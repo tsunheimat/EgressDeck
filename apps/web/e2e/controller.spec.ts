@@ -39,14 +39,14 @@ test('session, authorization and CSRF stay active across the browser boundary', 
   await expect(page.getByRole('button', { name: 'New policy', exact: true })).toBeDisabled()
 })
 
-test('subscription import publishes through the real API and manual selection reads back', async ({ page, context }, testInfo) => {
+test('subscription import and shared native selection converge for TCP and UDP', async ({ page, context }, testInfo) => {
   await signIn(context)
   await page.goto('/')
   await navigate(page, 'Subscriptions')
   await page.getByRole('button', { name: 'Add subscription', exact: true }).click()
   await page.getByLabel('Provider name', { exact: true }).fill('Browser imported subscription')
   await page.getByRole('combobox', { name: 'Source type', exact: true }).selectOption('paste')
-  await page.getByLabel('Subscription content', { exact: true }).fill('socks5://fixture:password@browser-edge.example:1080#Browser%20edge')
+  await page.getByLabel('Subscription content', { exact: true }).fill('socks5://fixture:password@browser-edge.example:1080#Browser%20edge\nsocks5://fixture:password@browser-spare.example:1080#Browser%20spare')
   await page.getByRole('combobox', { name: 'Import format', exact: true }).selectOption('links')
   await page.getByRole('button', { name: 'Add and stage provider', exact: true }).click()
   const card = page.getByRole('article', { name: 'Provider Browser imported subscription', exact: true })
@@ -59,29 +59,81 @@ test('subscription import publishes through the real API and manual selection re
   await card.getByRole('button', { name: 'Apply staged revision', exact: true }).click()
   await expect.poll(async () => (await list(page, `providers/${provider!.id}/revisions`)).some(item => item.state === 'active')).toBe(true)
   await expect(card.getByRole('button', { name: 'Apply staged revision', exact: true })).toBeDisabled()
+  const publishedRevisions = await list(page, `providers/${provider!.id}/revisions`)
 
   await navigate(page, 'Proxies')
   await page.getByRole('button', { name: 'New outbound group', exact: true }).click()
   await page.getByLabel('Outbound group name', { exact: true }).fill('Browser manual exit')
   await page.getByRole('combobox', { name: 'Outbound gateway', exact: true }).selectOption('fixture-gateway')
   await page.getByRole('checkbox', { name: 'Candidate Browser edge', exact: true }).check()
+  await page.getByRole('checkbox', { name: 'Candidate Browser spare', exact: true }).check()
   await page.getByRole('button', { name: 'Create outbound group', exact: true }).click()
   const groupCard = page.getByRole('article', { name: 'Outbound group Browser manual exit', exact: true })
   await expect(groupCard).toBeVisible()
-  await groupCard.getByRole('button', { name: 'Select Browser edge for Browser manual exit (TCP)', exact: true }).click()
   const group = (await list(page, 'outbound-groups')).find(item => item.name === 'Browser manual exit')
-  expect(group).toBeDefined()
+  expect(group).toMatchObject({ selection_scope: 'shared_tcp_udp' })
+  expect(group!.node_ids).toHaveLength(2)
+  await expect(groupCard.getByRole('combobox', { name: 'Selection transport for Browser manual exit', exact: true })).toHaveCount(0)
+  const nodeButton = groupCard.getByRole('button', { name: 'Select Browser edge for Browser manual exit (TCP + UDP)', exact: true })
+  await expect(nodeButton).toBeDisabled()
+  await groupCard.getByRole('button', { name: 'Apply configuration for Browser manual exit', exact: true }).click()
+  await expect(nodeButton).toBeEnabled()
+  await expect.poll(async () => {
+    const applied = (await list(page, 'outbound-groups')).find(item => item.id === group!.id)
+    return applied?.applied_revision === group!.revision && applied?.observed_revision === group!.revision
+  }).toBe(true)
+  const selectionResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith(`/outbound-groups/${group!.id}/selection`))
+  await nodeButton.click()
+  const response = await selectionResponse
+  expect(response.status(), await response.text()).toBe(202)
+  expect(response.request().postDataJSON().transport_scopes).toEqual(['tcp', 'udp'])
+  expect(response.request().postDataJSON().expected_revisions).toEqual({ tcp: 0, udp: 0 })
+  const selectedNodeID = response.request().postDataJSON().node_id
   await expect.poll(async () => {
     const selections = await list(page, `outbound-groups/${group!.id}/selection`)
-    return selections.some(item => item.desired_node_id && item.applied_node_id === item.desired_node_id && item.observed_node_id === item.desired_node_id)
-  }).toBe(true)
-  await expect(groupCard.getByRole('table')).toContainText('Browser edge')
+    return selections.map(item => ({ transport: item.scope.transport, desired: item.desired_node_id, applied: item.applied_node_id, observed: item.observed_node_id })).sort((left, right) => left.transport.localeCompare(right.transport))
+  }).toEqual(['tcp', 'udp'].map(transport => ({ transport, desired: selectedNodeID, applied: selectedNodeID, observed: selectedNodeID })))
+  for (const transport of ['TCP', 'UDP']) {
+    const row = groupCard.getByRole('table').getByRole('row').filter({ hasText: transport })
+    await expect(row.getByRole('cell', { name: 'Browser edge', exact: true })).toHaveCount(3)
+  }
   const operations = await list(page, 'operations')
   expect(operations.some(item => item.action === 'selection' && item.status === 'applied')).toBe(true)
-  await groupCard.getByLabel('Selection transport for Browser manual exit', { exact: true }).selectOption('udp')
-  await groupCard.getByRole('button', { name: 'Select Browser edge for Browser manual exit (UDP)', exact: true }).click()
-  await expect.poll(async () => (await list(page, `outbound-groups/${group!.id}/selection`)).map(item => item.scope.transport).sort()).toEqual(['tcp', 'udp'])
-  await expect(groupCard.getByRole('table').getByRole('row').filter({ hasText: 'UDP' })).toContainText('Browser edge')
+
+  // Membership has an independent deployment lifecycle; the provider remains
+  // at its existing active connection revision throughout this change.
+  await groupCard.getByRole('button', { name: 'Edit Browser manual exit', exact: true }).click()
+  await page.getByRole('checkbox', { name: 'Candidate Browser spare', exact: true }).uncheck()
+  await page.getByRole('button', { name: 'Save outbound group', exact: true }).click()
+  const edited = (await list(page, 'outbound-groups')).find(item => item.id === group!.id)!
+  expect(edited.node_ids).toEqual([selectedNodeID])
+  expect(edited.revision).toBeGreaterThan(group!.revision)
+  expect(edited.applied_revision).toBe(group!.revision)
+  await expect(nodeButton).toBeDisabled()
+  const csrf = (await context.cookies()).find(cookie => cookie.name === 'egressdeck_csrf')!.value
+  const selectionBeforeApply = await page.request.put(`/api/v1/outbound-groups/${group!.id}/selection`, {
+    headers: { 'X-CSRF-Token': csrf, 'If-Match': '1', 'Idempotency-Key': 'browser-selection-before-group-apply' },
+    data: { node_id: selectedNodeID, gateway_id: 'fixture-gateway', transport_scopes: ['tcp', 'udp'], expected_revisions: { tcp: 1, udp: 1 } },
+  })
+  expect(selectionBeforeApply.status(), await selectionBeforeApply.text()).toBe(409)
+  expect((await selectionBeforeApply.json()).error.code).toBe('group_configuration_not_applied')
+  expect((await list(page, 'operations')).some(item => item.status === 'outcome_unknown')).toBe(false)
+  await groupCard.getByRole('button', { name: 'Apply configuration for Browser manual exit', exact: true }).click()
+  await expect(nodeButton).toBeEnabled()
+  await expect.poll(async () => {
+    const applied = (await list(page, 'outbound-groups')).find(item => item.id === group!.id)
+    return applied?.applied_revision === edited.revision && applied?.observed_revision === edited.revision
+  }).toBe(true)
+  const reselectionResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith(`/outbound-groups/${group!.id}/selection`))
+  await nodeButton.click()
+  const reselection = await reselectionResponse
+  expect(reselection.status(), await reselection.text()).toBe(202)
+  expect(reselection.request().postDataJSON().transport_scopes).toEqual(['tcp', 'udp'])
+  await expect.poll(async () => {
+    const selections = await list(page, `outbound-groups/${group!.id}/selection`)
+    return selections.length === 2 && selections.every(item => item.revision === 2 && item.desired_node_id === selectedNodeID && item.applied_node_id === selectedNodeID && item.observed_node_id === selectedNodeID)
+  }).toBe(true)
+  expect(await list(page, `providers/${provider!.id}/revisions`)).toEqual(publishedRevisions)
   await page.screenshot({ path: testInfo.outputPath('proxy-selection.png'), fullPage: true })
   await page.screenshot({ path: 'e2e/artifacts/proxy-selection-desktop.png', fullPage: true })
   await page.setViewportSize({ width: 390, height: 844 })
@@ -98,8 +150,8 @@ test('subscription import publishes through the real API and manual selection re
     const region = await scrollRegion.boundingBox()
     return !!cell && !!region && cell.x >= region.x && cell.x + cell.width <= region.x + region.width
   }).toBe(true)
-  await groupCard.getByRole('combobox', { name: 'Selection transport for Browser manual exit', exact: true }).selectOption('tcp')
-  await expect(groupCard.getByRole('button', { name: 'Select Browser edge for Browser manual exit (TCP)', exact: true })).toBeEnabled()
+  await expect(groupCard.getByRole('combobox', { name: 'Selection transport for Browser manual exit', exact: true })).toHaveCount(0)
+  await expect(groupCard.getByRole('button', { name: 'Select Browser edge for Browser manual exit (TCP + UDP)', exact: true })).toBeEnabled()
   await page.screenshot({ path: testInfo.outputPath('proxy-selection-mobile.png'), fullPage: true })
   await page.screenshot({ path: 'e2e/artifacts/proxy-selection-mobile.png', fullPage: true })
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390)

@@ -23,6 +23,7 @@ type operationReconciler struct {
 	logger   *log.Logger
 	options  reconciliationOptions
 	complete func(context.Context, deployment.Operation, deployment.VerifyResult) error
+	guard    func(deployment.ReadbackExecutor) deployment.ReadbackExecutor
 	mu       sync.Mutex
 }
 
@@ -37,8 +38,9 @@ func newOperationReconciler(j deployment.Journal, factory func(deployment.Target
 }
 
 // Sweep inspects durable uncertain operations independently; an unavailable
-// gateway does not stop readback of another target. No remote mutations are
-// issued, and operators must explicitly resubmit unapplied work.
+// gateway does not stop readback of another target. The controller never
+// resubmits an ordinary mutation payload; native resolution may finish its
+// exact durably identified transaction or cancel it authoritatively.
 func (r *operationReconciler) Sweep(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -71,7 +73,9 @@ func (r *operationReconciler) Sweep(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		if r.complete != nil {
+		if r.guard != nil && (op.Action == "publish" || op.Action == "selection" || op.Action == "group_apply") {
+			reader = r.guard(reader)
+		} else if r.complete != nil {
 			reader = completionReadback{reader: reader, complete: r.complete}
 		}
 		readCtx, cancel := context.WithTimeout(ctx, r.options.Timeout)
@@ -114,6 +118,7 @@ func startOperationReconciliation(ctx context.Context, server *api.Server, logge
 	worker := newOperationReconciler(server.Services.Journal, server.Services.ExecutorFactory, logger, options)
 	worker.runner = server.Services.Runner
 	worker.complete = server.Services.CompleteOperationReadback
+	worker.guard = server.Services.OperationReadback
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = worker.Run(runCtx) }()
@@ -128,7 +133,7 @@ type completionReadback struct {
 
 func (r completionReadback) Readback(ctx context.Context, op deployment.Operation, f deployment.Fence) (deployment.VerifyResult, error) {
 	result, err := r.reader.Readback(ctx, op, f)
-	if err == nil && result.VerifiedOK && (op.Action == "publish" || op.Action == "selection") {
+	if err == nil && (result.VerifiedOK || result.NotApplied) && (op.Action == "publish" || op.Action == "selection" || op.Action == "group_apply") {
 		if err = r.complete(ctx, op, result); err != nil {
 			return result, err
 		}

@@ -344,10 +344,13 @@ func (s *Service) reconcileGroups(inventory []nodes.Node, expectedRevisions map[
 		s.groups[group.ID] = group
 		for key, selection := range s.selections {
 			if selection.GroupID == group.ID {
-				selection.Unavailable = selectionUnavailable(group, selection)
-				selection.Revision++
-				selection.UpdatedAt = now
-				s.selections[key] = selection
+				unavailable := selectionUnavailable(group, selection)
+				if selection.Unavailable != unavailable {
+					selection.Unavailable = unavailable
+					selection.Revision++
+					selection.UpdatedAt = now
+					s.selections[key] = selection
+				}
 			}
 		}
 	}

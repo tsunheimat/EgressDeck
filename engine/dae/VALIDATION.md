@@ -1,4 +1,34 @@
-# Native source validation receipt
+# Native source validation receipts
+
+## Review follow-up, 8 October 2026
+
+Current patch SHA-256:
+`f3266aa1e69de7f1798343c4d3623ed035f5ee30e85c5cb1e4a97fd50c23975d`.
+Capacity follow-up: `go test -race ./control -run TestHotOperation -count=1`
+passed 16 checks on `agnet-test` (job `rt-20261008-110049-qjafgr88`).
+Agent `go test -race ./internal/gateway -run TestNative -count=1` passed
+48 checks (job `rt-20261008-110049-pqcgp21q`). The earlier 1,402-check
+run below precedes this narrow non-evicting client-capacity refusal fix.
+
+All 26 source files are bound in `source-manifest.json`. Reverse application
+check against the pinned source tree passed.
+
+On `agnet-test`, `go test -race ./control ./cmd -run TestHot -count=1`
+passed 74 checks (job `rt-20261008-104308-07q5hoyv`), and `go test ./...`
+passed 1,402 checks in 34 packages (job `rt-20261008-104425-hdbsdz2k`).
+These include durable provider/group/selection operation receipts, same-ID
+deduplication, interrupted precommit recovery, source process restart, retention,
+and postcommit datapath-readback fencing.
+
+The prior receipts below describe the previous exported patch and binaries.
+They are historical evidence, not proof that the current source was built or
+qualified on a live network. Current cross-layer receipts:
+[production controller/agent/browser recovery scenario](../../tests/integration/artifacts/review-native-cross-layer.json)
+and [exact native-source CI fixture](evidence/native-source-review-receipt.json).
+The latter passed on the local host with actual daemon and adapter process
+restart, verified 26 exported native source hashes, and zero process exits.
+
+## Original implementation receipt
 
 Exact upstream base: `e3fee8fbc68a65167af13b685ab0b958757e20ee`.
 Patch SHA-256: `6dc2bbcb8270adfaac62eda4e33abab98eef9009bfa89e9f107d672cb904aa38`.

@@ -19,15 +19,18 @@ store and restores it across restart. OPNsense integration is a pinned native
 persisted/active readback. The gateway agent uses authenticated transport and a
 restricted stock dae adapter for executable identity, health, and validation.
 Explicit native mode connects to the separately patched daemon for hot provider
-publication and durable shared-transport manual selection; it requires private
+publication, independent group-membership publication and durable shared-transport
+manual selection; it requires private
 socket ownership and external encryption keys. This is implemented source and
 component behavior, with live network qualification still outstanding.
 
 The controller and UI behavior is covered by Go race tests, API/fixture
 contracts, PostgreSQL lifecycle tests, and browser acceptance using explicit
 test adapters. Real dae hot publication, OPNsense packet-path enforcement,
-strict DNS/IPv6 behavior, production enrollment, and OpenWrt support remain
-qualification gates. The fake engine is for explicit tests; neither it nor a
+strict DNS/IPv6 behavior, and OpenWrt support remain qualification gates.
+Complete native policy assembly/application, the independent enrollment guard,
+firewall session handling and client probes still require implementation and
+qualification. The fake engine is for explicit tests; neither it nor a
 successful management response is traffic verification.
 
 ## Delivery status
@@ -40,7 +43,7 @@ successful management response is traffic verification.
 | WP03 providers/nodes/outbounds | Bounded parser/fetcher, operator private-source allowlist, encrypted sources, revisions, stage-only scheduler, source CRUD, candidate filters and scoped selection | Qualified remote publication/selection; automatic scheduled publication remains unsupported |
 | WP04 policy/compiler | Device exceptions/ownership, groups, ordered rules/rule sets, deterministic manifests/source maps, stored-inventory plans, routing-only native output, preview and explanation | Complete native policy assembly and live enforcement of unknown domains, IPv6 and failure paths |
 | WP05 OPNsense | Pinned native client, exact alias/rule scope, version/TLS checks, delta mutation and active/persisted readback | Appliance credentials, firewall order, reboot/drift and canary traffic evidence |
-| WP06 deployment/reconcile | Durable operation runner, fencing, cross-system ordering, rollback/quarantine tests and desired/applied/observed/verified state | Configured gateway/firewall executors and injected live failure-boundary runs |
+| WP06 deployment/reconcile | Durable operation runner, fencing, cross-system ordering, rollback/quarantine tests and desired/applied/observed/verified state | Complete policy/guard/firewall-session/client-probe adapters and injected live failure-boundary runs |
 | WP07 UI | Dashboard pages for provider source/schedules, filters, policy/plans, device/groups, firewall attach/readback and activity; real Go browser harness, role/capability gates and readback | Live adapter-backed browser run after runtime capabilities are qualified |
 | WP08 qualification | Go race/security/contract tests, PostgreSQL integration, image smoke, browser harness and protected network workflow | Real packet, DNS, IPv6, hot-update, performance and retained-resource evidence |
 | WP09 operations | Compose single-image packaging, PostgreSQL overlay, Kubernetes/systemd/OpenWrt templates, backup/restore and incident runbooks | Target installation/restore rehearsal, immutable promotion and canary enrollment |
@@ -154,6 +157,15 @@ implementation, observed capabilities, predeclared group-name mappings,
 explicit initial selected nodes, and shared TCP/UDP selection. Native groups
 cannot span providers; stock and fake adapters cannot satisfy this runtime gate.
 
+Native selection appears as one **TCP + UDP** control in the Proxies page.
+The group response reports `selection_scope`; the UI submits and reads back
+both transports for shared selection. Saving a group's candidates updates
+desired configuration. Use **Apply configuration** to publish that
+revision against the existing provider inventory, then inspect the desired,
+applied and observed group revisions before selecting a node. This operation
+does not need a changed subscription or provider refresh. The current selected
+node must remain eligible in the applied group.
+
 The [provider fetch example](deploy/controller/provider-fetch.example.json)
 allows private sources only by exact host, port and private CIDR. Its JSON must
 be a private regular file of at most 64 KiB with no symlink path components.
@@ -183,7 +195,18 @@ published snapshots; it does not promise every intermediate transition. See
 Use observed capabilities and typed errors to determine whether an operation
 is available on a particular backend.
 
-The frozen Go snapshot passed **1,124 tests across 20 packages** with race
+The [review follow-up](docs/review-follow-up-2026-10-08.md) tracks the fixes and
+remaining implementation gaps identified against commit `5b443b5`.
+Its final source passed 1,267 Go race tests and 80 frontend tests. The
+[native management-path receipt](tests/integration/artifacts/review-native-cross-layer.json)
+also verifies the actual browser, controller, mTLS agent and patched dae Unix
+control plane through group edits, shared selection, pre-send/post-commit
+crashes and all-process restart. This receipt does not qualify eBPF or an
+OPNsense-enrolled client traffic path.
+
+The historical implementation snapshot recorded in
+[the original verification receipt](docs/verification/2026-10-08-results.json)
+passed **1,124 tests across 20 packages** with race
 detection and `go vet` on `agnet-test`. The web snapshot passed **73 unit and
 component tests**, type checking, production build and **14 Chrome browser
 tests** through the actual Go controller. Desktop/mobile screenshots were

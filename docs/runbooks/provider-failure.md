@@ -24,11 +24,11 @@ sha256sum /tmp/provider-body
 
 ## Decision tree
 
-- **Fetch failed or timed out:** leave the active revision unchanged. Correct DNS/TLS/route/credential settings, then retry once with the same idempotency key.
+- **Fetch failed or timed out:** leave the active revision unchanged. Correct DNS/TLS/route/credential settings. After the old operation is terminal, submit a new explicit refresh with a new idempotency key; the old key reads the prior result.
 - **Parse/validation failed:** quarantine the staged bytes and parse report. Do not publish an empty or partial inventory. Ask the provider owner to correct the source or use the last approved snapshot.
 - **Empty or unexpectedly small result:** require deliberate operator approval and an impact preview. An empty result never silently deletes pinned nodes.
 - **Prepare/probe failed:** preserve the current revision and close only resources created by the failed prepare. Check for leaked descriptors/connections before retrying.
-- **Publish acknowledgement lost:** treat the result as unknown. Read back provider and affected-group generations and node IDs before retrying; do not blindly publish twice.
+- **Publish acknowledgement lost:** treat the result as unknown. Follow the [stuck-operation runbook](stuck-operation.md) for exact identity-bound resolution and readback; do not blindly publish twice or infer rejection from an unchanged generation.
 
 If `provider.publish_hot` is false, do not claim R05. A stock full reload may be used only in an isolated development test with explicit disruption evidence; production refresh must remain staged until a qualified hot publication capability exists.
 

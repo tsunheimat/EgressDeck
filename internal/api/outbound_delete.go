@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/egressdeck/homelab-proxy-controller/internal/deployment"
 	"github.com/egressdeck/homelab-proxy-controller/internal/outbounds"
 	"github.com/egressdeck/homelab-proxy-controller/internal/policy"
 )
@@ -18,6 +19,10 @@ func (s *Server) deleteOutboundGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	services := s.servicesOrDefault()
 	id := r.PathValue("id")
+	if err := services.rejectUnknownTarget(r.Context(), deployment.Target{Kind: "outbound_group", ID: id}); err != nil {
+		writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
+		return
+	}
 	// Keep policy and rule-set writes blocked until the library has checked
 	// the group revision and runtime selections and completed the deletion.
 	services.mu.RLock()

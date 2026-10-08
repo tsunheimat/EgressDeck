@@ -6,10 +6,10 @@ import (
 	"fmt"
 )
 
-// InspectOutcome is the read-only startup/periodic recovery path. It never
+// InspectOutcome is the startup/periodic recovery path. It never
 // calls Validate, Stage, Apply, Verify, or Rollback, and it never issues a new
-// fence. Work not yet submitted to the remote target remains pending for an
-// explicit operator action. Use the same Runner instance as API mutation calls
+// fence. A reader may authoritatively resolve the existing transaction without
+// submitting a new mutation. Use the same Runner instance as API mutation calls
 // so its target lock excludes an in-process apply during observation.
 func (r *Runner) InspectOutcome(ctx context.Context, id string, reader ReadbackExecutor) (Operation, error) {
 	if err := r.check(); err != nil {
@@ -64,6 +64,9 @@ func (r *Runner) InspectOutcome(ctx context.Context, id string, reader ReadbackE
 	if readErr == nil && result.Observed == nil {
 		readErr = fmt.Errorf("%w: readback requires an observed state", ErrInvalidRequest)
 	}
+	if readErr == nil && result.NotApplied && result.VerifiedOK {
+		readErr = fmt.Errorf("%w: readback cannot confirm commit and noncommit", ErrInvalidRequest)
+	}
 	if readErr != nil {
 		op.Status = StatusOutcomeUnknown
 		op.Error = "remote outcome could not be confirmed by readback"
@@ -75,6 +78,10 @@ func (r *Runner) InspectOutcome(ctx context.Context, id string, reader ReadbackE
 			return op, errors.Join(readErr, saveErr)
 		}
 		return op, readErr
+	}
+	if result.NotApplied {
+		op.Error = "remote operation was authoritatively rejected before commit"
+		return r.finish(ctx, op, StatusFailed)
 	}
 	if result.VerifiedOK {
 		applied := result.Observed.Clone()

@@ -9,20 +9,25 @@ import (
 
 	"github.com/egressdeck/homelab-proxy-controller/internal/deployment"
 	"github.com/egressdeck/homelab-proxy-controller/internal/outbounds"
+	"github.com/egressdeck/homelab-proxy-controller/internal/providers"
 )
 
 // CompleteOperationReadback commits independently observed remote state before
 // reconciliation marks an uncertain operation applied. It does not claim an
 // enrolled-client traffic probe or retry a remote mutation.
 func (s *Services) CompleteOperationReadback(ctx context.Context, operation deployment.Operation, result deployment.VerifyResult) error {
-	if !result.VerifiedOK || result.Observed == nil || operation.Views.Desired == nil {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	return s.completeOperationReadback(ctx, operation, result)
+}
+
+func (s *Services) completeOperationReadback(ctx context.Context, operation deployment.Operation, result deployment.VerifyResult) error {
+	if (!result.VerifiedOK && !result.NotApplied) || (result.VerifiedOK && result.NotApplied) || result.Observed == nil || operation.Views.Desired == nil {
 		return errors.New("confirmed operation readback is required")
 	}
 	if operation.FenceToken == 0 {
 		return errors.New("operation has no recoverable fence")
 	}
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -32,6 +37,12 @@ func (s *Services) CompleteOperationReadback(ctx context.Context, operation depl
 	current, err := s.Journal.FenceCurrent(ctx, operation.Target, operation.FenceToken)
 	if err != nil || !current {
 		return errors.New("operation fence is no longer current")
+	}
+	if result.NotApplied {
+		if err := s.completeRejectedOperation(operation, result); err != nil {
+			return err
+		}
+		return s.persistCompletion(ctx)
 	}
 	switch operation.Action {
 	case "publish":
@@ -46,10 +57,11 @@ func (s *Services) CompleteOperationReadback(ctx context.Context, operation depl
 			GatewayIDs     []string `json:"gateway_ids"`
 		}
 		var observed struct {
-			ProviderID  string   `json:"provider_id"`
-			Revision    int64    `json:"revision"`
-			ContentHash string   `json:"content_hash"`
-			GatewayIDs  []string `json:"gateway_ids"`
+			ProviderID  string               `json:"provider_id"`
+			Revision    int64                `json:"revision"`
+			ContentHash string               `json:"content_hash"`
+			GatewayIDs  []string             `json:"gateway_ids"`
+			Groups      []GroupApplyReadback `json:"groups,omitempty"`
 		}
 		if json.Unmarshal(operation.Views.Desired.Data, &desired) != nil || json.Unmarshal(result.Observed.Data, &observed) != nil {
 			return errors.New("invalid provider readback")
@@ -62,8 +74,20 @@ func (s *Services) CompleteOperationReadback(ctx context.Context, operation depl
 			return errors.New("staged provider identity does not match journal intent")
 		}
 		status := s.Providers.Status(desired.ProviderID)
+		if status.Active != desired.Revision && status.Active != desired.ExpectedActive {
+			return errors.New("provider active revision changed since accepted intent")
+		}
+		outboundState, err := s.Outbounds.ExportState()
+		if err != nil {
+			return err
+		}
+		if err := s.completeProviderGroups(revision, observed.Groups); err != nil {
+			_ = s.Outbounds.ImportState(outboundState)
+			return err
+		}
 		if status.Active != desired.Revision {
 			if _, err := s.Providers.Publish(desired.ProviderID, desired.Revision, desired.ExpectedActive); err != nil {
+				_ = s.Outbounds.ImportState(outboundState)
 				return err
 			}
 		}
@@ -92,7 +116,7 @@ func (s *Services) CompleteOperationReadback(ctx context.Context, operation depl
 		for _, transport := range desired.TransportScopes {
 			scope := outbounds.Scope{GatewayID: desired.GatewayID, Transport: transport}
 			current, err := s.Outbounds.GetSelection(operation.Target.ID, scope)
-			if err != nil || current.DesiredNodeID != desired.NodeID || current.Revision != desired.ExpectedRevision+1 {
+			if err != nil || current.DesiredNodeID != desired.NodeID || current.Revision != selectionExpectedRevision(desired, transport)+1 {
 				return errors.New("selection intent changed after operation")
 			}
 			if readback, ok := byScope[transport]; !ok {
@@ -110,14 +134,67 @@ func (s *Services) CompleteOperationReadback(ctx context.Context, operation depl
 				return err
 			}
 		}
+	case "group_apply":
+		if operation.Target.Kind != "outbound_group" {
+			return errors.New("group operation target is invalid")
+		}
+		var desired GroupApplyIntent
+		var observed GroupApplyReadback
+		if json.Unmarshal(operation.Views.Desired.Data, &desired) != nil || json.Unmarshal(result.Observed.Data, &observed) != nil || desired.Group.ID != operation.Target.ID || observed.GroupID != desired.Group.ID || observed.Revision != desired.Group.Revision || !sameStringSet(observed.NodeIDs, desired.Group.NodeIDs) {
+			return errors.New("group configuration readback differs from journal intent")
+		}
+		if _, err := s.Outbounds.ObserveConfiguration(observed.GroupID, observed.Revision, observed.NodeIDs, observed.Generation); err != nil {
+			return err
+		}
 	default:
 		return errors.New("operation does not support local readback completion")
 	}
+	return s.persistCompletion(ctx)
+}
+
+func (s *Services) persistCompletion(ctx context.Context) error {
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := s.Persist(persistCtx); err != nil {
 		s.mutationBlocked = true
 		return err
+	}
+	return nil
+}
+
+func (s *Services) completeProviderGroups(revision providers.Revision, groups []GroupApplyReadback) error {
+	fences := map[string]int64{}
+	for _, observed := range groups {
+		if observed.GroupID == "" || observed.Revision <= 0 || observed.Generation < 0 {
+			return errors.New("provider readback contains invalid group state")
+		}
+		group, err := s.Outbounds.Get(observed.GroupID)
+		if err != nil {
+			return err
+		}
+		if _, duplicate := fences[group.ID]; duplicate {
+			return errors.New("provider readback repeats a group")
+		}
+		candidates, err := outbounds.ResolveCandidates(group, revision.Nodes)
+		if err != nil {
+			return err
+		}
+		expectedRevision := group.Revision
+		if !sameStringSet(group.NodeIDs, candidates) {
+			expectedRevision++
+		}
+		if group.GatewayID == "" || !sameStringSet(candidates, observed.NodeIDs) || expectedRevision != observed.Revision || observed.Generation < group.AppliedGeneration || observed.Generation < group.ObservedGeneration {
+			return errors.New("provider readback group differs from controller state")
+		}
+		fences[group.ID] = group.Revision
+	}
+	if _, err := s.Outbounds.ReconcileGroups(revision.Nodes, fences); err != nil {
+		return err
+	}
+	for _, observed := range groups {
+		if _, err := s.Outbounds.ObserveConfiguration(observed.GroupID, observed.Revision, observed.NodeIDs, observed.Generation); err != nil {
+			return err
+		}
 	}
 	return nil
 }

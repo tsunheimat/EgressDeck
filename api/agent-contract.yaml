@@ -4,15 +4,15 @@ info:
   version: 1.0.0
   summary: Implemented controller-to-gateway-agent HTTP protocol
   description: |-
-    Describes the HTTP handlers in cmd/gateway-agent and the stock, native, and fake backends in internal/gateway. The default stock backend exposes executable/process health and optionally native policy validation. Its managed inventory, publication, selection, application, probes, connections, counters, and events remain unsupported. Explicit native mode connects to the patched daemon through a protected Unix socket and enables the five capabilities listed under x-native-capabilities when inventory is reachable. Fake-engine success represents simulation only.
+    Describes the HTTP handlers in cmd/gateway-agent and the stock, native, and fake backends in internal/gateway. The default stock backend exposes executable/process health and optionally native policy validation. Its managed inventory, publication, selection, application, probes, connections, counters, and events remain unsupported. Explicit native mode connects to the patched daemon through a protected Unix socket and enables the capabilities listed under x-native-capabilities when inventory is reachable. Fake-engine success represents simulation only.
 
     On remote listeners, TLS 1.3 with verified client certificates and a bearer token are required together. Literal-loopback listeners may use plaintext; explicit development mode may disable the bearer token. Native HTTP routes start at /v1 with no /agent prefix.
 
-    Mutation responses are synchronous. Idempotency-Key is not processed and HTTP replay safety is not promised. No asynchronous 202 receipt or operation-resource endpoint exists. A lost mutation acknowledgement requires readback before retry. Native mutations retain unresolved intent and return outcome_unknown when authoritative readback cannot establish the result; stock readback remains unsupported.
+    Mutation responses are synchronous. Idempotency-Key is not processed. Controller mutations carry the five X-EgressDeck-Mutation identity headers together, binding the durable request hash, target and fence to its controller operation. GET /v1/mutations/{mutationId} reads the correlated outcome; POST /v1/mutations/{mutationId}/resolve explicitly resolves it using durable agent/daemon evidence. Missing identity is supported for legacy mutation requests, but cannot provide correlated controller recovery. These routes return synchronous receipts, not asynchronous 202 jobs. An unchanged generation alone never clears pending intent; stock readback remains unsupported.
 
     Private staging requests may carry credential-bearing node connections. Public Node JSON excludes connection; native snapshot construction also clears identity and definition_hash. Native encrypted recovery state is removed from /v1/journal output.
 
-    Most request decoders reject unknown fields. Staging uses a separate flat-or-nested decoder that ignores unknown fields. Omitted integer fences default to zero. Errors contain an error field holding either a string or a typed object. Generation and revision conflicts return HTTP 409; native outcome_unknown returns HTTP 503.
+    Most request decoders reject unknown fields. Staging uses a separate flat-or-nested decoder that ignores unknown fields. Omitted body integer fences default to zero; mutation identity fences are mandatory positive canonical decimal headers when identity is supplied. Errors contain an error field holding either a string or a typed object. A definite correlated preflight rejection also includes rejected_before_mutation and the matching mutation_identity. Generation and revision conflicts return HTTP 409; native outcome_unknown returns HTTP 503.
 servers:
   - url: https://{gateway}
     description: Native remote agent listener; mTLS and bearer authentication are both required.
@@ -27,6 +27,8 @@ tags:
     description: Agent liveness, health, and engine capabilities.
   - name: providers
     description: Staging and publication of provider revisions.
+  - name: groups
+    description: Independent outbound-group configuration publication.
   - name: selection
     description: Runtime and durable selection.
   - name: policy
@@ -35,8 +37,10 @@ tags:
     description: Engine node and group probes.
   - name: readback
     description: Inventory, journal, connections, counters, and events.
+  - name: mutations
+    description: Correlated native mutation status and authoritative recovery.
 x-stock-capabilities:
-  description: All fourteen capability entries are returned. Only policy.validate can become supported,
+  description: Every known capability entry is returned. Only policy.validate can become supported,
     after executable availability and version readback succeed. All other entries remain false.
   conditionally-supported:
     - policy.validate
@@ -44,6 +48,7 @@ x-stock-capabilities:
     - inventory.read
     - provider.stage
     - provider.publish_hot
+    - group.publish_hot
     - selection.set_runtime
     - selection.persist_restart
     - policy.apply_generation
@@ -58,7 +63,7 @@ x-planned-operations:
   - method: GET
     path: /v1/operations/{operationId}
     status: planned-only
-    description: Not registered. Current operation history is the bare journal array at /v1/journal.
+    description: Not registered on the gateway agent. Use /v1/mutations/{mutationId} for controller-correlated status and /v1/journal for public history. The private daemon has its own operation-ID protocol.
 paths:
   /healthz:
     get:
@@ -102,7 +107,7 @@ paths:
       operationId: discoverCapabilities
       summary: Read all known engine capabilities
       description: Returns every known capability. Stock supports only policy.validate conditionally.
-        Native supports inventory.read, provider.stage, provider.publish_hot, selection.set_runtime, and
+        Native supports inventory.read, provider.stage, provider.publish_hot, group.publish_hot, selection.set_runtime, and
         selection.persist_restart only while daemon inventory is reachable. Fake entries describe simulation
         and include restrictions.
       responses:
@@ -175,7 +180,7 @@ paths:
       description: Returns a bare JSON array. With no journal configured the result is []; an empty or
         missing ordinary file journal may produce null. Native mode requires its durable journal. Public
         output strips state from native.state entries, including encrypted recovery material; status and
-        lifecycle metadata remain visible. No operation-resource polling endpoint exists.
+        lifecycle metadata remain visible. Correlated status is available separately at /v1/mutations/{mutationId}.
       responses:
         '200':
           description: Synchronous result.
@@ -193,6 +198,113 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
         '500':
           $ref: '#/components/responses/InternalError'
+  /v1/mutations/{mutationId}:
+    parameters:
+      - $ref: '#/components/parameters/MutationIDPath'
+      - $ref: '#/components/parameters/MutationIDHeader'
+      - $ref: '#/components/parameters/MutationHashHeader'
+      - $ref: '#/components/parameters/MutationTargetKindHeader'
+      - $ref: '#/components/parameters/MutationTargetIDHeader'
+      - $ref: '#/components/parameters/MutationFenceHeader'
+    get:
+      tags:
+        - mutations
+      operationId: readMutationStatus
+      summary: Read the authoritative status of a correlated mutation
+      description: Read-only lookup. The complete authenticated identity must match the path and retained request. Absence or an unchanged generation is not proof of rejection. Stock and fake engines may return unsupported when they do not implement this interface.
+      responses:
+        '200':
+          $ref: '#/components/responses/MutationReceiptResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/mutations/{mutationId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/MutationIDPath'
+      - $ref: '#/components/parameters/MutationIDHeader'
+      - $ref: '#/components/parameters/MutationHashHeader'
+      - $ref: '#/components/parameters/MutationTargetKindHeader'
+      - $ref: '#/components/parameters/MutationTargetIDHeader'
+      - $ref: '#/components/parameters/MutationFenceHeader'
+    post:
+      tags:
+        - mutations
+      operationId: resolveMutation
+      summary: Resolve a correlated mutation using durable native evidence
+      description: Explicit recovery action. May settle an operation only when the durable agent/daemon protocol establishes its outcome and prevents delayed execution. It never releases pending intent solely because inventory generation is unchanged. No request body is required.
+      responses:
+        '200':
+          $ref: '#/components/responses/MutationReceiptResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/groups/publish:
+    post:
+      tags:
+        - groups
+      operationId: publishOutboundGroup
+      summary: Publish one group's configuration against an unchanged active provider
+      x-required-capability: group.publish_hot
+      description: Validates the exact active provider revision, expected gateway generation, advancing group revision and selected candidate. Native publication uses an existing manual group binding and retains provider connection definitions; groups spanning providers are unsupported. Successful response includes fresh matching inventory. Uncertain acknowledgement or readback returns outcome_unknown; definite preflight rejection does not claim a remote mutation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupPublishRequest'
+      responses:
+        '200':
+          description: Group published and read back
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: Invalid provider/group revision or selected candidate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /v1/providers/stage:
     post:
       tags:
@@ -920,7 +1032,59 @@ components:
       type: http
       scheme: bearer
       description: The configured agent token. Authorization uses the literal Bearer scheme.
+  parameters:
+    MutationIDPath:
+      name: mutationId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_.:-]{1,256}$'
+    MutationIDHeader:
+      name: X-EgressDeck-Mutation-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_.:-]{1,256}$'
+      description: Exact controller operation ID; must equal mutationId on status/resolve routes. Supply all five identity headers once each or omit all on legacy mutations.
+    MutationHashHeader:
+      name: X-EgressDeck-Mutation-Hash
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+      description: Durable controller request hash, bound to the mutation ID and target.
+    MutationTargetKindHeader:
+      name: X-EgressDeck-Mutation-Target-Kind
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+    MutationTargetIDHeader:
+      name: X-EgressDeck-Mutation-Target-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_.:-]{1,256}$'
+    MutationFenceHeader:
+      name: X-EgressDeck-Mutation-Fence
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[1-9][0-9]*$'
+      description: Positive uint64 fencing token in canonical decimal, without leading zeroes.
   responses:
+    MutationReceiptResponse:
+      description: Synchronous correlated mutation receipt; only committed or rejected establishes a terminal outcome.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MutationReceipt'
     BadRequest:
       description: Malformed JSON, unknown request field, invalid provider revision, or invalid/missing
         selection or probe target.
@@ -1048,6 +1212,7 @@ components:
         - inventory.read
         - provider.stage
         - provider.publish_hot
+        - group.publish_hot
         - selection.set_runtime
         - selection.persist_restart
         - policy.validate
@@ -1731,7 +1896,7 @@ components:
         code:
           type: string
           description: Engine code. Current typed errors include unsupported, conflict, busy, unavailable,
-            invalid_request, and outcome_unknown. Unknown native mutation outcomes use HTTP 503.
+            invalid_request, request_rejected, operation_rejected, and outcome_unknown. Unknown native mutation outcomes use HTTP 503.
         operation:
           type: string
         detail:
@@ -1739,6 +1904,60 @@ components:
       additionalProperties: false
       x-go-type: gateway.Error
       x-source: internal/gateway/engine.go
+    MutationIdentity:
+      type: object
+      required:
+        - id
+        - request_hash
+        - target_kind
+        - target_id
+        - fence_token
+      properties:
+        id:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,256}$'
+        request_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        target_kind:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+        target_id:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,256}$'
+        fence_token:
+          type: integer
+          minimum: 1
+          description: Unsigned 64-bit controller fencing token.
+      additionalProperties: false
+      x-go-type: gateway.MutationIdentity
+      x-source: internal/gateway/mutation.go
+    MutationReceipt:
+      type: object
+      required:
+        - identity
+        - state
+      properties:
+        identity:
+          $ref: '#/components/schemas/MutationIdentity'
+        state:
+          type: string
+          enum:
+            - committed
+            - rejected
+            - pending
+            - unknown
+        generation:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Supplied only when daemon readback is healthy; unchanged generation is not proof of rejection.
+        error_code:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+      additionalProperties: false
+      x-go-type: gateway.MutationReceipt
+      x-source: internal/gateway/mutation.go
     ErrorEnvelope:
       type: object
       description: Typed engine errors are nested under error. Decoder, authentication, method, and untyped
@@ -1750,7 +1969,66 @@ components:
           oneOf:
             - type: string
             - $ref: '#/components/schemas/TypedError'
+        rejected_before_mutation:
+          type: boolean
+          const: true
+          description: Definite preflight rejection proof, emitted only with the matching complete mutation_identity.
+        mutation_identity:
+          $ref: '#/components/schemas/MutationIdentity'
+      dependentRequired:
+        rejected_before_mutation:
+          - mutation_identity
+        mutation_identity:
+          - rejected_before_mutation
       additionalProperties: false
+    GroupPublication:
+      type: object
+      required:
+        - group
+        - provider_id
+        - provider_revision
+      properties:
+        group:
+          allOf:
+            - $ref: '#/components/schemas/PublicationGroup'
+            - type: object
+              required:
+                - selected_node_id
+              properties:
+                candidate_ids:
+                  type: array
+                  minItems: 1
+                  uniqueItems: true
+                  items:
+                    $ref: '#/components/schemas/Identifier'
+                selected_node_id:
+                  $ref: '#/components/schemas/Identifier'
+          description: The selected node must be an eligible candidate.
+        provider_id:
+          $ref: '#/components/schemas/Identifier'
+        provider_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Exact active provider connection revision, unchanged by group publication.
+      additionalProperties: false
+      x-go-type: gateway.GroupPublication
+      x-source: internal/gateway/group.go
+    GroupPublishRequest:
+      type: object
+      required:
+        - publication
+      properties:
+        publication:
+          $ref: '#/components/schemas/GroupPublication'
+        expected_generation:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      additionalProperties: false
+      x-go-type: gateway.GroupPublishRequest
+      x-source: internal/gateway/client_group.go
     PublicationGroup:
       type: object
       properties:
@@ -1836,6 +2114,7 @@ x-native-capabilities:
     - inventory.read
     - provider.stage
     - provider.publish_hot
+    - group.publish_hot
     - selection.set_runtime
     - selection.persist_restart
   always-unsupported:
@@ -1848,8 +2127,10 @@ x-native-capabilities:
     - traffic.proxy_counters
     - traffic.direct_counters
     - events.resume
-  description: All five supported flags depend on successful native inventory readback. Publication requires
+  description: All supported flags depend on successful native inventory readback. Provider publication requires
     exactly one predeclared group per staged provider, private native node links, and the encrypted agent
-    journal. Runtime selection is shared by TCP and UDP; transport must be both or empty. Persistence
+    journal. Independent group publication uses an unchanged active provider revision and an advancing group
+    configuration revision; the selected node must remain eligible. Runtime selection is shared by TCP and UDP;
+    transport must be both or empty. Persistence
     requires retained daemon and agent encryption keys and unchanged predeclared group layout. Capability
     discovery and degraded health do not establish privileged packet-path or eBPF acceptance.

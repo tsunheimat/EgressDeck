@@ -95,6 +95,9 @@ func (s StateRecord) Clone() StateRecord {
 // absent. A successful controller call only updates these views when the
 // corresponding adapter operation/readback actually succeeded.
 type StateViews struct {
+	// Previous is the controller state preceding a durable intent. It enables
+	// idempotent local compensation only after authoritative noncommit proof.
+	Previous *StateRecord `json:"previous,omitempty"`
 	Desired  *StateRecord `json:"desired,omitempty"`
 	Applied  *StateRecord `json:"applied,omitempty"`
 	Observed *StateRecord `json:"observed,omitempty"`
@@ -103,6 +106,10 @@ type StateViews struct {
 
 func (s StateViews) Clone() StateViews {
 	clone := s
+	if s.Previous != nil {
+		v := s.Previous.Clone()
+		clone.Previous = &v
+	}
 	if s.Desired != nil {
 		v := s.Desired.Clone()
 		clone.Desired = &v
@@ -219,7 +226,11 @@ type VerifyResult struct {
 	Observed   *StateRecord `json:"observed,omitempty"`
 	Verified   *StateRecord `json:"verified,omitempty"`
 	VerifiedOK bool         `json:"verified_ok"`
-	Message    string       `json:"message,omitempty"`
+	// NotApplied requires a target-authoritative operation receipt proving the
+	// exact fenced request was rejected or durably canceled before commit.
+	// An unchanged generation, missing receipt, or generic error is not proof.
+	NotApplied bool   `json:"not_applied,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // Journal is the durability boundary. Implementations must persist each

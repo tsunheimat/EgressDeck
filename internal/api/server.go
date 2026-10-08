@@ -59,6 +59,7 @@ func (s *Server) Handler() http.Handler {
 	handle("/api/v1/outbound-groups", s.outboundGroups)
 	handle("/api/v1/outbound-groups/{id}", s.outboundGroup)
 	handle("/api/v1/outbound-groups/{id}/selection", s.selection)
+	handle("/api/v1/outbound-groups/{id}/apply", s.outboundGroupApply)
 	handle("/api/v1/providers/{id}/revisions", s.providerRevisions)
 	handle("/api/v1/providers/{id}/refresh", s.providerRefresh)
 	handle("/api/v1/providers/{id}/schedule", s.providerSchedule)
@@ -136,6 +137,7 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		"inventory.read":             true,
 		"provider.stage":             services.ProviderStageEnabled,
 		"provider.publish_hot":       services.ProviderPublisher != nil && services.ProviderReadback != nil,
+		"group.publish_hot":          services.GroupPublisher != nil && services.GroupReadback != nil,
 		"selection.set_runtime":      services.SelectionApplier != nil,
 		"selection.persist_restart":  services.SelectionPersistence,
 		"policy.validate":            true,

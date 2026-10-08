@@ -1,9 +1,9 @@
 diff --git a/cmd/hot_control.go b/cmd/hot_control.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19e34c9a46
+index 0000000000000000000000000000000000000000..7e40862b22f8fcede12ca98665bb9b1e6b888c8e
 --- /dev/null
 +++ b/cmd/hot_control.go
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,473 @@
 +/*
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
@@ -22,6 +22,7 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +	"net/http"
 +	"os"
 +	"path/filepath"
++	"strings"
 +	"sync"
 +	"syscall"
 +	"time"
@@ -53,6 +54,10 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +	PublishHotProvider(context.Context, control.HotProviderRequest) (outbound.HotInventoryPublication, error)
 +	SetHotSelection(context.Context, uint64, uint8, string) (outbound.HotInventoryPublication, error)
 +	HotInventorySnapshot() (outbound.HotInventorySnapshot, error)
++	PublishHotProviderOperation(context.Context, string, control.HotProviderRequest) (outbound.HotInventoryPublication, error)
++	PublishHotGroupOperation(context.Context, string, control.HotGroupRequest) (outbound.HotInventoryPublication, error)
++	SetHotSelectionOperation(context.Context, string, uint64, uint8, string) (outbound.HotInventoryPublication, error)
++	HotOperationStatus(string) (control.HotOperationReceipt, error)
 +}
 +
 +type hotControlServer struct {
@@ -263,12 +268,16 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +			return
 +		}
 +		if r.URL.Path == "/v1/providers/publish" && r.Method == http.MethodPost {
-+			var req control.HotProviderRequest
++			var req hotProviderOperationRequest
 +			if err := decodeHotJSON(w, r, &req); err != nil {
 +				writeHotError(w, http.StatusBadRequest, "invalid_request", err.Error())
 +				return
 +			}
-+			publication, err := api.PublishHotProvider(r.Context(), req)
++			if req.OperationID == "" {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", "operation_id is required")
++				return
++			}
++			publication, err := api.PublishHotProviderOperation(r.Context(), req.OperationID, req.HotProviderRequest)
 +			if err != nil {
 +				writeHotMappedError(w, err)
 +				return
@@ -286,7 +295,11 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +				writeHotError(w, http.StatusBadRequest, "invalid_request", "positive expected generation and candidate ID are required")
 +				return
 +			}
-+			publication, err := api.SetHotSelection(r.Context(), req.ExpectedGeneration, req.Handle, req.CandidateID)
++			if req.OperationID == "" {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", "operation_id is required")
++				return
++			}
++			publication, err := api.SetHotSelectionOperation(r.Context(), req.OperationID, req.ExpectedGeneration, req.Handle, req.CandidateID)
 +			if err != nil {
 +				writeHotMappedError(w, err)
 +				return
@@ -294,10 +307,42 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +			writeHotJSON(w, http.StatusOK, publicationResponse(publication))
 +			return
 +		}
++		if r.URL.Path == "/v1/groups/publish" && r.Method == http.MethodPost {
++			var req hotGroupOperationRequest
++			if err := decodeHotJSON(w, r, &req); err != nil {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", err.Error())
++				return
++			}
++			if req.OperationID == "" {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", "operation_id is required")
++				return
++			}
++			publication, err := api.PublishHotGroupOperation(r.Context(), req.OperationID, req.HotGroupRequest)
++			if err != nil {
++				writeHotMappedError(w, err)
++				return
++			}
++			writeHotJSON(w, http.StatusOK, publicationResponse(publication))
++			return
++		}
++		if strings.HasPrefix(r.URL.Path, "/v1/operations/") && r.Method == http.MethodGet {
++			id := strings.TrimPrefix(r.URL.Path, "/v1/operations/")
++			if id == "" || strings.Contains(id, "/") {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", "invalid operation ID")
++				return
++			}
++			receipt, err := api.HotOperationStatus(id)
++			if err != nil {
++				writeHotMappedError(w, err)
++				return
++			}
++			writeHotJSON(w, http.StatusOK, receipt)
++			return
++		}
 +		switch r.URL.Path {
 +		case "/v1/inventory":
 +			w.Header().Set("Allow", http.MethodGet)
-+		case "/v1/providers/publish", "/v1/selection":
++		case "/v1/providers/publish", "/v1/selection", "/v1/groups/publish":
 +			w.Header().Set("Allow", http.MethodPost)
 +		default:
 +			writeHotError(w, http.StatusNotFound, "not_found", "unknown endpoint")
@@ -307,17 +352,30 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +	})
 +}
 +
++type hotProviderOperationRequest struct {
++	OperationID string `json:"operation_id"`
++	control.HotProviderRequest
++}
++
++type hotGroupOperationRequest struct {
++	OperationID string `json:"operation_id"`
++	control.HotGroupRequest
++}
++
 +type hotSelectionRequest struct {
++	OperationID        string `json:"operation_id"`
 +	ExpectedGeneration uint64 `json:"expected_generation"`
 +	Handle             uint8  `json:"handle"`
 +	CandidateID        string `json:"candidate_id"`
 +}
 +
 +type hotSnapshotGroup struct {
-+	Handle    uint8  `json:"handle"`
-+	Name      string `json:"name"`
-+	Identity  string `json:"identity"`
-+	Selection string `json:"selection"`
++	Handle        uint8    `json:"handle"`
++	Name          string   `json:"name"`
++	Identity      string   `json:"identity"`
++	Selection     string   `json:"selection"`
++	GroupRevision uint64   `json:"group_revision,omitempty"`
++	CandidateIDs  []string `json:"candidate_ids,omitempty"`
 +}
 +type hotSnapshotResponse struct {
 +	Generation uint64             `json:"generation"`
@@ -332,7 +390,7 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +func snapshotResponse(s outbound.HotInventorySnapshot) hotSnapshotResponse {
 +	groups := make([]hotSnapshotGroup, 0, len(s.Groups))
 +	for _, g := range s.Groups {
-+		groups = append(groups, hotSnapshotGroup{Handle: g.Handle, Name: g.Name, Identity: g.Identity, Selection: g.Selection})
++		groups = append(groups, hotSnapshotGroup{Handle: g.Handle, Name: g.Name, Identity: g.Identity, Selection: g.Selection, GroupRevision: g.GroupRevision, CandidateIDs: g.CandidateIDs})
 +	}
 +	return hotSnapshotResponse{Generation: s.Generation, Groups: groups}
 +}
@@ -389,8 +447,22 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +func writeHotMappedError(w http.ResponseWriter, err error) {
 +	code, status := "internal_error", http.StatusInternalServerError
 +	switch {
++	case errors.Is(err, control.ErrHotOperationOutcomeUnknown):
++		writeHotError(w, http.StatusServiceUnavailable, "outcome_unknown", "operation receipt uncertain; restart and readback required")
++		return
++	case errors.Is(err, control.ErrHotOperationInvalid):
++		code, status = "invalid_request", http.StatusBadRequest
++	case errors.Is(err, control.ErrHotOperationConflict):
++		code, status = "operation_conflict", http.StatusConflict
++	case errors.Is(err, control.ErrHotOperationExpired):
++		code, status = "operation_expired", http.StatusConflict
++	case errors.Is(err, control.ErrHotOperationSequence):
++		code, status = "operation_sequence", http.StatusConflict
++	case errors.Is(err, control.ErrHotOperationLimit):
++		code, status = "operation_limit", http.StatusTooManyRequests
 +	case errors.Is(err, control.ErrHotInventoryStorageOutcomeUnknown):
 +		writeHotError(w, http.StatusServiceUnavailable, "outcome_unknown", "storage commit uncertain; native inventory fenced")
++		return
 +	case errors.Is(err, control.ErrHotInventoryDatapathOutcomeUnknown):
 +		writeHotError(w, http.StatusServiceUnavailable, "outcome_unknown", "kernel admission readback failed; native inventory fenced")
 +		return
@@ -407,10 +479,10 @@ index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19
 +}
 diff --git a/cmd/hot_control_test.go b/cmd/hot_control_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe302834bc7fff6
+index 0000000000000000000000000000000000000000..8b83ad79c681708a14e3c5848f2ba01dde6ac4be
 --- /dev/null
 +++ b/cmd/hot_control_test.go
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,361 @@
 +/*
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
@@ -504,6 +576,18 @@ index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe30283
 +	f.expected, f.handle, f.candidate = expected, handle, candidate
 +	return outbound.HotInventoryPublication{Snapshot: hotFixtureSnapshot()}, f.err
 +}
++func (f *hotControlFixture) PublishHotProviderOperation(ctx context.Context, _ string, req control.HotProviderRequest) (outbound.HotInventoryPublication, error) {
++	return f.PublishHotProvider(ctx, req)
++}
++func (f *hotControlFixture) SetHotSelectionOperation(ctx context.Context, _ string, expected uint64, handle uint8, candidate string) (outbound.HotInventoryPublication, error) {
++	return f.SetHotSelection(ctx, expected, handle, candidate)
++}
++func (f *hotControlFixture) PublishHotGroupOperation(context.Context, string, control.HotGroupRequest) (outbound.HotInventoryPublication, error) {
++	return outbound.HotInventoryPublication{Snapshot: hotFixtureSnapshot()}, f.err
++}
++func (f *hotControlFixture) HotOperationStatus(id string) (control.HotOperationReceipt, error) {
++	return control.HotOperationReceipt{OperationID: id, State: "committed", Generation: 12}, f.err
++}
 +func (f *hotControlFixture) HotInventorySnapshot() (outbound.HotInventorySnapshot, error) {
 +	f.reads.Add(1)
 +	return hotFixtureSnapshot(), f.err
@@ -526,12 +610,12 @@ index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe30283
 +	}
 +
 +	w = httptest.NewRecorder()
-+	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/providers/publish", `{"expected_generation":11,"provider_id":"p","revision_id":"r","nodes":[{"id":"candidate-a","link":"socks5://user:secret@127.0.0.1:1080"}],"groups":[{"name":"main","candidate_ids":["candidate-a"],"selection":"candidate-a"}]}`))
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/providers/publish", `{"operation_id":"00000000000000000000000000000001:1","expected_generation":11,"provider_id":"p","revision_id":"r","nodes":[{"id":"candidate-a","link":"socks5://user:secret@127.0.0.1:1080"}],"groups":[{"name":"main","candidate_ids":["candidate-a"],"selection":"candidate-a"}]}`))
 +	if w.Code != http.StatusOK || f.publications.Load() != 1 || f.provider.ProviderID != "p" || f.provider.ExpectedGeneration != 11 || strings.Contains(w.Body.String(), "secret") || !strings.Contains(w.Body.String(), `"cleanup_pending":true`) || !strings.Contains(w.Body.String(), `"adopted":[2]`) {
 +		t.Fatalf("publication: status=%d body=%s calls=%d", w.Code, w.Body.String(), f.publications.Load())
 +	}
 +	w = httptest.NewRecorder()
-+	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"expected_generation":12,"handle":2,"candidate_id":"candidate-a"}`))
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"operation_id":"00000000000000000000000000000001:2","expected_generation":12,"handle":2,"candidate_id":"candidate-a"}`))
 +	if w.Code != http.StatusOK || f.selections.Load() != 1 || f.expected != 12 || f.handle != 2 || f.candidate != "candidate-a" {
 +		t.Fatalf("selection: status=%d body=%s calls=%d", w.Code, w.Body.String(), f.selections.Load())
 +	}
@@ -562,6 +646,23 @@ index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe30283
 +		if w.Code != http.StatusBadRequest || f.publications.Load() != 0 || strings.Contains(w.Body.String(), "credential") {
 +			t.Fatalf("invalid provider request was accepted: %d %s", w.Code, w.Body.String())
 +		}
++	}
++}
++
++func TestHotControlRequiresOperationIDsAndServesStatus(t *testing.T) {
++	f := &hotControlFixture{}
++	h := newHotControlHandler(f)
++	for _, path := range []string{"/v1/providers/publish", "/v1/groups/publish", "/v1/selection"} {
++		w := httptest.NewRecorder()
++		h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, path, `{"expected_generation":12}`))
++		if w.Code != http.StatusBadRequest || f.publications.Load()+f.selections.Load() != 0 {
++			t.Fatalf("mutation without operation ID: %s status=%d body=%s", path, w.Code, w.Body.String())
++		}
++	}
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodGet, "/v1/operations/00000000000000000000000000000001:1", ""))
++	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"state":"committed"`) || !strings.Contains(w.Body.String(), `"operation_id":"00000000000000000000000000000001:1"`) {
++		t.Fatalf("operation status: %d %s", w.Code, w.Body.String())
 +	}
 +}
 +
@@ -615,7 +716,7 @@ index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe30283
 +	} {
 +		f := &hotControlFixture{err: fmt.Errorf("socks5://secret:credential@host: %w", tc.err)}
 +		w := httptest.NewRecorder()
-+		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"expected_generation":2,"handle":2,"candidate_id":"n"}`))
++		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"operation_id":"00000000000000000000000000000001:1","expected_generation":2,"handle":2,"candidate_id":"n"}`))
 +		if w.Code != tc.status || !strings.Contains(w.Body.String(), tc.code) || strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "credential") {
 +			t.Errorf("sanitized error: %d %s", w.Code, w.Body.String())
 +		}
@@ -913,10 +1014,10 @@ index 0000000000000000000000000000000000000000..92ce1f3691fb57bf9914a543c015275e
 +}
 diff --git a/component/outbound/hot_inventory.go b/component/outbound/hot_inventory.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb587570233da01
+index 0000000000000000000000000000000000000000..a3cf2dc6f4b442cc7b438662442e4edc254a18b6
 --- /dev/null
 +++ b/component/outbound/hot_inventory.go
-@@ -0,0 +1,629 @@
+@@ -0,0 +1,637 @@
 +/*
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
@@ -951,11 +1052,12 @@ index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb58757
 +// handles requires a separate
 +// policy deployment and is deliberately not supported here.
 +type HotInventoryEntry struct {
-+	Handle     uint8
-+	Identity   string
-+	Group      *DialerGroup
-+	Candidates []HotInventoryCandidate
-+	Selection  string
++	Handle        uint8
++	Identity      string
++	GroupRevision uint64
++	Group         *DialerGroup
++	Candidates    []HotInventoryCandidate
++	Selection     string
 +	// Borrowed is allowed only at construction. The baseline control plane
 +	// keeps lifetime ownership; AcquireManaged tells callers to use its normal
 +	// selection path until an owned hot publication replaces this handle.
@@ -972,10 +1074,12 @@ index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb58757
 +
 +// HotInventoryGroup is a resource-free readback record.
 +type HotInventoryGroup struct {
-+	Handle    uint8
-+	Name      string
-+	Identity  string
-+	Selection string
++	Handle        uint8
++	Name          string
++	Identity      string
++	GroupRevision uint64
++	CandidateIDs  []string
++	Selection     string
 +}
 +
 +type HotInventorySnapshot struct {
@@ -1160,7 +1264,7 @@ index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb58757
 +			if current == nil || current.name != entry.Group.Name {
 +				return nil, fmt.Errorf("%w: handles and group names are fixed", ErrHotInventoryInvalid)
 +			}
-+			if current.entry.Identity == entry.Identity {
++			if current.entry.Identity == entry.Identity && current.entry.GroupRevision == entry.GroupRevision {
 +				if current.selection != entry.Selection {
 +					return nil, fmt.Errorf("%w: selection changes require SetSelection", ErrHotInventoryInvalid)
 +				}
@@ -1244,7 +1348,12 @@ index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb58757
 +func hotInventoryReadback(generation uint64, groups map[uint8]*hotInventoryGroup) HotInventorySnapshot {
 +	snapshot := HotInventorySnapshot{Generation: generation, Groups: make([]HotInventoryGroup, 0, len(groups))}
 +	for handle, group := range groups {
-+		snapshot.Groups = append(snapshot.Groups, HotInventoryGroup{Handle: handle, Name: group.name, Identity: group.entry.Identity, Selection: group.selection})
++		candidateIDs := make([]string, 0, len(group.candidates))
++		for id := range group.candidates {
++			candidateIDs = append(candidateIDs, id)
++		}
++		sort.Strings(candidateIDs)
++		snapshot.Groups = append(snapshot.Groups, HotInventoryGroup{Handle: handle, Name: group.name, Identity: group.entry.Identity, GroupRevision: group.entry.GroupRevision, CandidateIDs: candidateIDs, Selection: group.selection})
 +	}
 +	sort.Slice(snapshot.Groups, func(i, j int) bool { return snapshot.Groups[i].Handle < snapshot.Groups[j].Handle })
 +	return snapshot
@@ -3328,12 +3437,589 @@ index 0000000000000000000000000000000000000000..eb3cd218e330a929246d22db2db1adf9
 +		})
 +	}
 +}
+diff --git a/control/hot_group.go b/control/hot_group.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c9725ae04db93ba410ae053a62b8a3befe32889
+--- /dev/null
++++ b/control/hot_group.go
+@@ -0,0 +1,295 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"slices"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++)
++
++// HotGroupRequest replaces the membership of one existing managed group using
++// only the exact active provider's immutable node definitions. Group.Revision is
++// independent of RevisionID (the provider revision) and of selection generation.
++type HotGroupRequest struct {
++	ExpectedGeneration uint64           `json:"expected_generation"`
++	ProviderID         string           `json:"provider_id"`
++	RevisionID         string           `json:"revision_id"`
++	Group              HotProviderGroup `json:"group"`
++}
++
++func (c *ControlPlane) PublishHotGroup(ctx context.Context, req HotGroupRequest) (outbound.HotInventoryPublication, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return outbound.HotInventoryPublication{}, errors.New("hot inventory is disabled")
++	}
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
++	}
++	return c.applyHotGroupLocked(ctx, runtime, req)
++}
++
++func (c *ControlPlane) PublishHotGroupOperation(ctx context.Context, id string, req HotGroupRequest) (outbound.HotInventoryPublication, error) {
++	return c.runHotOperation(ctx, id, "group_publish", req, func(runtime *hotProviderRuntime) (outbound.HotInventoryPublication, error) {
++		return c.applyHotGroupLocked(ctx, runtime, req)
++	})
++}
++
++func (c *ControlPlane) applyHotGroupLocked(ctx context.Context, runtime *hotProviderRuntime, req HotGroupRequest) (outbound.HotInventoryPublication, error) {
++	before := runtime.inventory.Snapshot()
++	if req.ExpectedGeneration != before.Generation {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryConflict
++	}
++	if err := ctx.Err(); err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	req = cloneHotGroupRequest(req)
++	provider, found := runtime.providers[req.ProviderID]
++	if !found || provider.RevisionID != req.RevisionID {
++		return outbound.HotInventoryPublication{}, fmt.Errorf("%w: provider revision is not active", outbound.ErrHotInventoryConflict)
++	}
++	original, found := findHotProviderGroup(provider, req.Group.Name)
++	if !found {
++		return outbound.HotInventoryPublication{}, fmt.Errorf("%w: group is not owned by provider", outbound.ErrHotInventoryInvalid)
++	}
++	effective := effectiveHotProvider(provider, runtime.groupOverrides)
++	candidateCount := 0
++	for _, group := range effective.Groups {
++		if group.Name == req.Group.Name {
++			candidateCount += len(req.Group.CandidateIDs)
++		} else {
++			candidateCount += len(group.CandidateIDs)
++		}
++	}
++	if candidateCount > hotMaxNodes {
++		return outbound.HotInventoryPublication{}, fmt.Errorf("%w: total native candidate count exceeds limit", outbound.ErrHotInventoryInvalid)
++	}
++	if err := validateHotGroupSpec(provider, req.Group); err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	current := original
++	if override, exists := runtime.groupOverrides[req.Group.Name]; exists {
++		current = override.Group
++	}
++	if req.Group.Revision < current.Revision {
++		return outbound.HotInventoryPublication{}, fmt.Errorf("%w: group revision is older than applied revision", outbound.ErrHotInventoryConflict)
++	}
++	if req.Group.Revision == current.Revision {
++		if !slices.Equal(req.Group.CandidateIDs, current.CandidateIDs) {
++			return outbound.HotInventoryPublication{}, fmt.Errorf("%w: group revision identity was reused", outbound.ErrHotInventoryConflict)
++		}
++		return outbound.HotInventoryPublication{Snapshot: before}, nil
++	}
++	entry, release, err := c.prepareHotGroup(ctx, runtime, provider, req.Group, before)
++	if err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	adopted := false
++	defer func() { release(adopted) }()
++	providers := cloneHotProviders(runtime.providers)
++	overrides := cloneHotGroupOverrides(runtime.groupOverrides)
++	overrides[req.Group.Name] = req
++	publication, err := runtime.inventory.Publish(ctx, req.ExpectedGeneration, []outbound.HotInventoryEntry{entry}, func(ctx context.Context, snapshot outbound.HotInventorySnapshot) error {
++		state := runtime.hotStateForSnapshot(providers, runtime.revisions, overrides, snapshot)
++		return runtime.writeState(ctx, state)
++	})
++	if err != nil {
++		c.fenceHotOutcome(runtime, err)
++		return outbound.HotInventoryPublication{}, err
++	}
++	adopted = true
++	runtime.providers = providers
++	if err := c.publishHotOutboundConnectivity(publication.Adopted); err != nil {
++		c.fenceHotOutcome(runtime, ErrHotInventoryDatapathOutcomeUnknown)
++		return publication, ErrHotInventoryDatapathOutcomeUnknown
++	}
++	return publication, nil
++}
++
++func validateHotGroupSpec(provider HotProviderRequest, group HotProviderGroup) error {
++	invalid := func(message string) error { return fmt.Errorf("%w: %s", outbound.ErrHotInventoryInvalid, message) }
++	if group.Revision == 0 || len(group.CandidateIDs) == 0 || len(group.CandidateIDs) > hotMaxNodes {
++		return invalid("nonempty group membership and positive group revision required")
++	}
++	known := make(map[string]bool, len(provider.Nodes))
++	for _, node := range provider.Nodes {
++		known[node.ID] = true
++	}
++	seen := make(map[string]bool, len(group.CandidateIDs))
++	for _, id := range group.CandidateIDs {
++		if !known[id] || seen[id] {
++			return invalid("unknown or duplicate group candidate")
++		}
++		seen[id] = true
++	}
++	if group.Selection != "" && !seen[group.Selection] {
++		return invalid("selected candidate is absent")
++	}
++	return nil
++}
++
++func findHotProviderGroup(provider HotProviderRequest, name string) (HotProviderGroup, bool) {
++	for _, group := range provider.Groups {
++		if group.Name == name {
++			return group, true
++		}
++	}
++	return HotProviderGroup{}, false
++}
++
++func cloneHotGroupRequest(req HotGroupRequest) HotGroupRequest {
++	req.Group.CandidateIDs = append([]string(nil), req.Group.CandidateIDs...)
++	return req
++}
++
++func cloneHotGroupOverrides(source map[string]HotGroupRequest) map[string]HotGroupRequest {
++	result := make(map[string]HotGroupRequest, len(source))
++	for name, req := range source {
++		result[name] = cloneHotGroupRequest(req)
++	}
++	return result
++}
++
++func effectiveHotProvider(provider HotProviderRequest, overrides map[string]HotGroupRequest) HotProviderRequest {
++	provider = cloneHotRequest(provider)
++	for i := range provider.Groups {
++		if override, ok := overrides[provider.Groups[i].Name]; ok && override.ProviderID == provider.ProviderID && override.RevisionID == provider.RevisionID {
++			provider.Groups[i] = cloneHotGroupRequest(override).Group
++		}
++	}
++	return provider
++}
++
++func validateHotGroupOverrides(state hotDurableState) error {
++	for name, override := range state.GroupOverrides {
++		provider, found := state.Providers[override.ProviderID]
++		original, owned := findHotProviderGroup(provider, name)
++		if !found || !owned || override.RevisionID != provider.RevisionID || override.Group.Name != name || override.Group.Revision <= original.Revision {
++			return errors.New("invalid hot group override ownership or revision")
++		}
++		if err := validateHotGroupSpec(provider, override.Group); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// hotStateForSnapshot keeps provider revision hashes stable even when a group
++// chooses a node that was not in its original membership. The effective group
++// override stores that choice; original provider choices remain valid for their
++// immutable original membership and are ignored for overridden groups on restore.
++func (r *hotProviderRuntime) hotStateForSnapshot(providers map[string]HotProviderRequest, revisions map[string]map[string]string, overrides map[string]HotGroupRequest, snapshot outbound.HotInventorySnapshot) hotDurableState {
++	if overrides == nil {
++		overrides = cloneHotGroupOverrides(r.groupOverrides)
++	}
++	choices := make(map[string]string, len(snapshot.Groups))
++	for _, group := range snapshot.Groups {
++		choices[group.Name] = group.Selection
++	}
++	for id, provider := range providers {
++		for i, group := range provider.Groups {
++			if override, exists := overrides[group.Name]; exists {
++				override.Group.Selection = choices[group.Name]
++				overrides[group.Name] = override
++			} else {
++				provider.Groups[i].Selection = choices[group.Name]
++			}
++		}
++		providers[id] = provider
++	}
++	return hotDurableState{Version: 1, Generation: snapshot.Generation, Handles: r.handles, Providers: providers, Revisions: revisions, GroupOverrides: overrides}
++}
++
++// prepareHotGroup reuses every available unchanged native candidate. Temporary
++// leases prevent concurrent flow release from retiring resources before Publish
++// acquires ownership. A previously removed candidate can be recreated from its
++// immutable provider link without refetching the subscription.
++func (c *ControlPlane) prepareHotGroup(ctx context.Context, runtime *hotProviderRuntime, provider HotProviderRequest, spec HotProviderGroup, snapshot outbound.HotInventorySnapshot) (entry outbound.HotInventoryEntry, release func(bool), retErr error) {
++	entry = outbound.HotInventoryEntry{Handle: runtime.handles[spec.Name], Identity: provider.ProviderID + "/" + provider.RevisionID, GroupRevision: spec.Revision, Selection: spec.Selection}
++	for _, group := range snapshot.Groups {
++		if group.Name == spec.Name && slices.Contains(spec.CandidateIDs, group.Selection) {
++			entry.Selection = group.Selection
++		}
++	}
++	if entry.Selection == "" || !slices.Contains(spec.CandidateIDs, entry.Selection) {
++		return entry, nil, fmt.Errorf("%w: selected candidate disappeared; explicit replacement required", outbound.ErrHotInventoryInvalid)
++	}
++	var leases []*outbound.HotInventoryLease
++	var created []*dialer.Dialer
++	cleanup := func(adopted bool) {
++		if !adopted {
++			if entry.Group != nil {
++				_ = entry.Group.Close()
++			}
++			for _, d := range created {
++				_ = d.Close()
++				dialer.CleanupTransportCacheNamespace(d.TransportCacheNamespace)
++			}
++		}
++		for _, lease := range leases {
++			_ = lease.Release()
++		}
++	}
++	release = cleanup
++	defer func() {
++		if retErr != nil {
++			cleanup(false)
++		}
++	}()
++	var native []*dialer.Dialer
++	var annotations []*dialer.Annotation
++	fixed := 0
++	for i, id := range spec.CandidateIDs {
++		if err := ctx.Err(); err != nil {
++			return entry, nil, err
++		}
++		var candidate *dialer.Dialer
++		// Search target first so a membership edit retains its exact transport.
++		for _, targetFirst := range []bool{true, false} {
++			for _, group := range snapshot.Groups {
++				if (group.Name == spec.Name) != targetFirst || group.Identity != entry.Identity || !slices.Contains(group.CandidateIDs, id) {
++					continue
++				}
++				lease, err := runtime.inventory.AcquireCandidate(group.Handle, id)
++				if err != nil {
++					return entry, nil, err
++				}
++				leases = append(leases, lease)
++				candidate = lease.Dialer
++				break
++			}
++			if candidate != nil {
++				break
++			}
++		}
++		if candidate == nil {
++			singleton := cloneHotRequest(provider)
++			singleton.Groups = []HotProviderGroup{{Name: spec.Name, Revision: spec.Revision, CandidateIDs: []string{id}, Selection: id}}
++			prepared, err := c.prepareHotProvider(ctx, runtime, singleton, nil)
++			if err != nil {
++				return entry, nil, err
++			}
++			candidate = prepared[0].Candidates[0].Dialer
++			_ = prepared[0].Group.Close()
++			created = append(created, candidate)
++		}
++		native = append(native, candidate)
++		annotations = append(annotations, &dialer.Annotation{})
++		entry.Candidates = append(entry.Candidates, outbound.HotInventoryCandidate{ID: id, Dialer: candidate})
++		if id == entry.Selection {
++			fixed = i
++		}
++	}
++	entry.Group = outbound.NewDialerGroup(native[0].GlobalOption, spec.Name, native, annotations, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: fixed}, func(bool, *dialer.NetworkType, bool) {})
++	return entry, release, nil
++}
+diff --git a/control/hot_group_test.go b/control/hot_group_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5451dde08c1bcb45c27f1c094a92e7ead598f361
+--- /dev/null
++++ b/control/hot_group_test.go
+@@ -0,0 +1,270 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++
++	"github.com/daeuniverse/dae/component/outbound"
++)
++
++func TestHotGroupPublishUnchangedProviderPreservesUnrelatedFlowsAndRestarts(t *testing.T) {
++	link := hotTestSOCKS(t)
++	dir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, dir, "first", "second")
++	provider := hotTestRequest("p", "one", "first", 1, link)
++	provider.Groups = append(provider.Groups, HotProviderGroup{Name: "second", CandidateIDs: []string{"p-a", "p-b"}, Selection: "p-b"})
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	old := hotTestAcquire(t, cp, 2)
++	unrelated := hotTestAcquire(t, cp, 3)
++	conn, err := old.Dialer.DialContext(context.Background(), "tcp", "example.com:443")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	hotTestEcho(t, conn, "before-group-edit")
++	request := HotGroupRequest{ExpectedGeneration: 2, ProviderID: "p", RevisionID: "one", Group: HotProviderGroup{Name: "first", Revision: 2, CandidateIDs: []string{"p-a"}}}
++	publication, err := cp.PublishHotGroup(context.Background(), request)
++	if err != nil || publication.Snapshot.Generation != 3 || !reflect.DeepEqual(publication.Adopted, []uint8{2}) {
++		t.Fatalf("group publication: %#v %v", publication, err)
++	}
++	current := hotTestAcquire(t, cp, 2)
++	again := hotTestAcquire(t, cp, 3)
++	if current.Dialer != old.Dialer {
++		t.Fatal("unchanged candidate dialer was rebuilt")
++	}
++	if current.Identity != "p/one" || current.CandidateID != "p-a" || len(current.Group.Dialers) != 1 {
++		t.Fatalf("unexpected published group: %#v", current)
++	}
++	if again.Group != unrelated.Group || again.Dialer != unrelated.Dialer {
++		t.Fatal("group publication replaced unrelated native resources")
++	}
++	hotTestEcho(t, conn, "after-group-edit")
++	runtime := cp.hotInventory.Load()
++	if !reflect.DeepEqual(provider.Nodes, runtime.providers["p"].Nodes) || !sameHotRevision(provider, runtime.providers["p"]) {
++		t.Fatal("group change altered immutable provider revision")
++	}
++	snapshot, _ := cp.HotInventorySnapshot()
++	if snapshot.Groups[0].GroupRevision != 2 || !reflect.DeepEqual(snapshot.Groups[0].CandidateIDs, []string{"p-a"}) {
++		t.Fatalf("group readback does not identify applied revision: %#v", snapshot.Groups[0])
++	}
++	if _, err = cp.SetHotSelection(context.Background(), 3, 2, "p-a"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = cp.SetHotSelection(context.Background(), 3, 2, "p-b"); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("removed candidate selectable: %v", err)
++	}
++	_ = conn.Close()
++	_ = old.Release()
++	_ = current.Release()
++	_ = unrelated.Release()
++	_ = again.Release()
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	restored := hotTestControlPlane(t, dir, "first", "second")
++	restoredGroup := hotTestAcquire(t, restored, 2)
++	if restoredGroup.Identity != "p/one" || restoredGroup.CandidateID != "p-a" || len(restoredGroup.Group.Dialers) != 1 {
++		t.Fatalf("restart lost independent group state: %#v", restoredGroup)
++	}
++	snapshot, _ = restored.HotInventorySnapshot()
++	if snapshot.Generation != 3 || snapshot.Groups[0].GroupRevision != 2 {
++		t.Fatalf("restart lost group revision/generation: %#v", snapshot)
++	}
++}
++
++func TestHotGroupPublishRejectsStaleOrInvalidWithoutChangingDurableState(t *testing.T) {
++	link := hotTestSOCKS(t)
++	dir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, dir, "first")
++	provider := hotTestRequest("p", "one", "first", 1, link)
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	original, _ := os.ReadFile(filepath.Join(dir, hotStateFile))
++	good := HotGroupRequest{ExpectedGeneration: 2, ProviderID: "p", RevisionID: "one", Group: HotProviderGroup{Name: "first", Revision: 1, CandidateIDs: []string{"p-a"}}}
++	cases := []struct {
++		name   string
++		change func(*HotGroupRequest)
++		want   error
++	}{
++		{"stale_generation", func(r *HotGroupRequest) { r.ExpectedGeneration = 1 }, outbound.ErrHotInventoryConflict},
++		{"inactive_provider", func(r *HotGroupRequest) { r.RevisionID = "two" }, outbound.ErrHotInventoryConflict},
++		{"unknown_group", func(r *HotGroupRequest) { r.Group.Name = "missing" }, outbound.ErrHotInventoryInvalid},
++		{"foreign_candidate", func(r *HotGroupRequest) { r.Group.CandidateIDs = []string{"q-a"} }, outbound.ErrHotInventoryInvalid},
++		{"duplicate_candidate", func(r *HotGroupRequest) { r.Group.CandidateIDs = []string{"p-a", "p-a"} }, outbound.ErrHotInventoryInvalid},
++		{"empty", func(r *HotGroupRequest) { r.Group.CandidateIDs = nil }, outbound.ErrHotInventoryInvalid},
++		{"revision_zero", func(r *HotGroupRequest) { r.Group.Revision = 0 }, outbound.ErrHotInventoryInvalid},
++		{"selected_removed", func(r *HotGroupRequest) { r.Group.CandidateIDs = []string{"p-b"} }, outbound.ErrHotInventoryInvalid},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			request := cloneHotGroupRequest(good)
++			tc.change(&request)
++			if _, err := cp.PublishHotGroup(context.Background(), request); !errors.Is(err, tc.want) {
++				t.Fatalf("got %v want %v", err, tc.want)
++			}
++			actual, _ := os.ReadFile(filepath.Join(dir, hotStateFile))
++			if !bytes.Equal(original, actual) {
++				t.Fatal("rejected group write changed durable authority")
++			}
++			snapshot, _ := cp.HotInventorySnapshot()
++			if snapshot.Generation != 2 {
++				t.Fatalf("rejected group write changed generation: %d", snapshot.Generation)
++			}
++		})
++	}
++	good.Group.CandidateIDs = []string{"p-b"}
++	good.Group.Selection = "p-b"
++	if _, err := cp.PublishHotGroup(context.Background(), good); err != nil {
++		t.Fatal(err)
++	}
++	original, _ = os.ReadFile(filepath.Join(dir, hotStateFile))
++	good.ExpectedGeneration = 3
++	result, err := cp.PublishHotGroup(context.Background(), good)
++	if err != nil || result.Snapshot.Generation != 3 || len(result.Adopted) != 0 {
++		t.Fatalf("same group revision not a no-op: %#v %v", result, err)
++	}
++	actual, _ := os.ReadFile(filepath.Join(dir, hotStateFile))
++	if !bytes.Equal(original, actual) {
++		t.Fatal("no-op rewrote group state")
++	}
++	good.Group.CandidateIDs = []string{"p-a"}
++	good.Group.Selection = "p-a"
++	if _, err := cp.PublishHotGroup(context.Background(), good); !errors.Is(err, outbound.ErrHotInventoryConflict) {
++		t.Fatalf("same group revision content mutation accepted: %v", err)
++	}
++}
++
++func TestHotGroupAddExistingProviderCandidateSelectionRestart(t *testing.T) {
++	link := hotTestSOCKS(t)
++	dir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, dir, "first", "second")
++	provider := hotTestRequest("p", "one", "first", 1, link)
++	provider.Groups[0].CandidateIDs = []string{"p-a"}
++	provider.Groups = append(provider.Groups, HotProviderGroup{Name: "second", CandidateIDs: []string{"p-b"}, Selection: "p-b"})
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	req := HotGroupRequest{ExpectedGeneration: 2, ProviderID: "p", RevisionID: "one", Group: HotProviderGroup{Name: "first", Revision: 1, CandidateIDs: []string{"p-a", "p-b"}}}
++	if _, err := cp.PublishHotGroup(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := cp.SetHotSelection(context.Background(), 3, 2, "p-b"); err != nil {
++		t.Fatal(err)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	restored := hotTestControlPlane(t, dir, "first", "second")
++	lease := hotTestAcquire(t, restored, 2)
++	if lease.CandidateID != "p-b" || len(lease.Group.Dialers) != 2 {
++		t.Fatalf("new candidate choice lost over restart: %#v", lease)
++	}
++}
++
++func TestHotGroupSuccessiveRevisionsAndProviderRefresh(t *testing.T) {
++	link := hotTestSOCKS(t)
++	dir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, dir, "first")
++	provider := hotTestRequest("p", "one", "first", 1, link)
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	req := HotGroupRequest{ExpectedGeneration: 2, ProviderID: "p", RevisionID: "one", Group: HotProviderGroup{Name: "first", Revision: 2, CandidateIDs: []string{"p-a"}}}
++	if _, err := cp.PublishHotGroup(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	req.ExpectedGeneration = 3
++	req.Group.Revision = 3
++	req.Group.CandidateIDs = []string{"p-a", "p-b"}
++	if result, err := cp.PublishHotGroup(context.Background(), req); err != nil || result.Snapshot.Generation != 4 {
++		t.Fatalf("second group revision: %#v %v", result, err)
++	}
++	req.ExpectedGeneration = 4
++	req.Group.Revision = 2
++	if _, err := cp.PublishHotGroup(context.Background(), req); !errors.Is(err, outbound.ErrHotInventoryConflict) {
++		t.Fatalf("older group revision accepted: %v", err)
++	}
++	// A later provider revision installs its complete supplied group definition
++	// and must remove overrides tied to the old provider revision.
++	provider.ExpectedGeneration = 4
++	provider.RevisionID = "two"
++	provider.Groups[0].Revision = 4
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	if len(cp.hotInventory.Load().groupOverrides) != 0 {
++		t.Fatal("provider refresh retained stale group override")
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	restored := hotTestControlPlane(t, dir, "first")
++	snapshot, err := restored.HotInventorySnapshot()
++	if err != nil || snapshot.Generation != 5 || snapshot.Groups[0].Identity != "p/two" || snapshot.Groups[0].GroupRevision != 4 {
++		t.Fatalf("provider refresh restore: %#v %v", snapshot, err)
++	}
++}
++
++func TestHotGroupOperationLostAcknowledgementAndRejectedRetryRestart(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, dir, "first")
++	provider := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), provider); err != nil {
++		t.Fatal(err)
++	}
++	req := HotGroupRequest{ExpectedGeneration: 2, ProviderID: "p", RevisionID: "one", Group: HotProviderGroup{Name: "first", Revision: 1, CandidateIDs: []string{"p-a"}}}
++	id := hotTestOperationID(5, 1)
++	if _, err := cp.PublishHotGroupOperation(context.Background(), id, req); err != nil {
++		t.Fatal(err)
++	}
++	receipt := hotTestOperationReceipt(t, cp, id, "committed", 3)
++	if receipt.Kind != "group_publish" {
++		t.Fatalf("wrong receipt kind %s", receipt.Kind)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, dir, "first")
++	before, _ := os.ReadFile(filepath.Join(dir, hotStateFile))
++	result, err := cp.PublishHotGroupOperation(context.Background(), id, req)
++	if err != nil || result.Snapshot.Generation != 3 || len(result.Adopted) != 0 {
++		t.Fatalf("group ack recovery: %#v %v", result, err)
++	}
++	after, _ := os.ReadFile(filepath.Join(dir, hotStateFile))
++	if !bytes.Equal(before, after) {
++		t.Fatal("group operation replay rewrote durable state")
++	}
++	invalid := cloneHotGroupRequest(req)
++	invalid.ExpectedGeneration = 3
++	invalid.Group.Revision = 2
++	invalid.Group.CandidateIDs = []string{"p-b"}
++	rejectedID := hotTestOperationID(5, 2)
++	if _, err := cp.PublishHotGroupOperation(context.Background(), rejectedID, invalid); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("invalid group accepted: %v", err)
++	}
++	hotTestOperationReceipt(t, cp, rejectedID, "rejected", 3)
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, dir, "first")
++	if _, err := cp.PublishHotGroupOperation(context.Background(), rejectedID, invalid); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("rejected group replay changed result: %v", err)
++	}
++	snapshot, _ := cp.HotInventorySnapshot()
++	if snapshot.Generation != 3 || snapshot.Groups[0].Selection != "p-a" {
++		t.Fatalf("rejected replay mutated native state: %#v", snapshot)
++	}
++}
 diff --git a/control/hot_inventory.go b/control/hot_inventory.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a03f91a32b
+index 0000000000000000000000000000000000000000..1b47e2b322e7369a45df5d1200a88297fbe4b591
 --- /dev/null
 +++ b/control/hot_inventory.go
-@@ -0,0 +1,855 @@
+@@ -0,0 +1,902 @@
 +/*
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
@@ -3394,21 +4080,29 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +}
 +
 +type HotProviderGroup struct {
++	Revision     uint64   `json:"revision,omitempty"`
 +	Name         string   `json:"name"`
 +	CandidateIDs []string `json:"candidate_ids"`
 +	Selection    string   `json:"selection"`
 +}
 +
 +type hotProviderRuntime struct {
-+	mu        sync.Mutex
-+	inventory *outbound.HotInventory
-+	providers map[string]HotProviderRequest
-+	revisions map[string]map[string]string
-+	handles   map[string]uint8
-+	stateDir  *os.File
-+	aead      cipher.AEAD
-+	syncDir   func() error
-+	closed    bool
++	mu             sync.Mutex
++	inventory      *outbound.HotInventory
++	providers      map[string]HotProviderRequest
++	groupOverrides map[string]HotGroupRequest
++	revisions      map[string]map[string]string
++	handles        map[string]uint8
++	stateDir       *os.File
++	aead           cipher.AEAD
++	syncDir        func() error
++	closed         bool
++	// operations contains one durable receipt for each client authority. It is
++	// deliberately bounded so a compromised management client cannot turn the
++	// encrypted journal into an unbounded operation log. The latest sequence
++	// number is sufficient to fence retries and skipped requests.
++	operations       map[string]HotOperationReceipt
++	pendingOperation *hotOperationPending
 +}
 +
 +type hotStateEnvelope struct {
@@ -3432,11 +4126,13 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +}
 +
 +type hotDurableState struct {
-+	Version    int                           `json:"version"`
-+	Generation uint64                        `json:"generation"`
-+	Handles    map[string]uint8              `json:"handles"`
-+	Providers  map[string]HotProviderRequest `json:"providers"`
-+	Revisions  map[string]map[string]string  `json:"revisions"`
++	GroupOverrides map[string]HotGroupRequest     `json:"group_overrides,omitempty"`
++	Version        int                            `json:"version"`
++	Generation     uint64                         `json:"generation"`
++	Handles        map[string]uint8               `json:"handles"`
++	Providers      map[string]HotProviderRequest  `json:"providers"`
++	Revisions      map[string]map[string]string   `json:"revisions"`
++	Operations     map[string]HotOperationReceipt `json:"operations,omitempty"`
 +}
 +
 +// EnableHotInventory restores the latest committed provider definitions and
@@ -3460,7 +4156,7 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +	if err != nil {
 +		return err
 +	}
-+	runtime := &hotProviderRuntime{providers: make(map[string]HotProviderRequest), revisions: make(map[string]map[string]string), handles: make(map[string]uint8), stateDir: root, aead: aead}
++	runtime := &hotProviderRuntime{providers: make(map[string]HotProviderRequest), revisions: make(map[string]map[string]string), handles: make(map[string]uint8), operations: make(map[string]HotOperationReceipt), stateDir: root, aead: aead}
 +	defer func() {
 +		if retErr != nil {
 +			_ = runtime.close()
@@ -3508,6 +4204,14 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +			return err
 +		}
 +		runtime.revisions = cloneHotRevisionHistory(state.Revisions)
++		if err := validateHotGroupOverrides(state); err != nil {
++			return err
++		}
++		runtime.groupOverrides = cloneHotGroupOverrides(state.GroupOverrides)
++		runtime.operations = cloneHotOperationReceipts(state.Operations)
++		if err := validateHotOperationReceipts(runtime.operations, state.Generation); err != nil {
++			return err
++		}
 +		ids := make([]string, 0, len(state.Providers))
 +		for id := range state.Providers {
 +			ids = append(ids, id)
@@ -3521,7 +4225,7 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +			if err := runtime.validateRequest(req); err != nil {
 +				return fmt.Errorf("invalid stored hot provider: %w", err)
 +			}
-+			next, err := c.prepareHotProvider(context.Background(), runtime, req, nil)
++			next, err := c.prepareHotProvider(context.Background(), runtime, effectiveHotProvider(req, runtime.groupOverrides), nil)
 +			if err != nil {
 +				return err
 +			}
@@ -3594,6 +4298,10 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +	}
 +	runtime.mu.Lock()
 +	defer runtime.mu.Unlock()
++	return c.publishHotProviderLocked(ctx, runtime, req)
++}
++
++func (c *ControlPlane) publishHotProviderLocked(ctx context.Context, runtime *hotProviderRuntime, req HotProviderRequest) (outbound.HotInventoryPublication, error) {
 +	if runtime.closed {
 +		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
 +	}
@@ -3644,9 +4352,14 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +		revisions[req.ProviderID] = make(map[string]string)
 +	}
 +	revisions[req.ProviderID][req.RevisionID] = digest
++	overrides := cloneHotGroupOverrides(runtime.groupOverrides)
++	for name, override := range overrides {
++		if override.ProviderID == req.ProviderID {
++			delete(overrides, name)
++		}
++	}
 +	publication, err := runtime.inventory.Publish(ctx, req.ExpectedGeneration, entries, func(ctx context.Context, snapshot outbound.HotInventorySnapshot) error {
-+		syncHotSelections(providers, snapshot)
-+		return runtime.writeState(ctx, hotDurableState{Version: 1, Generation: snapshot.Generation, Handles: runtime.handles, Providers: providers, Revisions: revisions})
++		return runtime.writeState(ctx, runtime.hotStateForSnapshot(providers, revisions, overrides, snapshot))
 +	})
 +	if err != nil {
 +		c.fenceHotOutcome(runtime, err)
@@ -3671,13 +4384,16 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +	}
 +	runtime.mu.Lock()
 +	defer runtime.mu.Unlock()
++	return c.setHotSelectionLocked(ctx, runtime, expected, handle, candidateID)
++}
++
++func (c *ControlPlane) setHotSelectionLocked(ctx context.Context, runtime *hotProviderRuntime, expected uint64, handle uint8, candidateID string) (outbound.HotInventoryPublication, error) {
 +	if runtime.closed {
 +		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
 +	}
 +	providers := cloneHotProviders(runtime.providers)
 +	publication, err := runtime.inventory.SetSelection(ctx, expected, handle, candidateID, func(ctx context.Context, snapshot outbound.HotInventorySnapshot) error {
-+		syncHotSelections(providers, snapshot)
-+		return runtime.writeState(ctx, hotDurableState{Version: 1, Generation: snapshot.Generation, Handles: runtime.handles, Providers: providers, Revisions: runtime.revisions})
++		return runtime.writeState(ctx, runtime.hotStateForSnapshot(providers, runtime.revisions, nil, snapshot))
 +	})
 +	if err == nil {
 +		runtime.providers = providers
@@ -3811,7 +4527,7 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +		if !found {
 +			return entries, fmt.Errorf("%w: selected candidate disappeared; explicit replacement required", outbound.ErrHotInventoryInvalid)
 +		}
-+		entry := outbound.HotInventoryEntry{Handle: handle, Identity: req.ProviderID + "/" + req.RevisionID, Selection: choice}
++		entry := outbound.HotInventoryEntry{Handle: handle, Identity: req.ProviderID + "/" + req.RevisionID, GroupRevision: spec.Revision, Selection: choice}
 +		var native []*dialer.Dialer
 +		var annotations []*dialer.Annotation
 +		fixed := 0
@@ -4097,6 +4813,21 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +}
 +
 +func (r *hotProviderRuntime) writeState(ctx context.Context, state hotDurableState) error {
++	if state.GroupOverrides == nil {
++		state.GroupOverrides = cloneHotGroupOverrides(r.groupOverrides)
++	}
++	if state.Operations == nil {
++		state.Operations = cloneHotOperationReceipts(r.operations)
++	}
++	if pending := r.pendingOperation; pending != nil {
++		receipt := pending.Receipt
++		receipt.Generation = state.Generation
++		identity, err := parseHotOperationID(receipt.OperationID)
++		if err != nil {
++			return err
++		}
++		state.Operations[identity.Client] = receipt
++	}
 +	plaintext, err := json.Marshal(state)
 +	if err != nil || len(plaintext) > hotMaxStateBytes {
 +		return errors.New("hot inventory state exceeds storage limit")
@@ -4187,6 +4918,8 @@ index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a0
 +		}
 +		return errors.New("hot inventory directory sync failed; previous state restored")
 +	}
++	r.operations = cloneHotOperationReceipts(state.Operations)
++	r.groupOverrides = cloneHotGroupOverrides(state.GroupOverrides)
 +	return nil
 +}
 diff --git a/control/hot_inventory_test.go b/control/hot_inventory_test.go
@@ -4824,6 +5557,790 @@ index 0000000000000000000000000000000000000000..03f27eaac10febde4a8fefecb141b547
 +	}
 +	if len(runtime.revisions["p"]) != hotMaxRevisions || runtime.revisions["p"]["one"] == "" {
 +		t.Fatal("history bound evicted a protected identity")
++	}
++}
+diff --git a/control/hot_operations.go b/control/hot_operations.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc989de6d9f41ec839c920eb4b9f0a21fcea1399
+--- /dev/null
++++ b/control/hot_operations.go
+@@ -0,0 +1,348 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++// Durable hot operations are intentionally implemented in the control
++// package, next to the encrypted inventory journal. An operation receipt is
++// the authority that lets a client safely retry after a lost HTTP response:
++// the daemon never guesses whether a mutation happened.
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"regexp"
++	"strconv"
++
++	"github.com/daeuniverse/dae/component/outbound"
++)
++
++const hotOperationMaxClients = 64
++
++var hotOperationIDPattern = regexp.MustCompile(`^([0-9a-f]{32}):([1-9][0-9]*)$`)
++
++var (
++	ErrHotOperationInvalid        = errors.New("invalid hot operation")
++	ErrHotOperationConflict       = errors.New("hot operation request conflicts with durable receipt")
++	ErrHotOperationExpired        = errors.New("hot operation receipt has expired")
++	ErrHotOperationSequence       = errors.New("hot operation sequence must be the next sequence")
++	ErrHotOperationLimit          = errors.New("hot operation authority limit reached")
++	ErrHotOperationOutcomeUnknown = errors.New("hot operation outcome is unknown; restart and readback required")
++)
++
++// HotOperationReceipt is the compact, encrypted, per-client durable record.
++// The daemon retains only the latest receipt for each client authority.
++type HotOperationReceipt struct {
++	OperationID   string `json:"operation_id"`
++	RequestDigest string `json:"request_digest"`
++	Kind          string `json:"kind"`
++	State         string `json:"state"` // committed, rejected, not_started
++	Generation    uint64 `json:"generation,omitempty"`
++	ErrorCode     string `json:"error_code,omitempty"`
++}
++
++type hotOperationIdentity struct {
++	ID     string
++	Client string
++	Seq    uint64
++}
++
++type hotOperationPending struct {
++	Receipt HotOperationReceipt
++}
++
++func cloneHotOperationReceipts(in map[string]HotOperationReceipt) map[string]HotOperationReceipt {
++	out := make(map[string]HotOperationReceipt, len(in))
++	for client, receipt := range in {
++		out[client] = receipt
++	}
++	return out
++}
++
++func validateHotOperationReceipts(receipts map[string]HotOperationReceipt, generation uint64) error {
++	if len(receipts) > hotOperationMaxClients {
++		return errors.New("hot inventory operation authority limit exceeded")
++	}
++	for client, receipt := range receipts {
++		id, err := parseHotOperationID(receipt.OperationID)
++		digest, digestErr := hex.DecodeString(receipt.RequestDigest)
++		if err != nil || id.Client != client || digestErr != nil || len(digest) != 32 || receipt.Generation == 0 || receipt.Generation > generation {
++			return errors.New("invalid hot inventory operation receipt")
++		}
++		if receipt.State != "committed" && receipt.State != "rejected" || receipt.Kind != "provider_publish" && receipt.Kind != "selection_set" && receipt.Kind != "group_publish" {
++			return errors.New("invalid hot inventory operation receipt state")
++		}
++		if receipt.State == "committed" && receipt.ErrorCode != "" || receipt.State == "rejected" && receipt.ErrorCode == "" {
++			return errors.New("invalid hot inventory operation error receipt")
++		}
++	}
++	return nil
++}
++
++func parseHotOperationID(id string) (hotOperationIdentity, error) {
++	matches := hotOperationIDPattern.FindStringSubmatch(id)
++	if matches == nil {
++		return hotOperationIdentity{}, fmt.Errorf("%w: operation ID must be 32 lowercase hex client characters and a positive sequence", ErrHotOperationInvalid)
++	}
++	seq, err := strconv.ParseUint(matches[2], 10, 64)
++	if err != nil || seq == 0 {
++		return hotOperationIdentity{}, fmt.Errorf("%w: invalid operation sequence", ErrHotOperationInvalid)
++	}
++	return hotOperationIdentity{ID: id, Client: matches[1], Seq: seq}, nil
++}
++
++func hotOperationDigest(kind string, request any) string {
++	// Normalize request object ordering while retaining integer precision.
++	// Clients can use a different Go DTO field order without changing identity.
++	raw, _ := json.Marshal(request)
++	var normalized any
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.UseNumber()
++	_ = decoder.Decode(&normalized)
++	payload, _ := json.Marshal(struct {
++		Kind    string `json:"kind"`
++		Request any    `json:"request"`
++	}{Kind: kind, Request: normalized})
++	hash := sha256.Sum256(payload)
++	return hex.EncodeToString(hash[:])
++}
++
++func hotOperationErrorCode(err error) string {
++	switch {
++	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
++		return "request_canceled"
++	case errors.Is(err, outbound.ErrHotInventoryConflict):
++		return "generation_conflict"
++	case errors.Is(err, outbound.ErrHotInventoryBusy):
++		return "inventory_busy"
++	case errors.Is(err, outbound.ErrHotInventoryInvalid), errors.Is(err, outbound.ErrHotInventoryUnmanaged):
++		return "invalid_request"
++	case errors.Is(err, ErrHotOperationLimit):
++		return "operation_limit"
++	default:
++		return "mutation_rejected"
++	}
++}
++
++func (r *hotProviderRuntime) operationState(id string, digest string) (HotOperationReceipt, hotOperationIdentity, error) {
++	identity, err := parseHotOperationID(id)
++	if err != nil {
++		return HotOperationReceipt{}, identity, err
++	}
++	if r.operations == nil {
++		r.operations = make(map[string]HotOperationReceipt)
++	}
++	if previous, exists := r.operations[identity.Client]; exists {
++		prior, priorErr := parseHotOperationID(previous.OperationID)
++		if priorErr != nil {
++			return HotOperationReceipt{}, identity, fmt.Errorf("%w: corrupt durable operation receipt", ErrHotOperationInvalid)
++		}
++		switch {
++		case identity.Seq < prior.Seq:
++			return HotOperationReceipt{}, identity, fmt.Errorf("%w: %s", ErrHotOperationExpired, previous.OperationID)
++		case identity.Seq == prior.Seq:
++			if previous.RequestDigest != digest {
++				return HotOperationReceipt{}, identity, ErrHotOperationConflict
++			}
++			return previous, identity, nil
++		case identity.Seq != prior.Seq+1:
++			return HotOperationReceipt{}, identity, fmt.Errorf("%w: expected %d", ErrHotOperationSequence, prior.Seq+1)
++		}
++	} else if identity.Seq != 1 {
++		return HotOperationReceipt{}, identity, fmt.Errorf("%w: expected 1", ErrHotOperationSequence)
++	}
++	if len(r.operations) >= hotOperationMaxClients && r.operations[identity.Client].OperationID == "" {
++		return HotOperationReceipt{}, identity, ErrHotOperationLimit
++	}
++	return HotOperationReceipt{}, identity, nil
++}
++
++func (r *hotProviderRuntime) operationStateLocked(id, digest string) (HotOperationReceipt, hotOperationIdentity, error) {
++	return r.operationState(id, digest)
++}
++
++// RunHotOperation serializes an operation with native inventory mutations.
++// The callback executes with runtime.mu held and must use the private locked
++// mutation helpers. A committed receipt is included in the same encrypted
++// state transaction as the inventory snapshot. Rejected validation and
++// precommit failures receive their own durable receipt, so retrying the same
++// ID cannot accidentally run it later.
++func (c *ControlPlane) runHotOperation(ctx context.Context, operationID, kind string, request any, mutate func(*hotProviderRuntime) (outbound.HotInventoryPublication, error)) (outbound.HotInventoryPublication, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return outbound.HotInventoryPublication{}, errors.New("hot inventory is disabled")
++	}
++	digest := hotOperationDigest(kind, request)
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
++	}
++	previous, identity, err := runtime.operationStateLocked(operationID, digest)
++	if err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	if previous.OperationID != "" {
++		if previous.State == "rejected" {
++			return outbound.HotInventoryPublication{}, hotRejectedOperationError(previous.ErrorCode)
++		}
++		return outbound.HotInventoryPublication{Snapshot: runtime.inventory.Snapshot()}, nil
++	}
++	if err := ctx.Err(); err != nil {
++		receipt := HotOperationReceipt{OperationID: identity.ID, RequestDigest: digest, Kind: kind, State: "rejected", ErrorCode: hotOperationErrorCode(err)}
++		if persistErr := c.persistHotOperationRejectionLocked(context.Background(), runtime, receipt); persistErr != nil {
++			return outbound.HotInventoryPublication{}, persistErr
++		}
++		return outbound.HotInventoryPublication{}, err
++	}
++	receipt := HotOperationReceipt{OperationID: identity.ID, RequestDigest: digest, Kind: kind, State: "committed"}
++	runtime.pendingOperation = &hotOperationPending{Receipt: receipt}
++	publication, mutateErr := mutate(runtime)
++	runtime.pendingOperation = nil
++	if mutateErr != nil {
++		// If the transaction callback durably wrote our receipt, the mutation
++		// committed even if datapath readback later failed. Return the durable
++		// receipt and the datapath error to the caller.
++		if committed := runtime.operations[identity.Client]; committed.OperationID == operationID && committed.RequestDigest == digest {
++			return publication, mutateErr
++		}
++		if errors.Is(mutateErr, ErrHotInventoryStorageOutcomeUnknown) || errors.Is(mutateErr, ErrHotInventoryDatapathOutcomeUnknown) {
++			return publication, fmt.Errorf("%w: %v", ErrHotOperationOutcomeUnknown, mutateErr)
++		}
++		receipt.State = "rejected"
++		receipt.ErrorCode = hotOperationErrorCode(mutateErr)
++		if persistErr := c.persistHotOperationRejectionLocked(context.Background(), runtime, receipt); persistErr != nil {
++			return publication, persistErr
++		}
++		return publication, mutateErr
++	}
++	// Identity no-ops do not call HotInventory's commit callback. Persist the
++	// successful receipt independently at the current generation.
++	if committed := runtime.operations[identity.Client]; committed.OperationID != operationID || committed.RequestDigest != digest {
++		receipt.Generation = publication.Snapshot.Generation
++		if err := c.persistHotOperationLocked(context.Background(), runtime, receipt); err != nil {
++			return publication, err
++		}
++	} else {
++		receipt = committed
++	}
++	return publication, nil
++}
++
++func (c *ControlPlane) persistHotOperationRejectionLocked(ctx context.Context, runtime *hotProviderRuntime, receipt HotOperationReceipt) error {
++	receipt.State = "rejected"
++	receipt.Generation = runtime.inventory.Snapshot().Generation
++	if receipt.ErrorCode == "" {
++		receipt.ErrorCode = "mutation_rejected"
++	}
++	return c.persistHotOperationLocked(ctx, runtime, receipt)
++}
++
++func (c *ControlPlane) persistHotOperationLocked(ctx context.Context, runtime *hotProviderRuntime, receipt HotOperationReceipt) error {
++	if runtime.operations == nil {
++		runtime.operations = make(map[string]HotOperationReceipt)
++	}
++	identity, err := parseHotOperationID(receipt.OperationID)
++	if err != nil {
++		return err
++	}
++	if len(runtime.operations) >= hotOperationMaxClients && runtime.operations[identity.Client].OperationID == "" {
++		return ErrHotOperationLimit
++	}
++	operations := cloneHotOperationReceipts(runtime.operations)
++	operations[identity.Client] = receipt
++	state := hotDurableState{Version: 1, Generation: runtime.inventory.Snapshot().Generation, Handles: runtime.handles, Providers: runtime.providers, Revisions: runtime.revisions, Operations: operations}
++	if err := runtime.writeState(ctx, state); err != nil {
++		// A terminal response is only authoritative when its receipt is durable.
++		// Fence until restart readback if even the rejection cannot be recorded.
++		c.fenceHotOutcome(runtime, ErrHotInventoryStorageOutcomeUnknown)
++		return ErrHotOperationOutcomeUnknown
++	}
++	runtime.operations = operations
++	return nil
++}
++
++// HotOperationStatus reads the authoritative receipt after a restart. A
++// missing next sequence is an explicit not_started result; older or skipped
++// sequences are never guessed or replayed.
++func (c *ControlPlane) HotOperationStatus(operationID string) (HotOperationReceipt, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return HotOperationReceipt{}, errors.New("hot inventory is disabled")
++	}
++	identity, err := parseHotOperationID(operationID)
++	if err != nil {
++		return HotOperationReceipt{}, err
++	}
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return HotOperationReceipt{}, outbound.ErrHotInventoryClosed
++	}
++	previous := runtime.operations[identity.Client]
++	if previous.OperationID == "" {
++		// Client authorities are never evicted. Once full, an unregistered
++		// identity can never have an accepted or delayed accepted mutation.
++		if len(runtime.operations) >= hotOperationMaxClients {
++			return HotOperationReceipt{}, ErrHotOperationLimit
++		}
++		if identity.Seq != 1 {
++			return HotOperationReceipt{}, fmt.Errorf("%w: expected 1", ErrHotOperationSequence)
++		}
++		return HotOperationReceipt{OperationID: operationID, Kind: "", State: "not_started", Generation: runtime.inventory.Snapshot().Generation}, nil
++	}
++	prior, _ := parseHotOperationID(previous.OperationID)
++	if identity.Seq < prior.Seq {
++		return HotOperationReceipt{}, ErrHotOperationExpired
++	}
++	if identity.Seq == prior.Seq {
++		return previous, nil
++	}
++	if identity.Seq != prior.Seq+1 {
++		return HotOperationReceipt{}, ErrHotOperationSequence
++	}
++	return HotOperationReceipt{OperationID: operationID, State: "not_started", Generation: runtime.inventory.Snapshot().Generation}, nil
++}
++
++// PublishHotProviderOperation performs a durable provider mutation under an
++// explicit operation authority. Direct Go callers can retain the legacy
++// PublishHotProvider API, while the Unix control socket uses this method.
++func (c *ControlPlane) PublishHotProviderOperation(ctx context.Context, operationID string, req HotProviderRequest) (outbound.HotInventoryPublication, error) {
++	return c.runHotOperation(ctx, operationID, "provider_publish", req, func(runtime *hotProviderRuntime) (outbound.HotInventoryPublication, error) {
++		return c.publishHotProviderLocked(ctx, runtime, req)
++	})
++}
++
++// SetHotSelectionOperation is the durable operation form of SetHotSelection.
++func (c *ControlPlane) SetHotSelectionOperation(ctx context.Context, operationID string, expected uint64, handle uint8, candidateID string) (outbound.HotInventoryPublication, error) {
++	request := struct {
++		ExpectedGeneration uint64 `json:"expected_generation"`
++		Handle             uint8  `json:"handle"`
++		CandidateID        string `json:"candidate_id"`
++	}{expected, handle, candidateID}
++	return c.runHotOperation(ctx, operationID, "selection_set", request, func(runtime *hotProviderRuntime) (outbound.HotInventoryPublication, error) {
++		return c.setHotSelectionLocked(ctx, runtime, expected, handle, candidateID)
++	})
++}
++
++func hotRejectedOperationError(code string) error {
++	switch code {
++	case "generation_conflict":
++		return outbound.ErrHotInventoryConflict
++	case "inventory_busy":
++		return outbound.ErrHotInventoryBusy
++	case "invalid_request":
++		return outbound.ErrHotInventoryInvalid
++	case "request_canceled":
++		return context.Canceled
++	default:
++		return fmt.Errorf("hot operation was rejected: %s", code)
++	}
++}
+diff --git a/control/hot_operations_test.go b/control/hot_operations_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..57a9cc64edded610cf4da1269c40435860bd49b7
+--- /dev/null
++++ b/control/hot_operations_test.go
+@@ -0,0 +1,424 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"bytes"
++	"context"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/daeuniverse/dae/component/outbound"
++)
++
++func TestHotOperationPostcommitDatapathFailureRequiresRestartReadback(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	// Presence of a real core, without its availability map, simulates failure
++	// at the production post-commit kernel readback boundary.
++	cp.core = &controlPlaneCore{}
++	id := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:1"
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); !errors.Is(err, ErrHotInventoryDatapathOutcomeUnknown) {
++		t.Fatalf("postcommit datapath failure: %v", err)
++	}
++	if _, err := cp.HotOperationStatus(id); !errors.Is(err, outbound.ErrHotInventoryClosed) {
++		t.Fatalf("fenced runtime advertised committed operation: %v", err)
++	}
++	if !cp.rejectNewConnections.Load() {
++		t.Fatal("postcommit datapath failure did not fence new flows")
++	}
++	_ = cp.closeHotInventory()
++	restarted := hotTestControlPlane(t, stateDir, "first")
++	receipt, err := restarted.HotOperationStatus(id)
++	if err != nil || receipt.State != "committed" || receipt.Generation != 2 {
++		t.Fatalf("restart failed to recover durable committed receipt: %#v %v", receipt, err)
++	}
++}
++
++func hotTestOperationID(client, sequence int) string {
++	return fmt.Sprintf("%032x:%d", client, sequence)
++}
++
++func hotTestOperationReceipt(t *testing.T, cp *ControlPlane, id, state string, generation uint64) HotOperationReceipt {
++	t.Helper()
++	receipt, err := cp.HotOperationStatus(id)
++	if err != nil || receipt.OperationID != id || receipt.State != state || receipt.Generation != generation {
++		t.Fatalf("operation readback: %#v, %v; want %s at generation %d", receipt, err, state, generation)
++	}
++	if state != "not_started" {
++		digest, err := hex.DecodeString(receipt.RequestDigest)
++		if err != nil || len(digest) != 32 || receipt.Kind == "" {
++			t.Fatalf("operation receipt lacks request identity: %#v", receipt)
++		}
++	}
++	if state == "rejected" && receipt.ErrorCode == "" {
++		t.Fatalf("rejected operation has no bounded error code: %#v", receipt)
++	}
++	if state == "committed" && receipt.ErrorCode != "" {
++		t.Fatalf("committed operation retains an error code: %#v", receipt)
++	}
++	return receipt
++}
++
++func TestHotOperationCrashBeforeSendHasAuthoritativeSafeReplay(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	id := hotTestOperationID(1, 1)
++	// The agent has persisted its own intent, but the daemon has never received it.
++	hotTestOperationReceipt(t, cp, id, "not_started", 1)
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	hotTestOperationReceipt(t, cp, id, "not_started", 1)
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	publication, err := cp.PublishHotProviderOperation(context.Background(), id, req)
++	if err != nil || publication.Snapshot.Generation != 2 {
++		t.Fatalf("safe replay of an unsent operation: %#v %v", publication, err)
++	}
++	receipt := hotTestOperationReceipt(t, cp, id, "committed", 2)
++	if receipt.Kind != "provider_publish" {
++		t.Fatalf("provider receipt kind = %q", receipt.Kind)
++	}
++	if got := hotTestAcquire(t, cp, 2).CandidateID; got != "p-a" {
++		t.Fatalf("replayed provider selection = %q", got)
++	}
++}
++
++func TestHotOperationLostAcknowledgementReplaysAcrossRestartWithoutMutation(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	providerID := hotTestOperationID(1, 1)
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProviderOperation(context.Background(), providerID, req); err != nil {
++		t.Fatal(err)
++	}
++	providerReceipt := hotTestOperationReceipt(t, cp, providerID, "committed", 2)
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	if got := hotTestOperationReceipt(t, cp, providerID, "committed", 2); !reflect.DeepEqual(got, providerReceipt) {
++		t.Fatalf("restart changed provider receipt: %#v != %#v", got, providerReceipt)
++	}
++	before, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Reuse the original expected generation, not the current generation. The
++	// receipt must resolve this before ordinary publication CAS validation.
++	publication, err := cp.PublishHotProviderOperation(context.Background(), providerID, req)
++	if err != nil || publication.Snapshot.Generation != 2 || len(publication.Adopted) != 0 {
++		t.Fatalf("provider acknowledgement recovery: %#v %v", publication, err)
++	}
++	after, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("provider replay rewrote durable state: %v", err)
++	}
++	selectionID := hotTestOperationID(1, 2)
++	if _, err := cp.SetHotSelectionOperation(context.Background(), selectionID, 2, 2, "p-b"); err != nil {
++		t.Fatal(err)
++	}
++	selectionReceipt := hotTestOperationReceipt(t, cp, selectionID, "committed", 3)
++	if selectionReceipt.Kind != "selection_set" {
++		t.Fatalf("selection receipt kind = %q", selectionReceipt.Kind)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	if got := hotTestOperationReceipt(t, cp, selectionID, "committed", 3); !reflect.DeepEqual(got, selectionReceipt) {
++		t.Fatalf("restart changed selection receipt: %#v != %#v", got, selectionReceipt)
++	}
++	before, err = os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	publication, err = cp.SetHotSelectionOperation(context.Background(), selectionID, 2, 2, "p-b")
++	if err != nil || publication.Snapshot.Generation != 3 || len(publication.Adopted) != 0 {
++		t.Fatalf("selection acknowledgement recovery: %#v %v", publication, err)
++	}
++	after, err = os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("selection replay rewrote durable state: %v", err)
++	}
++	if got := hotTestAcquire(t, cp, 2).CandidateID; got != "p-b" {
++		t.Fatalf("restored selection = %q", got)
++	}
++}
++
++func TestHotOperationNoopMutationStillHasDurableReceipt(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	req.ExpectedGeneration = 2
++	providerID := hotTestOperationID(1, 1)
++	publication, err := cp.PublishHotProviderOperation(context.Background(), providerID, req)
++	if err != nil || publication.Snapshot.Generation != 2 || len(publication.Adopted) != 0 {
++		t.Fatalf("provider no-op changed the inventory: %#v %v", publication, err)
++	}
++	providerReceipt := hotTestOperationReceipt(t, cp, providerID, "committed", 2)
++	selectionID := hotTestOperationID(2, 1)
++	publication, err = cp.SetHotSelectionOperation(context.Background(), selectionID, 2, 2, "p-a")
++	if err != nil || publication.Snapshot.Generation != 2 {
++		t.Fatalf("selection no-op changed the inventory: %#v %v", publication, err)
++	}
++	selectionReceipt := hotTestOperationReceipt(t, cp, selectionID, "committed", 2)
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	if got := hotTestOperationReceipt(t, cp, providerID, "committed", 2); !reflect.DeepEqual(got, providerReceipt) {
++		t.Fatalf("restart lost provider no-op receipt: %#v != %#v", got, providerReceipt)
++	}
++	if got := hotTestOperationReceipt(t, cp, selectionID, "committed", 2); !reflect.DeepEqual(got, selectionReceipt) {
++		t.Fatalf("restart lost selection no-op receipt: %#v != %#v", got, selectionReceipt)
++	}
++}
++
++func TestHotOperationPrecommitRejectionTerminatesAcrossRestart(t *testing.T) {
++	for _, name := range []string{"invalid_candidate", "stale_selection_generation", "stale_provider_generation", "canceled_selection", "canceled_provider"} {
++		t.Run(name, func(t *testing.T) {
++			stateDir := filepath.Join(t.TempDir(), "state")
++			cp := hotTestControlPlane(t, stateDir, "first")
++			req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++			if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++				t.Fatal(err)
++			}
++			id := hotTestOperationID(1, 1)
++			mutate := func(cp *ControlPlane) error {
++				ctx := context.Background()
++				if strings.HasPrefix(name, "canceled_") {
++					var cancel context.CancelFunc
++					ctx, cancel = context.WithCancel(ctx)
++					cancel()
++				}
++				if strings.HasSuffix(name, "provider") || name == "stale_provider_generation" {
++					update := cloneHotRequest(req)
++					update.RevisionID = "two"
++					update.ExpectedGeneration = 2
++					if name == "stale_provider_generation" {
++						update.ExpectedGeneration = 1
++					}
++					_, err := cp.PublishHotProviderOperation(ctx, id, update)
++					return err
++				}
++				expected, candidate := uint64(2), "p-b"
++				if name == "invalid_candidate" {
++					candidate = "absent"
++				}
++				if name == "stale_selection_generation" {
++					expected = 1
++				}
++				_, err := cp.SetHotSelectionOperation(ctx, id, expected, 2, candidate)
++				return err
++			}
++			if err := mutate(cp); err == nil {
++				t.Fatal("precommit failure acknowledged success")
++			}
++			receipt := hotTestOperationReceipt(t, cp, id, "rejected", 2)
++			if err := cp.closeHotInventory(); err != nil {
++				t.Fatal(err)
++			}
++			cp = hotTestControlPlane(t, stateDir, "first")
++			if got := hotTestOperationReceipt(t, cp, id, "rejected", 2); !reflect.DeepEqual(got, receipt) {
++				t.Fatalf("restart lost terminal rejection: %#v != %#v", got, receipt)
++			}
++			if err := mutate(cp); err == nil {
++				t.Fatal("replay of rejected operation acknowledged success")
++			}
++			if got := hotTestAcquire(t, cp, 2); got.CandidateID != "p-a" || got.Generation != 2 {
++				t.Fatalf("rejected mutation changed active selection: %#v", got)
++			}
++			if publication, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(1, 2), 2, 2, "p-b"); err != nil || publication.Snapshot.Generation != 3 {
++				t.Fatalf("resolved rejection left future management blocked: %#v %v", publication, err)
++			}
++		})
++	}
++}
++
++func TestHotOperationVerifiedDurabilityRollbackRecordsTerminalRejection(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	runtime := cp.hotInventory.Load()
++	syncCalls := 0
++	runtime.syncDir = func() error {
++		syncCalls++
++		if syncCalls == 2 {
++			return errors.New("injected operation commit directory sync fault")
++		}
++		return runtime.stateDir.Sync()
++	}
++	id := hotTestOperationID(1, 1)
++	req.ExpectedGeneration, req.RevisionID = 2, "two"
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); err == nil || errors.Is(err, ErrHotInventoryStorageOutcomeUnknown) {
++		t.Fatalf("verified rollback did not return a definite failure: %v", err)
++	}
++	if syncCalls < 5 {
++		t.Fatalf("rejection was not persisted after rollback: %d directory syncs", syncCalls)
++	}
++	runtime.syncDir = nil
++	hotTestOperationReceipt(t, cp, id, "rejected", 2)
++	state, exists, err := runtime.readState()
++	if err != nil || !exists || state.Generation != 2 || state.Providers["p"].RevisionID != "one" {
++		t.Fatalf("failed mutation altered durable provider: %#v exists=%v %v", state, exists, err)
++	}
++	if cp.rejectNewConnections.Load() {
++		t.Fatal("verified rollback fenced healthy packet admission")
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	hotTestOperationReceipt(t, cp, id, "rejected", 2)
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); err == nil {
++		t.Fatal("rejected operation was silently retried")
++	}
++	if publication, err := cp.PublishHotProviderOperation(context.Background(), hotTestOperationID(1, 2), req); err != nil || publication.Snapshot.Generation != 3 {
++		t.Fatalf("new operation cannot recover after definite rollback: %#v %v", publication, err)
++	}
++}
++
++func TestHotOperationInterruptedStorageRequiresRestartBeforeSafeReplay(t *testing.T) {
++	for _, failure := range []string{"rollback_sync", "rejection_receipt_sync"} {
++		t.Run(failure, func(t *testing.T) {
++			stateDir := filepath.Join(t.TempDir(), "state")
++			cp := hotTestControlPlane(t, stateDir, "first")
++			req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++			if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++				t.Fatal(err)
++			}
++			runtime := cp.hotInventory.Load()
++			syncCalls := 0
++			runtime.syncDir = func() error {
++				syncCalls++
++				if syncCalls == 2 || failure == "rollback_sync" && syncCalls == 3 || failure == "rejection_receipt_sync" && syncCalls == 4 {
++					return errors.New("injected interrupted storage transaction")
++				}
++				return runtime.stateDir.Sync()
++			}
++			id := hotTestOperationID(1, 1)
++			req.ExpectedGeneration, req.RevisionID = 2, "two"
++			if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); !errors.Is(err, ErrHotOperationOutcomeUnknown) {
++				t.Fatalf("unacknowledged receipt persistence reported definite outcome: %v", err)
++			}
++			if _, err := cp.HotOperationStatus(id); !errors.Is(err, outbound.ErrHotInventoryClosed) {
++				t.Fatalf("fenced process invented operation authority: %v", err)
++			}
++			if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); !errors.Is(err, outbound.ErrHotInventoryClosed) {
++				t.Fatalf("fenced process replayed a mutation: %v", err)
++			}
++			if err := cp.closeHotInventory(); err != nil {
++				t.Fatal(err)
++			}
++			// The injected fault leaves the old file on disk. Only reopening the
++			// encrypted journal after fencing establishes this as authority.
++			cp = hotTestControlPlane(t, stateDir, "first")
++			hotTestOperationReceipt(t, cp, id, "not_started", 2)
++			if publication, err := cp.PublishHotProviderOperation(context.Background(), id, req); err != nil || publication.Snapshot.Generation != 3 {
++				t.Fatalf("restart could not resolve and replay interrupted mutation: %#v %v", publication, err)
++			}
++			hotTestOperationReceipt(t, cp, id, "committed", 3)
++		})
++	}
++}
++
++func TestHotOperationIdentityAndSequenceFenceDuplicateRequests(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	id := hotTestOperationID(1, 1)
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); err != nil {
++		t.Fatal(err)
++	}
++	changed := cloneHotRequest(req)
++	changed.Nodes[0].Link = "socks5://127.0.0.1:2"
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, changed); !errors.Is(err, ErrHotOperationConflict) {
++		t.Fatalf("same operation ID with different provider payload: %v", err)
++	}
++	if _, err := cp.SetHotSelectionOperation(context.Background(), id, 2, 2, "p-b"); !errors.Is(err, ErrHotOperationConflict) {
++		t.Fatalf("same operation ID with different mutation kind: %v", err)
++	}
++	if _, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(1, 3), 2, 2, "p-b"); !errors.Is(err, ErrHotOperationSequence) {
++		t.Fatalf("skipped sequence accepted: %v", err)
++	}
++	if _, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(1, 2), 2, 2, "absent"); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("invalid selection did not fail: %v", err)
++	}
++	if _, err := cp.HotOperationStatus(id); !errors.Is(err, ErrHotOperationExpired) {
++		t.Fatalf("old sequence still reported replayable: %v", err)
++	}
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); !errors.Is(err, ErrHotOperationExpired) {
++		t.Fatalf("expired provider operation replayed: %v", err)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	if _, err := cp.PublishHotProviderOperation(context.Background(), id, req); !errors.Is(err, ErrHotOperationExpired) {
++		t.Fatalf("restart lost sequence fencing: %v", err)
++	}
++	if publication, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(1, 3), 2, 2, "p-b"); err != nil || publication.Snapshot.Generation != 3 {
++		t.Fatalf("next sequence did not advance: %#v %v", publication, err)
++	}
++	for _, invalid := range []string{"", "1:1", strings.Repeat("a", 32) + ":0", strings.Repeat("A", 32) + ":1", strings.Repeat("a", 32) + ":01", strings.Repeat("a", 32) + ":-1"} {
++		if _, err := cp.HotOperationStatus(invalid); !errors.Is(err, ErrHotOperationInvalid) {
++			t.Fatalf("invalid operation ID %q accepted: %v", invalid, err)
++		}
++	}
++}
++
++func TestHotOperationClientBoundNeverEvictsRecoveryAuthority(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	for client := 1; client <= 64; client++ {
++		id := hotTestOperationID(client, 1)
++		if _, err := cp.SetHotSelectionOperation(context.Background(), id, 2, 2, "absent"); err == nil {
++			t.Fatalf("client %d invalid selection accepted", client)
++		}
++		hotTestOperationReceipt(t, cp, id, "rejected", 2)
++	}
++	if _, err := cp.HotOperationStatus(hotTestOperationID(65, 1)); !errors.Is(err, ErrHotOperationLimit) {
++		t.Fatalf("unregistered capacity status must reject: %v", err)
++	}
++	if _, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(65, 1), 2, 2, "p-b"); !errors.Is(err, ErrHotOperationLimit) {
++		t.Fatalf("client recovery bound silently expanded/evicted: %v", err)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	for client := 1; client <= 64; client++ {
++		hotTestOperationReceipt(t, cp, hotTestOperationID(client, 1), "rejected", 2)
++	}
++	if _, err := cp.HotOperationStatus(hotTestOperationID(65, 1)); !errors.Is(err, ErrHotOperationLimit) {
++		t.Fatalf("unregistered capacity status must reject: %v", err)
++	}
++	if _, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(65, 1), 2, 2, "p-b"); !errors.Is(err, ErrHotOperationLimit) {
++		t.Fatalf("restart reset client recovery bound: %v", err)
++	}
++	if publication, err := cp.SetHotSelectionOperation(context.Background(), hotTestOperationID(1, 2), 2, 2, "p-b"); err != nil || publication.Snapshot.Generation != 3 {
++		t.Fatalf("bounded journal blocked an existing client: %#v %v", publication, err)
 +	}
 +}
 diff --git a/control/session_manager.go b/control/session_manager.go

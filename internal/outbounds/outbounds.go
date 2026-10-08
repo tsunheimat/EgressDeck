@@ -44,8 +44,17 @@ type Group struct {
 	Mode          SelectionMode     `json:"mode"`
 	Replacement   ReplacementPolicy `json:"replacement_policy"`
 	Revision      int64             `json:"revision"`
-	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	// AppliedRevision and ObservedRevision describe the independently
+	// published runtime group configuration. They intentionally do not advance
+	// the provider revision: a membership edit is its own lifecycle.
+	AppliedRevision    int64     `json:"applied_revision,omitempty"`
+	ObservedRevision   int64     `json:"observed_revision,omitempty"`
+	AppliedNodeIDs     []string  `json:"applied_node_ids,omitempty"`
+	ObservedNodeIDs    []string  `json:"observed_node_ids,omitempty"`
+	AppliedGeneration  int64     `json:"applied_generation,omitempty"`
+	ObservedGeneration int64     `json:"observed_generation,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type Scope struct {
@@ -182,6 +191,8 @@ func NewService() *Service {
 
 func cloneGroup(g Group) Group {
 	g.NodeIDs = append([]string(nil), g.NodeIDs...)
+	g.AppliedNodeIDs = append([]string(nil), g.AppliedNodeIDs...)
+	g.ObservedNodeIDs = append([]string(nil), g.ObservedNodeIDs...)
 	if g.SourceFilters != nil {
 		filters := cloneSourceFilters(*g.SourceFilters)
 		g.SourceFilters = &filters
@@ -205,6 +216,9 @@ func (s *Service) Create(g Group) (Group, error) {
 	}
 	now := time.Now().UTC()
 	g.Revision, g.CreatedAt, g.UpdatedAt = 1, now, now
+	g.AppliedRevision, g.ObservedRevision = 0, 0
+	g.AppliedNodeIDs, g.ObservedNodeIDs = nil, nil
+	g.AppliedGeneration, g.ObservedGeneration = 0, 0
 	s.groups[g.ID] = cloneGroup(g)
 	return cloneGroup(g), nil
 }
@@ -243,6 +257,9 @@ func (s *Service) Update(g Group, expectedRevision int64) (Group, error) {
 	if expectedRevision <= 0 || old.Revision != expectedRevision {
 		return Group{}, ErrSelectionConflict
 	}
+	if old.AppliedRevision > 0 && g.GatewayID != old.GatewayID {
+		return Group{}, &domain.ValidationError{Problems: []string{"cannot change gateway while runtime group configuration exists"}}
+	}
 	for _, selected := range s.selections {
 		if selected.GroupID != g.ID {
 			continue
@@ -255,13 +272,22 @@ func (s *Service) Update(g Group, expectedRevision int64) (Group, error) {
 		}
 	}
 	g.CreatedAt, g.UpdatedAt, g.Revision = old.CreatedAt, time.Now().UTC(), old.Revision+1
+	// Runtime state belongs to the previous desired revision until a separate
+	// group publication is acknowledged by the gateway.
+	g.AppliedRevision, g.ObservedRevision = old.AppliedRevision, old.ObservedRevision
+	g.AppliedNodeIDs = append([]string(nil), old.AppliedNodeIDs...)
+	g.ObservedNodeIDs = append([]string(nil), old.ObservedNodeIDs...)
+	g.AppliedGeneration, g.ObservedGeneration = old.AppliedGeneration, old.ObservedGeneration
 	s.groups[g.ID] = cloneGroup(g)
 	for key, selected := range s.selections {
 		if selected.GroupID == g.ID {
-			selected.Unavailable = selectionUnavailable(g, selected)
-			selected.Revision++
-			selected.UpdatedAt = g.UpdatedAt
-			s.selections[key] = selected
+			unavailable := selectionUnavailable(g, selected)
+			if selected.Unavailable != unavailable {
+				selected.Unavailable = unavailable
+				selected.Revision++
+				selected.UpdatedAt = g.UpdatedAt
+				s.selections[key] = selected
+			}
 		}
 	}
 	return cloneGroup(g), nil
@@ -516,6 +542,9 @@ func (s *Service) ImportState(data []byte) error {
 		}
 		if !validID(group.ID) || group.Revision <= 0 || group.CreatedAt.IsZero() || group.UpdatedAt.Before(group.CreatedAt) || group.Mode == "" || group.Replacement == "" {
 			return errors.New("invalid outbound snapshot group metadata")
+		}
+		if err := validateConfigurationState(group); err != nil {
+			return err
 		}
 		for _, id := range group.NodeIDs {
 			if !validID(id) {

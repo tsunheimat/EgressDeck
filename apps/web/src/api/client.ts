@@ -41,6 +41,7 @@ export interface SelectionRequest {
   gatewayId: string
   transportScopes?: string[]
   expectedRevision?: string
+  expectedRevisions?: Record<string, number>
 }
 
 export interface OperationResult {
@@ -87,7 +88,7 @@ function normalizeNode(value: unknown): NodeSummary {
 function normalizeOutbound(value: unknown): OutboundGroupSummary {
   const g = wire(value)
   const ids = array<string>(g.node_ids)
-  return { id: text(g.id), name: text(g.name), revision: number(g.revision), mode: (g.mode ?? 'manual') as OutboundGroupSummary['mode'], gatewayId: text(g.gateway_id), nodeIds: ids, sourceFilters: g.source_filters as OutboundGroupSummary['sourceFilters'], candidateCount: ids.length, replacementPolicy: (g.replacement_policy ?? 'block') as 'block' | 'none', transportScopes: array(g.transport_scopes), desired: text(g.desired) || undefined, applied: text(g.applied) || undefined, observed: text(g.observed) || undefined, usedBy: array(g.used_by) }
+  return { id: text(g.id), name: text(g.name), revision: number(g.revision), appliedRevision: typeof g.applied_revision === 'number' ? g.applied_revision : undefined, observedRevision: typeof g.observed_revision === 'number' ? g.observed_revision : undefined, appliedGeneration: typeof g.applied_generation === 'number' ? g.applied_generation : undefined, appliedNodeIds: Array.isArray(g.applied_node_ids) ? array(g.applied_node_ids) : undefined, mode: (g.mode ?? 'manual') as OutboundGroupSummary['mode'], gatewayId: text(g.gateway_id), nodeIds: ids, sourceFilters: g.source_filters as OutboundGroupSummary['sourceFilters'], candidateCount: ids.length, replacementPolicy: (g.replacement_policy ?? 'block') as 'block' | 'none', selectionScope: g.selection_scope === 'shared_tcp_udp' ? 'shared_tcp_udp' : 'independent_transport', transportScopes: array(g.transport_scopes), desired: text(g.desired) || undefined, applied: text(g.applied) || undefined, observed: text(g.observed) || undefined, usedBy: array(g.used_by) }
 }
 function normalizeOperation(value: unknown): OperationSummary {
   const o = wire(value)
@@ -271,7 +272,13 @@ export class ControllerApi {
     return this.request<unknown>(`/outbound-groups/${encodeURIComponent(outboundGroupId)}/selection`, {
       method: 'PUT',
       headers: { 'Idempotency-Key': idempotencyKey, ...(request.expectedRevision ? { 'If-Match': request.expectedRevision } : {}) },
-      body: JSON.stringify({ node_id: request.nodeId, gateway_id: request.gatewayId, transport_scopes: request.transportScopes }),
+      body: JSON.stringify({ node_id: request.nodeId, gateway_id: request.gatewayId, transport_scopes: request.transportScopes, expected_revisions: request.expectedRevisions }),
+    }).then(normalizeAccepted)
+  }
+
+  applyOutboundGroup(outboundGroupId: string, revision: number, idempotencyKey: string): Promise<OperationResult> {
+    return this.request<unknown>(`/outbound-groups/${encodeURIComponent(outboundGroupId)}/apply`, {
+      method: 'POST', headers: { 'If-Match': String(revision), 'Idempotency-Key': idempotencyKey }, body: '{}',
     }).then(normalizeAccepted)
   }
 

@@ -24,6 +24,21 @@ describe('ControllerApi', () => {
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ node_id: 'node-1', gateway_id: 'gw-1' })
   })
 
+  it('sends per-transport revisions for shared selection', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ operation_id: 'op-shared', status: 'applying' }), { status: 202 }))
+    const api = new ControllerApi('/api/v1', fetcher)
+    await api.setSelection('group/1', { nodeId: 'node-1', gatewayId: 'gw-1', transportScopes: ['tcp', 'udp'], expectedRevision: '3', expectedRevisions: { tcp: 3, udp: 1 } }, 'idem-shared')
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ node_id: 'node-1', gateway_id: 'gw-1', transport_scopes: ['tcp', 'udp'], expected_revisions: { tcp: 3, udp: 1 } })
+    expect(fetcher.mock.calls[0]?.[1]?.headers).toEqual(expect.objectContaining({ 'If-Match': '3', 'Idempotency-Key': 'idem-shared' }))
+  })
+
+  it('publishes outbound group configuration with a durable precondition', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ operation_id: 'op-group', status: 'applying' }), { status: 202 }))
+    const api = new ControllerApi('/api/v1', fetcher)
+    await api.applyOutboundGroup('group/1', 8, 'idem-group')
+    expect(fetcher).toHaveBeenCalledWith('/api/v1/outbound-groups/group%2F1/apply', expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'If-Match': '8', 'Idempotency-Key': 'idem-group' }), body: '{}' }))
+  })
+
   it('unwraps the paginated list envelope used by the controller contract', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [{ id: 'gw-1', name: 'lab', endpoint: 'https://gw', health: 'healthy', capabilities: { supported: [] } }] }), { status: 200 }))
     const api = new ControllerApi('/api/v1', fetcher)

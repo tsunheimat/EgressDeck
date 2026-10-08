@@ -1,18 +1,31 @@
 # Development status
 
-The [verification receipt](verification/2026-10-08-results.json) records commands,
-hosts, boundaries and image digests. Its linked source manifest identifies the
-final working-tree files; individual native/PostgreSQL receipts bind their own
-tested snapshots.
+The historical [verification receipt](verification/2026-10-08-results.json)
+records the initial implementation's commands, hosts, boundaries and image
+digests. Its linked source manifest identifies that working-tree snapshot;
+individual native/PostgreSQL receipts bind their own tested snapshots. Those
+receipts are preserved and do not establish acceptance of later review fixes.
+
+The [review follow-up](review-follow-up-2026-10-08.md) tracks findings
+`REV-1`–`REV-5` against reviewed commit
+`5b443b5c9aab66c6312f084a29d7dc4b452229fd`, including specific regression
+boundaries and remaining work.
+The frozen follow-up passed 1,267 Go race tests and 80 frontend tests. Its
+[actual native management-path receipt](../tests/integration/artifacts/review-native-cross-layer.json)
+passes browser shared selection, independent group apply against unchanged
+provider inventory, pre-send and post-commit crash recovery, and controller,
+agent and daemon restart. The receipt binds 260 repository and 500 dae source
+hashes; it does not qualify the live eBPF/OPNsense/client packet path.
 
 Updated 8 October 2026. The controller, Vue workflows, durable storage,
 security boundaries, native OPNsense client, stock dae agent and opt-in native
 bridge have implementations. Scheduler, planner, event, filter and telemetry
 follow-ups are present. The frozen Go snapshot, PostgreSQL lifecycle, browser
 application and controller image passed their final checks documented below.
-The full development plan is **not accepted for production**:
-live hot publication, traffic enrollment, packet-path enforcement and the
-target release matrix remain unqualified.
+The full development plan is **not accepted for production**. Native policy
+assembly/application and the complete guard/firewall/session/client-probe
+enrollment path still require implementation. Live hot publication,
+packet-path enforcement and the target release matrix remain unqualified.
 
 The distinction below is between implementation evidence and runtime
 qualification. Tests with real HTTP, TLS, PostgreSQL or browser components
@@ -26,7 +39,7 @@ gateway enforce the requested traffic policy.
 | **WP00 — capability/topology** | Complete pinned dae source audit, Zashboard client inspection, native OPNsense 26.7 source review, compatibility record and packet-path ADR. The audit established that the dae pin has no native management API and that its reload rebuilds a full control-plane generation. | Run the isolated two-client OPNsense/dae topology. Record source identity, NAT, routes/returns, deny ordering, DNS, IPv6, direct/proxy TCP/UDP and gateway-down behavior. No privileged packet-path proof exists here. |
 | **WP01 — foundation** | Go controller, Vue application, typed API/agent contracts, schema and migrations; revision checks, address ownership, authorization, audit and durable operations. OIDC code flow uses PKCE/nonce/browser-bound state; separate signed-proxy mode, encrypted sessions, roles and CSRF are tested. File and pgx stores persist state; lifecycle secrets use an external-key AES-GCM vault. | Qualify the actual identity provider, key recovery, service accounts and deployment settings. Hosted Actions execution and a release artifact must be recorded separately from local checks. |
 | **WP02 — agent/engine** | Stock executable digest/process/native-validation checks; TLS 1.3 mutual TLS and authenticated controller client. Explicit native mode bridges the private patched-daemon Unix API, with encrypted bounded agent recovery state. Exported `engine/dae` patch implements fixed handles, native TCP/UDP/DNS resource leases, affected-provider publication and durable manual selection; focused source race tests, broader upstream regression tests, vet and generated-BPF build passed. | Validate the current controller/agent/daemon chain and real traffic: unchanged listeners/tc/DNS, unrelated TCP/UDP continuity, restart and retained resources. Native scope is predeclared single-provider groups, manual selection shared by TCP/UDP, with external keys retained. Full reload/suspend, policy application, probes and traffic telemetry remain unsupported in native mode; stock hot capabilities stay disabled. |
-| **WP03 — providers/nodes/outbounds** | URL fetch/paste/upload, bounded native/Base64/SIP008/JSON/supported Clash-node parsing, SSRF/redirect/rebinding guards, startup private-source allowlist, encrypted sources/private node serialization. Provider CRUD, references/deletion checks, source filters, metadata/candidate impact, scoped selections and CAS are implemented. Durable scheduler coalesces missed runs and stages revisions for review at intervals of 300–604800 seconds. | Qualify real gateway publication/selection and resource behavior. Scheduler auto-apply is explicitly unsupported; imported unsupported entries require review. Engine restart intent depends on the patched daemon and retained keys/layout. No full Clash configuration importer is claimed. |
+| **WP03 — providers/nodes/outbounds** | URL fetch/paste/upload, bounded native/Base64/SIP008/JSON/supported Clash-node parsing, SSRF/redirect/rebinding guards, startup private-source allowlist, encrypted sources/private node serialization. Provider CRUD, references/deletion checks, source filters, metadata/candidate impact, explicit shared/independent selection semantics and CAS are implemented. Outbound-group apply publishes membership independently of unchanged provider connections and exposes desired/applied/observed revisions. Durable scheduler coalesces missed runs and stages revisions for review at intervals of 300–604800 seconds. | Qualify real gateway publication/selection and resource behavior. Native groups remain manual, single-provider and predeclared; current selected nodes must remain eligible during membership changes. Automatic selection, multi-provider groups, native node/group probes and scheduler auto-apply remain unsupported. No full Clash configuration importer is claimed. |
 | **WP04 — device policy** | Device/group inventory, primary group, address ownership, ordered rules/rule sets and persisted per-device exceptions. Deterministic manifests/source maps, preview/explain and impact reports. Stored-inventory planner captures gateway-scoped resource/selection revisions and hashes in an immutable checksum document; routing-only native output is provided when supported. | Complete native policy assembly and validate generated rules against the source-visible topology, including domain limits, unknown domains, IPv6 and strict failure. A checksum-bound routing plan does not supply daemon configuration, independent guard or traffic verification; plans remain non-deployable where these prerequisites are missing. |
 | **WP05 — OPNsense** | Native HTTPS client pinned to **26.7**, core `821598263289e177b40971600f06f5a91d9faef3`. Version/TLS/auth checks, persisted alias UUID/type/content decoding, active-table existence/contents, independent empty-state confirmation, exact reviewed modern-rule shape, address deltas and partial/drift refusal are covered by TLS fixtures. External configuration omits write authority unless a reviewed managed-alias scope is provided. | Test an actual appliance: least privilege, existing deny preservation, active/persisted convergence, reload/reboot and canary steering. Native API lacks CAS, so external edits can race an individual mutation. Legacy rules, rule provisioning and targeted state deletion are unsupported. |
 | **WP06 — deployment/reconciliation** | Encrypted request-bound operation journal, serialization/fencing, desired/applied/observed/verified state and startup/periodic readback recovery. Cross-system tests cover guard/gateway/firewall ordering, moves, lost acknowledgement, rollback, quarantine, cancellation and late writes. Optional runtime provider/selection wiring and native artifact executor use operator opt-in and observed capabilities. Offline journal migration preserves the plaintext source and refuses overwrite. | Supply and qualify independent guard, full gateway apply/readback, firewall session handling and client probe. The opt-in native daemon currently rejects full policy apply. Complete strict enrollment remains unsupported; native artifact wiring cannot create those missing semantics. Run real crash/failure injection at each boundary. |
@@ -34,7 +47,7 @@ gateway enforce the requested traffic policy.
 | **WP08 — qualification** | Frozen Go snapshot: **1,124 tests / 20 packages**, race and vet passed on `agnet-test`. Web: **73 unit/component tests**, typecheck/build and **14 Chrome E2E tests** passed. Final PostgreSQL 16.15 API/adapter race checks and final controller image smoke passed. Daemon patch: **60 no-stub hot race cases**, **1,055 broader stub-tag race cases**, vet/build and an actual adapter→source handler process/restart receipt. Hosted workflows and the protected evidence-required network gate are present. | Real packet, DNS/IPv6, throughput and retained-resource measurements remain blocked. Source/native/fixture/browser evidence does not replace live qualification; local execution does not establish hosted Actions success. |
 | **WP09 — operational delivery** | Single Go/Vue management image; agent and optional development web images; durable Compose default plus PostgreSQL overlay; systemd and Kubernetes/PVC templates; OpenWrt qualification guidance; installation, backup/restore, key rotation, rollback and incident runbooks. Container smoke exercises authentication, encrypted staging, CRUD, unsupported-runtime refusal and restart restoration. | Produce source-bound immutable release digests, SBOM/provenance receipts and target-specific clean-install/restore/canary records. Qualify OpenWrt kernel/architecture/storage/firewall behavior before publishing a package. Migration from an existing proxy system remains an explicit mapping and dry run. |
 
-## Verified boundaries
+## Historical verified boundaries
 
 - **PostgreSQL:** [`TestPostgresIntegration`](../internal/store/postgres_integration_test.go)
   and [`TestPostgresAPILifecycle`](../tests/integration/postgres_api_test.go)
@@ -62,7 +75,7 @@ gateway enforce the requested traffic policy.
   configures no production gateway/router and expects unsupported runtime
   publication to be refused.
 
-Test totals describe this development run and may increase with new checks.
+Test totals below describe the original implementation run.
 Use the source commit and the final command/job receipts when approving a
 release; existing pass totals do not cover later edits or an untested target.
 

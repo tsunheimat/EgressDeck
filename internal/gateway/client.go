@@ -105,6 +105,12 @@ func (c *Client) request(ctx context.Context, method, path, op string, input, ou
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
+	if identity, ok := MutationIdentityFromContext(ctx); ok {
+		if err := identity.Validate(); err != nil {
+			return clientFailure(op, "invalid_request", "mutation identity is invalid", ErrValidation)
+		}
+		setMutationIdentityHeaders(req, identity)
+	}
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -132,7 +138,13 @@ func (c *Client) request(ctx context.Context, method, path, op string, input, ou
 		return clientFailure(op, "invalid_response", "gateway response was incomplete or exceeded the response limit", ErrProtocol)
 	}
 	if resp.StatusCode != expected {
-		return remoteStatusError(op, resp.StatusCode, mutation)
+		failure := remoteStatusError(op, resp.StatusCode, mutation)
+		if mutation {
+			if identity, present := MutationIdentityFromContext(ctx); present && matchesMutationRejection(data, identity) {
+				return RejectBeforeMutation("request_rejected", "gateway rejected this mutation before execution", failure)
+			}
+		}
+		return failure
 	}
 	if output == nil {
 		return nil

@@ -2,6 +2,7 @@ export type Capability =
   | 'inventory.read'
   | 'provider.stage'
   | 'provider.publish_hot'
+  | 'group.publish_hot'
   | 'selection.set_runtime'
   | 'selection.persist_restart'
   | 'policy.validate'
@@ -117,6 +118,10 @@ export interface OutboundGroupSummary {
   name: string
   revision: number
   nodeIds: string[]
+  appliedRevision?: number
+  observedRevision?: number
+  appliedGeneration?: number
+  appliedNodeIds?: string[]
   sourceFilters?: OutboundSourceFilters
   replacementPolicy: 'block' | 'none'
   mode: 'manual' | 'automatic'
@@ -125,6 +130,7 @@ export interface OutboundGroupSummary {
   applied?: string
   observed?: string
   gatewayId: string
+  selectionScope: 'shared_tcp_udp' | 'independent_transport'
   transportScopes: string[]
   usedBy: string[]
 }

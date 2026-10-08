@@ -39,7 +39,7 @@ const (
 )
 
 var AllCapabilities = []CapabilityName{
-	CapabilityInventoryRead, CapabilityProviderStage, CapabilityProviderPublish,
+	CapabilityInventoryRead, CapabilityProviderStage, CapabilityProviderPublish, CapabilityGroupPublish,
 	CapabilitySelectionRuntime, CapabilitySelectionPersist, CapabilityPolicyValidate,
 	CapabilityPolicyApply, CapabilityProbeNode, CapabilityProbeGroup,
 	CapabilityConnectionsObserve, CapabilityConnectionsClose, CapabilityProxyCounters,

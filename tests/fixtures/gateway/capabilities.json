@@ -5,6 +5,7 @@
     {"name": "inventory.read", "supported": true, "implementation": "egressdeck-fake-engine"},
     {"name": "provider.stage", "supported": true, "implementation": "egressdeck-fake-engine"},
     {"name": "provider.publish_hot", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "group.publish_hot", "supported": true, "implementation": "egressdeck-fake-engine"},
     {"name": "selection.set_runtime", "supported": true, "implementation": "egressdeck-fake-engine"},
     {"name": "selection.persist_restart", "supported": true, "implementation": "egressdeck-fake-engine"},
     {"name": "policy.validate", "supported": true, "implementation": "egressdeck-fake-engine"},

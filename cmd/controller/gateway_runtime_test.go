@@ -38,6 +38,7 @@ type runtimeTestEngine struct {
 	received              []gateway.ProviderRevision
 	selectionRequests     []gateway.Selection
 	publishCalls          int
+	groupPublishCalls     int
 	requestCount          int
 	responses             []string
 	rejectPublish         bool
@@ -202,6 +203,27 @@ func (e *runtimeTestEngine) serve(t *testing.T, w http.ResponseWriter, r *http.R
 			write(http.StatusOK, map[string]string{"status": "published"})
 			return
 		}
+		write(http.StatusOK, map[string]any{"status": "published", "snapshot": snapshot})
+	case "POST /v1/groups/publish":
+		var request struct {
+			Publication        gateway.GroupPublication `json:"publication"`
+			ExpectedGeneration int64                    `json:"expected_generation"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		e.mu.Lock()
+		if request.ExpectedGeneration != e.state.Generation {
+			e.mu.Unlock()
+			write(http.StatusConflict, map[string]string{"error": "conflict"})
+			return
+		}
+		e.groupPublishCalls++
+		group := request.Publication.Group
+		e.state.Groups[group.ID] = gateway.OutboundGroup{ID: group.ID, Name: group.Name, Revision: group.Revision, ProviderIDs: []string{request.Publication.ProviderID}, NodeIDs: append([]string(nil), group.CandidateIDs...), SelectionMode: "manual"}
+		e.state.Generation++
+		snapshot := e.snapshotLocked()
+		e.mu.Unlock()
 		write(http.StatusOK, map[string]any{"status": "published", "snapshot": snapshot})
 	case "PUT /v1/selections":
 		var request struct {

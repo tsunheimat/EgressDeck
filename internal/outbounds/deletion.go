@@ -29,6 +29,9 @@ func (s *Service) Delete(id string, expectedRevision int64, referencedBy []strin
 	if len(referencedBy) > 0 {
 		return ErrGroupReferenced
 	}
+	if group.AppliedRevision > 0 || group.ObservedRevision > 0 {
+		return ErrGroupInUse
+	}
 	for _, selection := range s.selections {
 		if selection.GroupID == id && (selection.DesiredNodeID != "" || selection.AppliedNodeID != "" || selection.ObservedNodeID != "") {
 			return ErrGroupInUse

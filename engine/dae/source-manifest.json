@@ -6,20 +6,20 @@
   "patches": [
     {
       "path": "patches/0001-native-hot-provider-runtime.patch",
-      "sha256": "6dc2bbcb8270adfaac62eda4e33abab98eef9009bfa89e9f107d672cb904aa38",
-      "bytes": 186862
+      "sha256": "f3266aa1e69de7f1798343c4d3623ed035f5ee30e85c5cb1e4a97fd50c23975d",
+      "bytes": 254556
     }
   ],
   "files": [
     {
       "path": "cmd/hot_control.go",
-      "sha256": "488eded1c5079355e675e167aa6253400406cc1c869e0cb28fa400b338f7bc8e",
-      "bytes": 13459
+      "sha256": "10091697460ce959a67f58e439d63b755a91fd5f1e751aa5831356d7deb0683f",
+      "bytes": 16619
     },
     {
       "path": "cmd/hot_control_test.go",
-      "sha256": "bb5671cd6bee632212b0cceb3577e891674f71e461a46d25faa46888aad9848b",
-      "bytes": 12847
+      "sha256": "3bd53840d0e69318b7290942d5cb461fd41f7c93bf247a1e3afd5ec8306ae973",
+      "bytes": 14798
     },
     {
       "path": "cmd/run.go",
@@ -38,8 +38,8 @@
     },
     {
       "path": "component/outbound/hot_inventory.go",
-      "sha256": "0d0836a8b4f3c6fbb33c0e49db99780f2eb2d343efee866d9e1d8b418999bbcd",
-      "bytes": 24146
+      "sha256": "1dfeea67a7d1f97740ad757a07b9869edbc3ddc7b726e1bf7a458e1199482f33",
+      "bytes": 24541
     },
     {
       "path": "component/outbound/hot_inventory_test.go",
@@ -97,14 +97,34 @@
       "bytes": 9061
     },
     {
+      "path": "control/hot_group.go",
+      "sha256": "4a406943d65d1ead52debfe73c35679e661d6aaec25169c40274244821569d73",
+      "bytes": 11865
+    },
+    {
+      "path": "control/hot_group_test.go",
+      "sha256": "a70860740c064b6eb35b3caff19efd8c04a8498d2af4ff4bcb53159640805ba1",
+      "bytes": 11844
+    },
+    {
       "path": "control/hot_inventory.go",
-      "sha256": "18202ba23b14efcaec80d07f1a0e639db76ed6a405fe31f45553a22b9d978b81",
-      "bytes": 29909
+      "sha256": "edd07595e61b3deebefd2719878c57925b146204d9af7ee1827efe9f63cda941",
+      "bytes": 32119
     },
     {
       "path": "control/hot_inventory_test.go",
       "sha256": "683a3190dc8d51a2e345b4e6093f3a8880c19b947d724118771957f3f9b68dbb",
       "bytes": 23179
+    },
+    {
+      "path": "control/hot_operations.go",
+      "sha256": "9e985e2aa545f7e8592cb145e7bcfe35e2288edce454da9f781ebcad76a3b2f7",
+      "bytes": 14806
+    },
+    {
+      "path": "control/hot_operations_test.go",
+      "sha256": "3470a62aea9fd92dd09492640ac95cdbde06a54119383f3aa1922f02b9d7ef7c",
+      "bytes": 19006
     },
     {
       "path": "control/session_manager.go",
@@ -131,8 +151,8 @@
     "outbound_module": "github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260918090140-cc86ced2e683"
   },
   "license_sha256": "4df3c306dddaaf4baffdff5ca820cc679ac8cd6dc263c6a74517783e42fa7a3b",
-  "qualification": "native component and real generated BPF compile; no live eBPF or OPNsense runtime acceptance",
-  "validation_artifacts": {
+  "qualification": "native source/component regressions and source integration; no live eBPF or OPNsense runtime acceptance",
+  "historical_validation_artifacts": {
     "test_binary_sha256": "1560c7c2b88f18a2632705a9cfb940df3d47e840889a9632a41512af86e75aeb",
     "generated_bpf_object_sha256": "06ca4cddfb8eb8556f6cc151546cb876abdbc7783343336e591bea7a1e80b640",
     "generated_bpf_go_sha256": "4ff8f22a878f42459b805f3d356269a80fc849a928c6ec08907822959bf19086"

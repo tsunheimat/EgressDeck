@@ -40,6 +40,9 @@ type Services struct {
 	SelectionPersistence bool
 	ProviderPublisher    func(context.Context, domain.Provider, providers.Revision) error
 	ProviderReadback     func(context.Context, domain.Provider) (int64, error)
+	GroupPublisher       func(context.Context, outbounds.Group) (gateway.Snapshot, error)
+	GroupReadback        func(context.Context, outbounds.Group) (gateway.Snapshot, error)
+	SelectionPreflight   func(context.Context, outbounds.Group) error
 	SelectionApplier     func(context.Context, outbounds.Group, outbounds.Selection) (outbounds.Selection, error)
 	SelectionScopeMode   func(outbounds.Group) string
 	ProviderTargetIDs    func(context.Context, domain.Provider) ([]string, error)
@@ -198,7 +201,12 @@ type storeProviderList interface {
 func (s *Server) outboundGroups(w http.ResponseWriter, r *http.Request) {
 	services := s.servicesOrDefault()
 	if r.Method == http.MethodGet {
-		writeCollection(w, r, services.Outbounds.List(), nil)
+		groups := services.Outbounds.List()
+		views := make([]outboundGroupView, 0, len(groups))
+		for _, group := range groups {
+			views = append(views, services.outboundGroupView(group))
+		}
+		writeCollection(w, r, views, nil)
 		return
 	}
 	if r.Method == http.MethodPost {
@@ -209,13 +217,17 @@ func (s *Server) outboundGroups(w http.ResponseWriter, r *http.Request) {
 		if !s.checkOutboundInventory(w, r, &group) {
 			return
 		}
+		if err := services.rejectPendingProviderForGroup(r.Context(), group); err != nil {
+			writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
+			return
+		}
 		created, err := services.Outbounds.Create(group)
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
 		services.record(requestActor(r), "outbound_group", created.ID, "create", "accepted")
-		writeJSON(w, http.StatusCreated, created)
+		writeJSON(w, http.StatusCreated, services.outboundGroupView(created))
 		return
 	}
 	methodNotAllowed(w, "GET, POST")
@@ -234,7 +246,7 @@ func (s *Server) outboundGroup(w http.ResponseWriter, r *http.Request) {
 			writeServiceError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, group)
+		writeJSON(w, http.StatusOK, services.outboundGroupView(group))
 		return
 	}
 	if r.Method == http.MethodPatch || r.Method == http.MethodPut {
@@ -248,7 +260,15 @@ func (s *Server) outboundGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		group.ID = id
+		if err := services.rejectUnknownTarget(r.Context(), deployment.Target{Kind: "outbound_group", ID: id}); err != nil {
+			writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
+			return
+		}
 		if !s.checkOutboundInventory(w, r, &group) {
+			return
+		}
+		if err := services.rejectPendingProviderForGroup(r.Context(), group); err != nil {
+			writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
 			return
 		}
 		updated, err := services.Outbounds.Update(group, expected)
@@ -257,18 +277,34 @@ func (s *Server) outboundGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		services.record(requestActor(r), "outbound_group", id, "update", "accepted")
-		writeJSON(w, http.StatusOK, updated)
+		writeJSON(w, http.StatusOK, services.outboundGroupView(updated))
 		return
 	}
 	methodNotAllowed(w, "GET, PATCH, PUT")
 }
 
 type selectionRequest struct {
-	NodeID           string   `json:"node_id"`
-	GatewayID        string   `json:"gateway_id"`
-	Transport        string   `json:"transport,omitempty"`
-	TransportScopes  []string `json:"transport_scopes,omitempty"`
-	ExpectedRevision int64    `json:"expected_revision,omitempty"`
+	NodeID            string           `json:"node_id"`
+	GatewayID         string           `json:"gateway_id"`
+	Transport         string           `json:"transport,omitempty"`
+	TransportScopes   []string         `json:"transport_scopes,omitempty"`
+	ExpectedRevision  int64            `json:"expected_revision,omitempty"`
+	ExpectedRevisions map[string]int64 `json:"expected_revisions,omitempty"`
+}
+
+type outboundGroupView struct {
+	outbounds.Group
+	SelectionScope   string `json:"selection_scope"`
+	AppliedRevision  int64  `json:"applied_revision"`
+	ObservedRevision int64  `json:"observed_revision"`
+}
+
+func (services *Services) outboundGroupView(group outbounds.Group) outboundGroupView {
+	scope := "independent_transport"
+	if services.SelectionScopeMode != nil && services.SelectionScopeMode(group) == "shared" {
+		scope = "shared_tcp_udp"
+	}
+	return outboundGroupView{Group: group, SelectionScope: scope, AppliedRevision: group.AppliedRevision, ObservedRevision: group.ObservedRevision}
 }
 
 func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +346,10 @@ func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
 	if req.GatewayID == "" {
 		req.GatewayID = group.GatewayID
 	}
+	if req.GatewayID != group.GatewayID {
+		writeError(w, 422, "invalid_gateway_scope", "selection gateway must match the outbound group's gateway")
+		return
+	}
 	sharedSelection := services.SelectionScopeMode != nil && services.SelectionScopeMode(group) == "shared"
 	if sharedSelection {
 		if len(scopes) != 2 || !((scopes[0] == "tcp" && scopes[1] == "udp") || (scopes[0] == "udp" && scopes[1] == "tcp")) {
@@ -326,13 +366,35 @@ func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPreconditionRequired, "revision_required", "If-Match is required; use 0 for a new selection")
 		return
 	}
+	// Older independent selections can have different TCP and UDP revisions.
+	// Bind each scope explicitly when merging them into a shared selection;
+	// never substitute a maximum revision or skip the second scope's CAS.
+	if req.ExpectedRevisions != nil {
+		if len(req.ExpectedRevisions) != len(scopes) {
+			writeError(w, 422, "invalid_expected_revisions", "expected_revisions must contain exactly the requested transport scopes")
+			return
+		}
+		for _, transport := range scopes {
+			revision, present := req.ExpectedRevisions[transport]
+			if !present || revision < 0 {
+				writeError(w, 422, "invalid_expected_revisions", "each requested transport requires a nonnegative expected revision")
+				return
+			}
+		}
+		if req.ExpectedRevisions[scopes[0]] != expected {
+			writeError(w, 422, "invalid_expected_revisions", "If-Match must equal the first transport's expected revision (TCP for shared selection)")
+			return
+		}
+	}
+	expectedFor := func(transport string) int64 {
+		if req.ExpectedRevisions != nil {
+			return req.ExpectedRevisions[transport]
+		}
+		return expected
+	}
 	req.TransportScopes = scopes
 	req.Transport = ""
 	req.ExpectedRevision = expected
-	if err := services.rejectUnknownTarget(r.Context(), deployment.Target{Kind: "outbound_group", ID: groupID}); err != nil {
-		writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
-		return
-	}
 	if key := r.Header.Get("Idempotency-Key"); key != "" {
 		if old, lookupErr := services.Journal.FindByIdempotency(r.Context(), deployment.Target{Kind: "outbound_group", ID: groupID}, key); lookupErr == nil {
 			encoded, _ := json.Marshal(req)
@@ -344,20 +406,29 @@ func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := services.rejectUnknownTarget(r.Context(), deployment.Target{Kind: "outbound_group", ID: groupID}); err != nil {
+		writeError(w, http.StatusConflict, "outcome_unknown", err.Error())
+		return
+	}
+	priorSelections := map[string]*outbounds.Selection{}
 	for _, transport := range scopes {
 		scope := outbounds.Scope{GatewayID: req.GatewayID, Transport: transport}
 		current, getErr := services.Outbounds.GetSelection(groupID, scope)
-		if getErr == nil && current.Revision != expected {
+		if getErr == nil && current.Revision != expectedFor(transport) {
 			writeStoreError(w, domain.ErrConflict)
 			return
 		}
-		if errors.Is(getErr, domain.ErrNotFound) && expected != 0 {
+		if errors.Is(getErr, domain.ErrNotFound) && expectedFor(transport) != 0 {
 			writeStoreError(w, domain.ErrConflict)
 			return
 		}
 		if getErr != nil && !errors.Is(getErr, domain.ErrNotFound) {
 			writeServiceError(w, getErr)
 			return
+		}
+		priorSelections[transport] = nil
+		if getErr == nil {
+			priorSelections[transport] = &current
 		}
 		member := false
 		for _, id := range group.NodeIDs {
@@ -370,29 +441,33 @@ func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if services.SelectionPreflight != nil {
+		if err := services.SelectionPreflight(r.Context(), group); err != nil {
+			writeServiceError(w, err)
+			return
+		}
+	}
 	intentBytes, _ := json.Marshal(req)
+	previousBytes, _ := json.Marshal(priorSelections)
 	selectionTarget := deployment.Target{Kind: "outbound_group", ID: groupID}
 	fence, err := services.Journal.NextFence(r.Context(), selectionTarget)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	intent, err := services.Journal.Create(r.Context(), deployment.Operation{Target: selectionTarget, FenceToken: fence.Token, Action: "selection", IdempotencyKey: r.Header.Get("Idempotency-Key"), Status: deployment.StatusApplying, Views: deployment.StateViews{Desired: &deployment.StateRecord{Data: intentBytes, Status: "requested", At: time.Now().UTC()}}})
+	intent, err := services.Journal.Create(r.Context(), deployment.Operation{Target: selectionTarget, FenceToken: fence.Token, RequestHash: privateRequestHash(json.RawMessage(intentBytes)), Action: "selection", IdempotencyKey: r.Header.Get("Idempotency-Key"), Status: deployment.StatusApplying, Views: deployment.StateViews{Desired: &deployment.StateRecord{Data: intentBytes, Status: "requested", At: time.Now().UTC()}, Previous: &deployment.StateRecord{Data: previousBytes, Status: "previous", At: time.Now().UTC()}}})
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 	selectedIntents := make([]outbounds.Selection, 0, len(scopes))
-	priorSelections := map[string]*outbounds.Selection{}
 	for _, transport := range scopes {
 		scope := outbounds.Scope{GatewayID: req.GatewayID, Transport: transport}
-		var prior *outbounds.Selection
-		if previous, getErr := services.Outbounds.GetSelection(groupID, scope); getErr == nil {
-			prior = &previous
-		}
-		priorSelections[transport] = prior
-		selected, err := services.Outbounds.SetDesired(groupID, scope, req.NodeID, expected)
+		selected, err := services.Outbounds.SetDesired(groupID, scope, req.NodeID, expectedFor(transport))
 		if err != nil {
+			for _, selected := range selectedIntents {
+				_ = services.Outbounds.RestoreDesired(groupID, selected.Scope, priorSelections[selected.Scope.Transport])
+			}
 			intent.Status = deployment.StatusFailed
 			intent.Error = "selection intent validation failed"
 			_ = services.Journal.Save(context.WithoutCancel(r.Context()), intent)
@@ -419,10 +494,30 @@ func (s *Server) selection(w http.ResponseWriter, r *http.Request) {
 		applied := sharedResult
 		var err error
 		if !sharedSelection || index == 0 {
-			applied, err = services.SelectionApplier(r.Context(), group, selected)
+			applied, err = services.SelectionApplier(operationMutationContext(r.Context(), intent), group, selected)
 			sharedResult = applied
 		}
 		if err != nil {
+			if index == 0 && gateway.IsDefiniteRejection(err) {
+				for _, desired := range selectedIntents {
+					if restoreErr := services.Outbounds.RestoreDesired(groupID, desired.Scope, priorSelections[desired.Scope.Transport]); restoreErr != nil {
+						writeServiceError(w, restoreErr)
+						return
+					}
+				}
+				if persistErr := services.Persist(context.WithoutCancel(r.Context())); persistErr != nil {
+					writeServiceError(w, persistErr)
+					return
+				}
+				intent.Status = deployment.StatusFailed
+				intent.Error = "selection was rejected before runtime mutation"
+				if saveErr := services.Journal.Save(context.WithoutCancel(r.Context()), intent); saveErr != nil {
+					writeServiceError(w, saveErr)
+					return
+				}
+				writeServiceError(w, err)
+				return
+			}
 			intent.Status = deployment.StatusOutcomeUnknown
 			intent.Error = "selection result is unknown; gateway readback is required"
 			_ = services.Journal.Save(context.WithoutCancel(r.Context()), intent)
@@ -613,13 +708,14 @@ func (s *Server) providerApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerIntent, _ := json.Marshal(map[string]any{"provider_id": provider.ID, "revision": number, "expected_active_revision": expected, "content_hash": revision.Hash, "gateway_ids": targetIDs})
-	intent, err := services.Journal.Create(r.Context(), deployment.Operation{Target: providerTarget, FenceToken: fence.Token, Action: "publish", IdempotencyKey: r.Header.Get("Idempotency-Key"), Status: deployment.StatusApplying, Views: deployment.StateViews{Desired: &deployment.StateRecord{Revision: strconv.FormatInt(number, 10), Data: providerIntent, Status: "requested", At: time.Now().UTC()}}})
+	intent, err := services.Journal.Create(r.Context(), deployment.Operation{Target: providerTarget, FenceToken: fence.Token, Action: "publish", RequestHash: privateRequestHash(json.RawMessage(providerIntent)), IdempotencyKey: r.Header.Get("Idempotency-Key"), Status: deployment.StatusApplying, Views: deployment.StateViews{Desired: &deployment.StateRecord{Revision: strconv.FormatInt(number, 10), Data: providerIntent, Status: "requested", At: time.Now().UTC()}}})
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	publishErr := services.ProviderPublisher(r.Context(), provider, revision)
-	observed, readErr := services.ProviderReadback(r.Context(), provider)
+	mutationCtx := operationMutationContext(r.Context(), intent)
+	publishErr := services.ProviderPublisher(mutationCtx, provider, revision)
+	observed, readErr := services.ProviderReadback(mutationCtx, provider)
 	if readErr != nil || observed != number {
 		intent.Status = deployment.StatusOutcomeUnknown
 		intent.Error = "provider publication was not confirmed by gateway readback"
@@ -755,6 +851,11 @@ func writeUnsupported(w http.ResponseWriter, capability, message string) {
 }
 func writeServiceError(w http.ResponseWriter, err error) {
 	if err == nil {
+		return
+	}
+	var rejected *gateway.RequestRejected
+	if errors.As(err, &rejected) {
+		writeError(w, http.StatusConflict, rejected.Code, rejected.Detail)
 		return
 	}
 	if errors.Is(err, domain.ErrNotFound) || errors.Is(err, deployment.ErrNotFound) || errors.Is(err, outbounds.ErrGroupNotFound) {

@@ -39,11 +39,21 @@ jobs:
           test "$DISPATCH_REF" = main \
             || { echo "The ref input must be main."; exit 1; }
 
-      - name: Check out protected main
+      - name: Check out immutable dispatch commit
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify qualification source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          test "$source_commit" = "$GITHUB_SHA" \
+            || { echo "Checkout does not match dispatch commit ($source_commit != $GITHUB_SHA)."; exit 1; }
+          printf 'commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -61,6 +71,8 @@ jobs:
             || { echo 'tests/network is absent; the real-network gate is not qualified.'; exit 1; }
 
       - name: Run real network qualification
+        env:
+          NETWORK_QUALIFICATION_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
@@ -71,16 +83,16 @@ jobs:
             || { echo 'Trusted real-network harness is not installed.'; exit 1; }
           /opt/egressdeck/bin/run-network-qualification \
             --config "$NETWORK_QUALIFICATION_CONFIG" \
-            --source-commit "$GITHUB_SHA" \
+            --source-commit "$NETWORK_QUALIFICATION_SOURCE_COMMIT" \
             --evidence "$NETWORK_QUALIFICATION_EVIDENCE"
           # The tag is mandatory so ordinary unit tests cannot satisfy this gate.
           go test -tags=network -count=1 -v ./tests/network/...
 
       - name: Upload redacted qualification evidence
-        if: always()
+        if: always() && steps.source.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: network-qualification-${{ github.sha }}
+          name: network-qualification-${{ steps.source.outputs.commit }}
           path: |
             artifacts/network/**
             tests/network/artifacts/**

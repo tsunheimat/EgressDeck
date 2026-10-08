@@ -18,6 +18,8 @@ qualification on a real gateway.
 | DNS selection | `control/control_plane.go` disables the pointer-bearing selection cache while hot mode is enabled and pins chosen resources. |
 | DNS transport | `control/hot_dns.go` uses an exchange-owned forwarder, closes it before releasing the resource lease, and leaves ordinary answer caching intact. |
 | Kernel availability | `control/connectivity.go` takes availability ownership for published manual groups, suppresses obsolete baseline callbacks, writes and reads back the existing availability map. Failure fences native mutation/admission and returns outcome unknown. |
+| Independent group configuration | `control/hot_group.go` publishes group membership under its own revision while preserving active provider definitions and stable handles. |
+| Durable operations | `control/hot_operations.go` atomically binds operation IDs and request digests to committed/rejected inventory receipts; status and strict sequences safely resolve interrupted requests. |
 | Persistence | `control/hot_inventory.go` keeps a bounded encrypted compact snapshot, serializes mutations, restores exact handle/selection generations, and fences ambiguous persistence. |
 | Local daemon API | `cmd/hot_control.go` authenticates Unix peer UID, rejects permissive/symlink paths, bounds input and sanitizes errors; `cmd/run.go` drains requests before shutdown. |
 

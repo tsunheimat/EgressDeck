@@ -1842,6 +1842,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OutboundGroup'
+        '409':
+          description: outcome_unknown; an earlier group mutation must be reconciled before editing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '412':
           $ref: '#/components/responses/Error412'
         '401':
@@ -1862,7 +1868,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       x-implementation-status: implemented
       description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
-        Omitted mutable fields use zero values.
+        Omitted mutable fields use zero values. This updates desired configuration only; use the separate apply operation to deploy it against the active provider inventory.
       x-required-role: admin
     patch:
       tags:
@@ -1886,6 +1892,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OutboundGroup'
+        '409':
+          description: outcome_unknown; an earlier group mutation must be reconciled before editing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '412':
           $ref: '#/components/responses/Error412'
         '401':
@@ -1906,8 +1918,68 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       x-implementation-status: implemented
       description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
-        Omitted mutable fields use zero values.
+        Omitted mutable fields use zero values. This updates desired configuration only; use the separate apply operation to deploy it against the active provider inventory.
       x-required-role: admin
+  /api/v1/outbound-groups/{id}/apply:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    post:
+      tags:
+      - policy
+      summary: Publish desired outbound-group configuration independently of provider content
+      operationId: applyOutboundGroup
+      x-required-capability: group.publish_hot
+      x-required-role: admin
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Exact desired group revision to publish. Missing or invalid input returns 428; mismatch returns 412.
+      description: Applies the stored desired group configuration against the active provider inventory without refetching or advancing its connection revision. Requires configured group publication/readback adapters and explicit native group bindings. The idempotency key binds the full normalized desired group configuration. Applied and observed fields advance only after matching readback. Definite preflight rejection records failed; an uncertain remote outcome records outcome_unknown and requires reconciliation.
+      responses:
+        '202':
+          description: Durable group operation; group is present after matching applied readback and omitted on idempotent replay or uncertain outcome
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupApplyAccepted'
+        '400':
+          description: Invalid runtime publication request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          description: Idempotency conflict, unresolved prior operation, provider/group mismatch or definite native rejection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '428':
+          description: If-Match with the desired group revision is required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/Error503'
   /api/v1/outbound-groups/{id}/selection:
     parameters:
     - $ref: '#/components/parameters/ResourceID'
@@ -1955,7 +2027,11 @@ paths:
         '404':
           $ref: '#/components/responses/Error404'
         '409':
-          $ref: '#/components/responses/Error409'
+          description: group_configuration_not_applied, selection_preflight_failed, idempotency conflict, or an unresolved prior operation; definite preflight failures perform no selection mutation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '501':
           $ref: '#/components/responses/NotImplemented'
         '401':
@@ -2007,6 +2083,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SelectionAccepted'
+        '409':
+          description: group_configuration_not_applied, selection_preflight_failed, idempotency conflict, or an unresolved prior operation; definite preflight failures perform no selection mutation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '501':
           $ref: '#/components/responses/NotImplemented'
         '401':
@@ -4108,6 +4190,37 @@ components:
           format: date-time
         source_filters:
           $ref: '#/components/schemas/SourceFilters'
+        selection_scope:
+          type: string
+          enum:
+          - shared_tcp_udp
+          - independent_transport
+          description: Runtime selection semantics for this group. Shared selection uses one TCP/UDP control and requires both scopes in one mutation.
+        applied_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Last independently applied group configuration revision; omitted until publication is observed.
+        observed_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        applied_node_ids:
+          type: array
+          items:
+            type: string
+        observed_node_ids:
+          type: array
+          items:
+            type: string
+        applied_generation:
+          type: integer
+          format: int64
+          minimum: 0
+        observed_generation:
+          type: integer
+          format: int64
+          minimum: 0
       additionalProperties: false
       required:
       - id
@@ -4119,8 +4232,10 @@ components:
       - revision
       - created_at
       - updated_at
-      x-go-type: outbounds.Group
-      x-source: internal/outbounds/outbounds.go
+      - selection_scope
+      x-go-type: api.outboundGroupView
+      x-source: internal/api/services.go
+      description: revision and node_ids are desired group configuration. Applied and observed fields advance only after matching gateway readback; editing membership does not advance a provider connection revision or automatically deploy the group.
     SelectionRequest:
       type: object
       properties:
@@ -4139,14 +4254,23 @@ components:
           type: integer
           format: int64
           description: Accepted by decoder but overwritten from required If-Match; it is not the precondition authority.
+        expected_revisions:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Optional CAS revision per transport. Must contain exactly the requested transport scopes. If-Match must equal the first scope's value, which is TCP in shared mode. Both scopes are validated before mutation.
       additionalProperties: false
       required:
       - node_id
       x-go-type: api.selectionRequest
       x-source: internal/api/services.go
       description: gateway_id defaults to the group gateway. transport_scopes overrides transport; omitted transport
-        becomes tcp. Gateways advertising shared mode require explicit tcp and udp scopes. If-Match must contain
-        the nonnegative selection revision.
+        becomes tcp. Groups with selection_scope shared_tcp_udp require explicit tcp and udp scopes; the controller
+        canonicalizes their order to tcp, udp. If-Match must contain the nonnegative selection revision. Without
+        expected_revisions the same If-Match value applies to every requested scope. Invalid scope maps return
+        422 invalid_expected_revisions; omitted shared transport returns 422 shared_transport_required.
     Selection:
       type: object
       properties:
@@ -4202,6 +4326,20 @@ components:
       - items
     SelectionAccepted:
       $ref: '#/components/schemas/OperationAccepted'
+    GroupApplyAccepted:
+      type: object
+      required:
+      - operation_id
+      - status
+      properties:
+        operation_id:
+          type: string
+        status:
+          type: string
+          description: Durable operation status; applied confirms matching management readback, not traffic verification.
+        group:
+          $ref: '#/components/schemas/OutboundGroup'
+      additionalProperties: false
     GatewayCreate:
       type: object
       properties:

@@ -155,9 +155,12 @@ func (a *agent) routes() http.Handler {
 	mux.HandleFunc("/v1/inventory", a.auth(a.inventory))
 	mux.HandleFunc("/v1/readback", a.auth(a.inventory))
 	mux.HandleFunc("/v1/journal", a.auth(a.journalEntries))
+	mux.HandleFunc("/v1/mutations/{mutationId}", a.auth(a.mutationStatus))
+	mux.HandleFunc("/v1/mutations/{mutationId}/resolve", a.auth(a.resolveMutation))
 	mux.HandleFunc("/v1/providers/stage", a.auth(a.stageProvider))
 	mux.HandleFunc("/v1/providers/publish", a.auth(a.publishProvider))
 	mux.HandleFunc("/v1/providers/{providerId}/publish", a.auth(a.publishProvider))
+	mux.HandleFunc("/v1/groups/publish", a.auth(a.publishGroup))
 	mux.HandleFunc("/v1/selections/runtime", a.auth(a.runtimeSelection))
 	mux.HandleFunc("/v1/selections/persist", a.auth(a.persistSelection))
 	mux.HandleFunc("/v1/selections", a.auth(a.selectionRequest))
@@ -186,6 +189,15 @@ func (a *agent) auth(next handler) http.HandlerFunc {
 				writeError(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
+		}
+		identity, present, err := mutationIdentityFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid mutation identity")
+			return
+		}
+		if present {
+			r = r.WithContext(gateway.WithMutationIdentity(r.Context(), identity))
+			w = &mutationResponseWriter{ResponseWriter: w, identity: identity}
 		}
 		next(w, r)
 	}
@@ -567,6 +579,9 @@ func writeEngineError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, gateway.ErrInvalidRevision) || errors.Is(err, gateway.ErrSelection) {
 		status = http.StatusBadRequest
+	}
+	if writeMutationRejection(w, status, err) {
+		return
 	}
 	var typed *gateway.Error
 	if errors.As(err, &typed) {

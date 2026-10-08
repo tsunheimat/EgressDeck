@@ -61,6 +61,9 @@ function nodeName(id?: string) {
 function activeTransport(group: OutboundGroupSummary) {
   return selectedTransports.value[group.id] ?? 'tcp'
 }
+function sharedSelection(group: OutboundGroupSummary) { return group.selectionScope === 'shared_tcp_udp' }
+function selectionTransports(group: OutboundGroupSummary) { return sharedSelection(group) ? ['tcp', 'udp'] : [activeTransport(group)] }
+function selectionLabel(group: OutboundGroupSummary) { return selectionTransports(group).map(transport => transport.toUpperCase()).join(' + ') }
 function transports(group: OutboundGroupSummary) {
   return [...new Set(['tcp', 'udp', ...group.transportScopes, ...(selections.value[group.id] ?? []).filter(item => item.scope.gateway_id === group.gatewayId).map(item => item.scope.transport)])]
 }
@@ -68,13 +71,26 @@ function selectionFor(group: OutboundGroupSummary, transport = activeTransport(g
   return selections.value[group.id]?.find(item => item.scope.gateway_id === group.gatewayId && item.scope.transport === transport)
 }
 function selectionStates(group: OutboundGroupSummary) {
-  const current = selectionFor(group)
-  return { desired: nodeName(current?.desired_node_id), applied: nodeName(current?.applied_node_id), observed: nodeName(current?.observed_node_id) }
+  const records = selectionTransports(group).map(transport => selectionFor(group, transport))
+  const state = (field: 'desired_node_id' | 'applied_node_id' | 'observed_node_id') => {
+    const ids = records.map(record => record?.[field])
+    return ids.every(id => id === ids[0]) ? nodeName(ids[0]) : 'TCP / UDP differ — see readback'
+  }
+  return { desired: state('desired_node_id'), applied: state('applied_node_id'), observed: state('observed_node_id') }
+}
+function observedForSelection(group: OutboundGroupSummary, nodeID: string) { return selectionTransports(group).every(transport => selectionFor(group, transport)?.observed_node_id === nodeID) }
+function groupConfigurationPending(group: OutboundGroupSummary) { return group.appliedRevision !== undefined && (group.appliedRevision !== group.revision || group.observedRevision !== group.revision) }
+function groupApplyUnavailable(group: OutboundGroupSummary) {
+  if (!canAdminister.value) return 'An administrator session is required to apply group configuration.'
+  if (!props.state.capabilities.value['group.publish_hot']) return 'This controller does not report group publication support.'
+  if (!group.nodeIds.length) return 'Add candidate nodes before applying group configuration.'
+  return undefined
 }
 function selectionUnavailable(group: OutboundGroupSummary) {
   if (!props.state.canOperate.value) return 'An operator or administrator session is required to change selection.'
   if (!props.state.capabilities.value['selection.set_runtime']) return 'Runtime selection is unavailable on this controller.'
   if (group.mode !== 'manual') return 'Use manual selection mode to choose a node.'
+  if (groupConfigurationPending(group)) return 'Group configuration is not applied. Apply the saved group revision before choosing a node.'
   if (readbackErrors.value[group.id]) return 'Selection readback is unavailable. Refresh before changing selection.'
   if (!Object.prototype.hasOwnProperty.call(selections.value, group.id)) return 'Selection readback is pending.'
   if (!group.nodeIds.length) return 'Add candidate nodes before changing selection.'
@@ -205,18 +221,19 @@ async function select(group: OutboundGroupSummary, node: NodeSummary) {
     actionError.value = unavailable ?? 'This node is not a supported candidate in the group.'
     return
   }
-  const transport = activeTransport(group)
-  const expectedRevision = String(selectionFor(group, transport)?.revision ?? 0)
+  const transportScopes = selectionTransports(group)
+  const expectedRevisions = Object.fromEntries(transportScopes.map(transport => [transport, selectionFor(group, transport)?.revision ?? 0]))
+  const expectedRevision = String(expectedRevisions[transportScopes[0]!])
   pendingGroup.value = group.id
   actionError.value = undefined
   notice.value = undefined
   try {
-    const result = await props.state.api.setSelection(group.id, { nodeId: node.id, gatewayId: group.gatewayId, transportScopes: [transport], expectedRevision }, randomIdempotencyKey())
+    const result = await props.state.api.setSelection(group.id, { nodeId: node.id, gatewayId: group.gatewayId, transportScopes, expectedRevision, ...(sharedSelection(group) ? { expectedRevisions } : {}) }, randomIdempotencyKey())
     if (!result.operationId) throw new Error('The controller did not return an operation identifier. Refresh selection readback before retrying.')
     const operation = await props.state.api.waitForOperation(result.operationId)
     props.state.recordOperation(operation)
     if (['failed', 'outcome_unknown', 'partially_applied'].includes(operation.status)) actionError.value = operation.error ?? `Selection operation is ${operation.status}.`
-    else notice.value = `Selection operation ${operation.status}. Review the ${transport.toUpperCase()} readback below.`
+    else notice.value = `Selection operation ${operation.status}. Review the ${selectionLabel(group)} readback below.`
   } catch (cause) {
     actionError.value = errorMessage(cause, 'Selection failed')
   } finally {
@@ -225,13 +242,35 @@ async function select(group: OutboundGroupSummary, node: NodeSummary) {
   }
 }
 
+async function applyGroup(group: OutboundGroupSummary) {
+  if (busy.value) return
+  const unavailable = groupApplyUnavailable(group)
+  if (unavailable) { actionError.value = unavailable; return }
+  pendingGroup.value = group.id
+  actionError.value = undefined
+  notice.value = undefined
+  try {
+    const accepted = await props.state.api.applyOutboundGroup(group.id, group.revision, randomIdempotencyKey())
+    const operation = await props.state.api.waitForOperation(accepted.operationId)
+    props.state.recordOperation(operation)
+    await load()
+    const readback = groups.value.find(item => item.id === group.id)
+    if (operation.status !== 'applied') actionError.value = operation.error ?? `Group configuration operation is ${operation.status}.`
+    else if (!readback || readback.revision !== group.revision || readback.appliedRevision !== group.revision || readback.observedRevision !== group.revision) actionError.value = 'The controller accepted the group publication, but readback has not confirmed the requested revision.'
+    else notice.value = `Group configuration revision ${group.revision} applied and observed on the gateway.`
+  } catch (cause) {
+    actionError.value = errorMessage(cause, 'Unable to apply group configuration')
+    await load()
+  } finally { pendingGroup.value = undefined }
+}
+
 onActivated(load)
 </script>
 
 <template>
   <div class="page-grid">
     <section class="page-heading">
-      <div><p class="eyebrow">Proxy inventory</p><h1>Proxies</h1><p class="lede">Organize candidate nodes and choose a node independently for each transport.</p></div>
+      <div><p class="eyebrow">Proxy inventory</p><h1>Proxies</h1><p class="lede">Organize candidate nodes and choose an exit using each gateway’s selection mode.</p></div>
       <div class="node-filters"><input v-model="search" class="search" type="search" placeholder="Search nodes" aria-label="Search nodes" /><label>Protocol<select v-model="protocolFilter" aria-label="Filter nodes by protocol"><option value="">All protocols</option><option v-for="protocol in protocols" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>Sort<select v-model="nodeSort" aria-label="Sort nodes"><option value="name">Name</option><option value="protocol">Protocol</option><option value="health">Health</option></select></label></div>
     </section>
     <section v-if="loadError" class="alert alert--bad" role="alert">{{ loadError }}</section>
@@ -272,20 +311,22 @@ onActivated(load)
       <article v-for="group in groups" :key="group.id" class="group-card" :aria-label="`Outbound group ${group.name}`">
         <div class="group-card__heading">
           <div><h3>{{ group.name }}</h3><p>{{ group.nodeIds.length }} candidates · {{ group.mode }} · gateway {{ group.gatewayId }} · configuration revision {{ group.revision }}</p></div>
-          <div class="actions"><StatusPill :label="pendingGroup === group.id ? 'Applying' : readbackErrors[group.id] ? 'Readback unavailable' : 'Configured'" :tone="pendingGroup === group.id || readbackErrors[group.id] ? 'warn' : 'neutral'" /><button class="button button--secondary" :aria-label="`Test group ${group.name} from gateway`" :title="probeUnavailable(group)" :disabled="!!probing || !!probeUnavailable(group)" @click="runProbe(group)">{{ probing === probeKey(group) ? 'Testing…' : 'Test group' }}</button><button class="button button--secondary" :aria-label="`Edit ${group.name}`" :disabled="busy || !canAdminister" @click="openEditor(group)">Edit</button></div>
+          <div class="actions"><StatusPill :label="pendingGroup === group.id ? 'Applying' : readbackErrors[group.id] ? 'Readback unavailable' : groupConfigurationPending(group) ? 'Configuration pending' : 'Configured'" :tone="pendingGroup === group.id || readbackErrors[group.id] || groupConfigurationPending(group) ? 'warn' : 'neutral'" /><button v-if="groupConfigurationPending(group)" class="button" :aria-label="`Apply configuration for ${group.name}`" :title="groupApplyUnavailable(group)" :disabled="busy || !!groupApplyUnavailable(group)" @click="applyGroup(group)">Apply configuration</button><button class="button button--secondary" :aria-label="`Test group ${group.name} from gateway`" :title="probeUnavailable(group)" :disabled="!!probing || !!probeUnavailable(group)" @click="runProbe(group)">{{ probing === probeKey(group) ? 'Testing…' : 'Test group' }}</button><button class="button button--secondary" :aria-label="`Edit ${group.name}`" :disabled="busy || !canAdminister" @click="openEditor(group)">Edit</button></div>
         </div>
+        <p v-if="group.appliedRevision !== undefined" class="help">Group configuration: desired revision {{ group.revision }} · applied {{ group.appliedRevision || 'Not applied' }} · observed {{ group.observedRevision || 'Not observed' }}<span v-if="group.appliedGeneration"> · gateway generation {{ group.appliedGeneration }}</span></p>
         <p v-if="group.sourceFilters" class="help">Candidates follow saved source filters. The {{ group.nodeIds.length }} nodes below are the controller’s current resolved membership.</p>
         <p v-if="readbackErrors[group.id]" class="alert alert--bad" role="alert">{{ readbackErrors[group.id] }} Previously loaded values may be stale.</p>
         <p v-if="probeResults[probeKey(group)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group)]!) }}<span v-if="probeResults[probeKey(group)]?.probe.error"> · {{ probeResults[probeKey(group)]?.probe.error }}</span></p>
         <p v-if="probeErrors[probeKey(group)]" class="help warning" role="alert">{{ probeErrors[probeKey(group)] }}</p>
         <div class="table-scroll"><table :aria-label="`Selection readback for ${group.name}`"><thead><tr><th>Transport</th><th>Desired</th><th>Applied</th><th>Observed</th><th>Revision</th></tr></thead><tbody><tr v-for="transport in transports(group)" :key="transport"><th scope="row">{{ transport.toUpperCase() }}</th><td>{{ nodeName(selectionFor(group, transport)?.desired_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.applied_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.observed_node_id) ?? '—' }}</td><td>{{ selectionFor(group, transport)?.revision ?? 'No selection' }}</td></tr></tbody></table></div>
-        <label class="transport-control">Selection transport<select :value="activeTransport(group)" :aria-label="`Selection transport for ${group.name}`" :disabled="busy" @change="selectedTransports[group.id] = ($event.target as HTMLSelectElement).value"><option v-for="transport in transports(group)" :key="transport" :value="transport">{{ transport.toUpperCase() }}</option></select></label>
+        <p v-if="sharedSelection(group)" class="help">Shared TCP + UDP selection. Choosing a node changes both transports together.</p>
+        <label v-else class="transport-control">Selection transport<select :value="activeTransport(group)" :aria-label="`Selection transport for ${group.name}`" :disabled="busy" @change="selectedTransports[group.id] = ($event.target as HTMLSelectElement).value"><option v-for="transport in transports(group)" :key="transport" :value="transport">{{ transport.toUpperCase() }}</option></select></label>
         <StateStrip :states="selectionStates(group)" :pending="pendingGroup === group.id" />
         <p v-if="selectionUnavailable(group)" class="help warning">{{ selectionUnavailable(group) }}</p>
         <p v-else-if="!state.capabilities.value['selection.persist_restart']" class="help warning">This adapter does not report durable selection across gateway restarts.</p>
         <div class="node-grid">
-          <div v-for="node in nodesForGroup(group)" :key="node.id" class="node-entry"><button class="node-card" :class="{ 'node-card--selected': node.id === selectionFor(group)?.observed_node_id }" :aria-label="`Select ${node.name} for ${group.name} (${activeTransport(group).toUpperCase()})`" :aria-pressed="node.id === selectionFor(group)?.observed_node_id" :disabled="busy || !!selectionUnavailable(group) || !node.supported" @click="select(group, node)">
-            <span class="node-card__name">{{ node.name }}</span><span class="node-card__meta">{{ node.protocol }} · {{ node.health }}</span><span v-if="!node.supported" class="node-card__warning">Unsupported</span><span v-if="node.id === selectionFor(group)?.observed_node_id" class="node-card__meta">Observed for {{ activeTransport(group).toUpperCase() }}</span>
+          <div v-for="node in nodesForGroup(group)" :key="node.id" class="node-entry"><button class="node-card" :class="{ 'node-card--selected': observedForSelection(group, node.id) }" :aria-label="`Select ${node.name} for ${group.name} (${selectionLabel(group)})`" :aria-pressed="observedForSelection(group, node.id)" :disabled="busy || !!selectionUnavailable(group) || !node.supported" @click="select(group, node)">
+            <span class="node-card__name">{{ node.name }}</span><span class="node-card__meta">{{ node.protocol }} · {{ node.health }}</span><span v-if="!node.supported" class="node-card__warning">Unsupported</span><span v-if="observedForSelection(group, node.id)" class="node-card__meta">Observed for {{ selectionLabel(group) }}</span>
           </button><button class="button button--secondary" :aria-label="`Test node ${node.name} from gateway for ${group.name}`" :title="probeUnavailable(group, node)" :disabled="!!probing || !!probeUnavailable(group, node)" @click="runProbe(group, node)">{{ probing === probeKey(group, node) ? 'Testing…' : 'Test node' }}</button><p v-if="probeResults[probeKey(group, node)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group, node)]!) }}<span v-if="probeResults[probeKey(group, node)]?.probe.error"> · {{ probeResults[probeKey(group, node)]?.probe.error }}</span></p><p v-if="probeErrors[probeKey(group, node)]" class="help warning" role="alert">{{ probeErrors[probeKey(group, node)] }}</p></div>
         </div>
         <p v-if="group.nodeIds.length && !nodesForGroup(group).length && !missingCandidates(group).length" class="help">No candidate nodes match the search.</p>

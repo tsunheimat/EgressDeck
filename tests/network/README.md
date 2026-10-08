@@ -20,4 +20,8 @@ guard observations.
 
 Run the protected GitHub `Network qualification` workflow only after installing
 the topology harness on the isolated `egressdeck-network` runner. The workflow
-does not enroll a production network and is not triggered by pull requests.
+checks out the immutable dispatch commit and verifies `HEAD` against
+`GITHUB_SHA` before running the harness. The harness source argument and artifact
+name use that verified commit, so a later update to `main` cannot change the
+source being qualified. The workflow does not enroll a production network and
+is not triggered by pull requests.

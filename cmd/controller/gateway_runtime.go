@@ -70,9 +70,12 @@ func configureGatewayRuntime(server *api.Server, connections map[string]configur
 		server.Services.ProviderPublisher = bridge.publishProvider
 		server.Services.ProviderReadback = bridge.providerReadback
 		server.Services.ProviderTargetIDs = bridge.providerTargetIDs
+		server.Services.GroupPublisher = bridge.publishGroup
+		server.Services.GroupReadback = bridge.groupReadback
 	}
 	if selectionEnabled {
 		server.Services.SelectionApplier = bridge.applySelection
+		server.Services.SelectionPreflight = bridge.selectionPreflight
 		server.Services.SelectionPersistence = true
 		server.Services.SelectionScopeMode = func(group outbounds.Group) string {
 			if connection, ok := connections[group.GatewayID]; ok && connection.runtime.EnableSelection && connection.runtime.SharedTransportSelection {
@@ -110,6 +113,9 @@ func (b *gatewayRuntimeBridge) connection(ctx context.Context, id string, operat
 		return configuredGateway{}, gateway.Snapshot{}, gateway.ErrUnsupported
 	}
 	if operation == gateway.CapabilityProviderPublish && !c.runtime.EnableProviderPublish {
+		return c, gateway.Snapshot{}, gateway.ErrUnsupported
+	}
+	if operation == gateway.CapabilityGroupPublish && !c.runtime.EnableProviderPublish {
 		return c, gateway.Snapshot{}, gateway.ErrUnsupported
 	}
 	if operation == gateway.CapabilitySelectionRuntime && !c.runtime.EnableSelection {
@@ -330,7 +336,8 @@ func (b *gatewayRuntimeBridge) publishProvider(ctx context.Context, provider dom
 		}
 	}
 	for _, target := range targets {
-		if verifyPublished(target.before, target.revision) == nil {
+		_, correlated := gateway.MutationIdentityFromContext(ctx)
+		if verifyPublished(target.before, target.revision) == nil && !correlated {
 			continue
 		}
 		stage, err := target.connection.client.StageProvider(ctx, target.revision, target.before.Generation)
@@ -348,6 +355,17 @@ func (b *gatewayRuntimeBridge) publishProvider(ctx context.Context, provider dom
 	}
 	if _, err := b.server.Services.Outbounds.ReconcileGroups(inventory, fences); err != nil {
 		return gateway.ErrOutcomeUnknown
+	}
+	for _, target := range targets {
+		observed, err := target.connection.client.Readback(ctx)
+		if err != nil || verifyPublished(observed, target.revision) != nil {
+			return gateway.ErrOutcomeUnknown
+		}
+		for _, group := range target.revision.Groups {
+			if _, err := b.server.Services.Outbounds.ObserveConfiguration(group.ID, group.Revision, group.CandidateIDs, observed.Generation); err != nil {
+				return gateway.ErrOutcomeUnknown
+			}
+		}
 	}
 	return nil
 }
@@ -418,26 +436,27 @@ func (b *gatewayRuntimeBridge) applySelection(ctx context.Context, group outboun
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if group.GatewayID != desired.Scope.GatewayID || group.ID != desired.GroupID || group.Mode != outbounds.SelectionManual || !containsID(group.NodeIDs, desired.DesiredNodeID) {
-		return outbounds.Selection{}, outbounds.ErrNodeNotMember
+		return outbounds.Selection{}, gateway.RejectBeforeMutation("invalid_selection", "selection is not a member of the configured group", outbounds.ErrNodeNotMember)
 	}
 	connection, before, err := b.connection(ctx, group.GatewayID, gateway.CapabilitySelectionRuntime)
 	if err != nil {
-		return outbounds.Selection{}, err
+		return outbounds.Selection{}, gateway.RejectBeforeMutation("selection_preflight_failed", err.Error(), err)
 	}
 	binding, ok := connection.runtime.Groups[group.ID]
 	if !ok {
-		return outbounds.Selection{}, gateway.ErrUnsupported
+		return outbounds.Selection{}, gateway.RejectBeforeMutation("unsupported_group", "group has no native runtime binding", gateway.ErrUnsupported)
 	}
 	remoteGroup, ok := before.Groups[group.ID]
-	if !ok || remoteGroup.Name != binding.Name || !sameIDs(remoteGroup.NodeIDs, group.NodeIDs) {
-		return outbounds.Selection{}, domain.ErrConflict
+	if !ok || remoteGroup.Name != binding.Name || remoteGroup.Revision != group.Revision || !sameIDs(remoteGroup.NodeIDs, group.NodeIDs) {
+		return outbounds.Selection{}, gateway.RejectBeforeMutation("group_configuration_not_applied", "apply the desired group configuration before selecting a node", domain.ErrConflict)
 	}
 	old, exists := remoteSelection(before, group.GatewayID, group.ID)
 	expected := int64(0)
 	if exists {
 		expected = old.Revision
 	}
-	if !exists || old.DesiredNodeID != desired.DesiredNodeID || old.ObservedNodeID != desired.DesiredNodeID {
+	_, correlated := gateway.MutationIdentityFromContext(ctx)
+	if correlated || !exists || old.DesiredNodeID != desired.DesiredNodeID || old.ObservedNodeID != desired.DesiredNodeID {
 		_, applyErr := connection.client.PersistSelection(ctx, gateway.SelectionScope{GatewayID: group.GatewayID, GroupID: group.ID, Transport: "both"}, desired.DesiredNodeID, expected)
 		after, readErr := connection.client.Readback(ctx)
 		if readErr != nil {

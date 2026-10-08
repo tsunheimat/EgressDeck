@@ -13,7 +13,7 @@ scratch_dir=$1
 base_commit=e3fee8fbc68a65167af13b685ab0b958757e20ee
 headers_commit=56937c66784879fe5e2ff89db5bc05aa061d594c
 patch_file="$script_dir/patches/0001-native-hot-provider-runtime.patch"
-patch_sha=6dc2bbcb8270adfaac62eda4e33abab98eef9009bfa89e9f107d672cb904aa38
+patch_sha=f3266aa1e69de7f1798343c4d3623ed035f5ee30e85c5cb1e4a97fd50c23975d
 actual_sha=$(sha256sum "$patch_file")
 [[ ${actual_sha%% *} == "$patch_sha" ]] || { echo 'patch digest mismatch' >&2; exit 1; }
 git clone https://github.com/daeuniverse/dae.git "$scratch_dir"

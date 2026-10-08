@@ -19,6 +19,10 @@ it. Existing flows keep their selected native resources. Hot DNS exchanges use
 leased, per-exchange forwarders so a replacement using the same display name
 cannot reuse an obsolete connection. Ordinary DNS answer caching remains intact.
 
+Outbound-group membership has its own revision and publication operation against
+unchanged provider inventory. All Unix mutations use durable operation IDs and
+authoritative status readback, including safe exact-ID replay after pre-send crashes.
+
 The native runtime has a compact journal with restart restoration, generation
 preconditions, private file permissions, directory locking, and ambiguous-commit
 fencing. Kernel availability writes are read back before successful publication
@@ -87,6 +91,12 @@ plaintext legacy state and authenticated ciphertext corruption fail closed.
 The hosted source-contract workflow is [dae-native.yml](../../.github/workflows/dae-native.yml).
 It builds and tests the patch and runs the actual native API/adapter fixture;
 its existence does not establish a completed hosted run.
+
+Upgrade only after the previous agent reports no unresolved mutations. Journals
+with legacy pending intent lacking operation IDs fail startup with
+`upgrade_required`; they cannot be safely labeled never-accepted. Resolve that
+intent using the previous source/version and authoritative runtime readback before
+upgrading. Settled encrypted state and staged unsent revisions remain readable.
 
 The local contract is documented in [API.md](API.md). Source hashes and dependency
 pins are in [source-manifest.json](source-manifest.json); actual test receipts and

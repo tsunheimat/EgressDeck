@@ -41,11 +41,17 @@ type NativeEngine struct {
 }
 
 type nativeState struct {
-	Version    int                             `json:"version"`
-	Staged     map[string]nativeStage          `json:"staged"`
-	Active     map[string]ProviderStageRequest `json:"active"`
-	Selections map[string]Selection            `json:"selections"`
-	Pending    *nativePendingSelection         `json:"pending_selection,omitempty"`
+	Version        int                             `json:"version"`
+	Staged         map[string]nativeStage          `json:"staged"`
+	Active         map[string]ProviderStageRequest `json:"active"`
+	Selections     map[string]Selection            `json:"selections"`
+	Pending        *nativePendingSelection         `json:"pending_selection,omitempty"`
+	PendingGroup   *nativePendingGroup             `json:"pending_group,omitempty"`
+	Operation      *nativePendingOperation         `json:"operation,omitempty"`
+	ClientID       string                          `json:"client_id,omitempty"`
+	Sequence       uint64                          `json:"sequence,omitempty"`
+	Correlations   map[string]nativeCorrelation    `json:"correlations,omitempty"`
+	MutationFences map[string]uint64               `json:"mutation_fences,omitempty"`
 }
 type nativeStage struct {
 	Request ProviderStageRequest `json:"request"`
@@ -62,12 +68,15 @@ type nativeInventory struct {
 	Groups     []nativeGroup `json:"groups"`
 }
 type nativeGroup struct {
-	Handle    uint8  `json:"handle"`
-	Name      string `json:"name"`
-	Identity  string `json:"identity"`
-	Selection string `json:"selection"`
+	Handle        uint8    `json:"handle"`
+	Name          string   `json:"name"`
+	Identity      string   `json:"identity"`
+	Selection     string   `json:"selection"`
+	GroupRevision int64    `json:"group_revision"`
+	CandidateIDs  []string `json:"candidate_ids"`
 }
 type nativePublicationGroup struct {
+	Revision     int64    `json:"revision,omitempty"`
 	Name         string   `json:"name"`
 	CandidateIDs []string `json:"candidate_ids"`
 	Selection    string   `json:"selection"`
@@ -113,6 +122,15 @@ func NewNativeEngine(options NativeOptions, journal Journal) (*NativeEngine, err
 			return nil, fmt.Errorf("%w: native journal cannot be authenticated", ErrJournal)
 		}
 		break
+	}
+	if e.state.Operation == nil {
+		legacyPending := e.state.Pending != nil || e.state.PendingGroup != nil
+		for _, stage := range e.state.Staged {
+			legacyPending = legacyPending || stage.Pending
+		}
+		if legacyPending {
+			return nil, &Error{Code: "upgrade_required", Detail: "legacy native journal has unresolved intent without an operation ID; resolve with the previous version before upgrade", Cause: ErrJournal}
+		}
 	}
 	return e, nil
 }
@@ -241,6 +259,8 @@ func (e *NativeEngine) do(ctx context.Context, method, path string, input, outpu
 			return conflict("native", "native generation changed")
 		case "inventory_busy":
 			return &Error{Code: "busy", Detail: "native retained inventory is full", Cause: ErrBusy}
+		case "operation_limit":
+			return &Error{Code: "operation_limit", Detail: "native operation client registry is full", Cause: ErrBusy}
 		case "invalid_request":
 			return &Error{Code: "invalid_request", Detail: "native daemon rejected the request", Cause: ErrInvalidRevision}
 		case "outcome_unknown":
@@ -289,15 +309,26 @@ func nativeRequestObserved(inv nativeInventory, r ProviderStageRequest) bool {
 	}
 	for _, g := range r.Groups {
 		observed, ok := nativeGroupByName(inv, g.Name)
-		if !ok || observed.Identity != nativeIdentity(r) {
+		if !ok || observed.Identity != nativeIdentity(r) || observed.GroupRevision != g.Revision || !sameGroupCandidates(observed.CandidateIDs, g.CandidateIDs) {
 			return false
 		}
 	}
 	return true
 }
-func (e *NativeEngine) reconcile(ctx context.Context, inv nativeInventory) error {
+func (e *NativeEngine) reconcile(ctx context.Context, inventory *nativeInventory) error {
+	if err := e.reconcileNativeOperation(ctx, inventory); err != nil {
+		return err
+	}
+	inv := *inventory
 	next := e.cloneState()
 	changed := false
+	if next.PendingGroup != nil {
+		groupChanged, err := e.reconcileGroup(ctx, &next, inv)
+		if err != nil {
+			return err
+		}
+		changed = groupChanged
+	}
 	for id, stage := range next.Staged {
 		if !stage.Pending {
 			continue
@@ -350,6 +381,10 @@ func (e *NativeEngine) reconcile(ctx context.Context, inv nativeInventory) error
 				changed = true
 			}
 		}
+	}
+	if next.Operation != nil {
+		e.completeNativeOperation(&next, "committed", "", inv.Generation)
+		changed = true
 	}
 	if changed {
 		return e.persist(ctx, next, "readback")
@@ -411,7 +446,7 @@ func (e *NativeEngine) Inventory(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	if err = e.reconcile(ctx, inv); err != nil {
+	if err = e.reconcile(ctx, &inv); err != nil {
 		return Snapshot{}, err
 	}
 	return e.snapshot(inv), nil
@@ -432,6 +467,10 @@ func (e *NativeEngine) StageInfo(id string) (ProviderRevision, int64, bool) {
 func (e *NativeEngine) StageProvider(ctx context.Context, revision ProviderRevision, expected int64) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	check := e.cloneState()
+	if err := e.checkNativeCorrelation(ctx, &check); err != nil {
+		return "", err
+	}
 	if expected < 0 {
 		return "", conflict("provider.stage", "expected generation must be nonnegative")
 	}
@@ -473,7 +512,7 @@ func (e *NativeEngine) StageProvider(ctx context.Context, revision ProviderRevis
 	if err != nil {
 		return "", err
 	}
-	if err = e.reconcile(ctx, inv); err != nil {
+	if err = e.reconcile(ctx, &inv); err != nil {
 		return "", err
 	}
 	if int64(inv.Generation) != expected {
@@ -491,7 +530,9 @@ func (e *NativeEngine) StageProvider(ctx context.Context, revision ProviderRevis
 			}
 		}
 		if provider == r.ProviderID && r.Revision <= active.Revision {
-			return "", conflict("provider.stage", "provider revision must advance")
+			if r.Revision != active.Revision || nativeStageHash(NewProviderStageRequest(r, expected)) != nativeStageHash(active) {
+				return "", conflict("provider.stage", "provider revision must advance or exactly match active content")
+			}
 		}
 	}
 	req := NewProviderStageRequest(r, expected)
@@ -532,6 +573,10 @@ func (e *NativeEngine) StageProvider(ctx context.Context, revision ProviderRevis
 func (e *NativeEngine) PublishProvider(ctx context.Context, id string) (Snapshot, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	check := e.cloneState()
+	if err := e.checkNativeCorrelation(ctx, &check); err != nil {
+		return Snapshot{}, err
+	}
 	stage, ok := e.state.Staged[id]
 	if !ok {
 		return Snapshot{}, ErrStageNotFound
@@ -540,7 +585,7 @@ func (e *NativeEngine) PublishProvider(ctx context.Context, id string) (Snapshot
 	if err != nil {
 		return Snapshot{}, err
 	}
-	if err = e.reconcile(ctx, inv); err != nil {
+	if err = e.reconcile(ctx, &inv); err != nil {
 		return Snapshot{}, err
 	}
 	if _, ok = e.state.Staged[id]; !ok {
@@ -549,45 +594,50 @@ func (e *NativeEngine) PublishProvider(ctx context.Context, id string) (Snapshot
 	if int64(inv.Generation) != stage.Request.ExpectedGeneration {
 		return Snapshot{}, conflict("provider.publish_hot", "staged generation does not match native inventory")
 	}
+	if active, exists := e.state.Active[stage.Request.ProviderID]; exists && nativeStageHash(active) == nativeStageHash(stage.Request) && nativeRequestObserved(inv, active) {
+		next := e.cloneState()
+		delete(next.Staged, id)
+		if err := e.recordNativeNoop(ctx, &next, inv.Generation); err != nil {
+			return Snapshot{}, err
+		}
+		if err := e.persist(ctx, next, "provider_unchanged"); err != nil {
+			return Snapshot{}, err
+		}
+		return e.snapshot(inv), nil
+	}
 	next := e.cloneState()
 	stage.Pending = true
 	next.Staged[id] = stage
+	r := stage.Request
+	if err = e.nativeBeginOperation(ctx, &next, "provider_publish", "/v1/providers/publish", nativePublishWire(r)); err != nil {
+		return Snapshot{}, err
+	}
 	if err = e.persist(ctx, next, "publish_pending"); err != nil {
 		return Snapshot{}, err
 	}
-	r := stage.Request
-	request := nativePublishWire(r)
-	var ack nativeMutationResponse
-	mutationErr := e.do(ctx, http.MethodPost, "/v1/providers/publish", request, &ack)
-	if definiteNativeRejection(mutationErr) {
-		next := e.cloneState()
-		stage.Pending = false
-		next.Staged[id] = stage
-		if err := e.persist(context.WithoutCancel(ctx), next, "publish_rejected"); err != nil {
-			return Snapshot{}, err
-		}
-		return Snapshot{}, mutationErr
-	}
+	// The exact durable operation is dispatched by reconciliation. This covers
+	// both normal delivery and an agent restart before the first send.
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.Timeout)
 	defer cancel()
 	read, readErr := e.inventory(readCtx)
 	if readErr != nil {
 		return Snapshot{}, nativeUnknown()
 	}
-	if err = e.reconcile(readCtx, read); err != nil {
+	if err = e.reconcile(readCtx, &read); err != nil {
 		return Snapshot{}, err
 	}
 	if active, ok := e.state.Active[r.ProviderID]; ok && nativeIdentity(active) == nativeIdentity(r) && nativeRequestObserved(read, r) {
 		return e.snapshot(read), nil
-	}
-	if mutationErr != nil {
-		return Snapshot{}, mutationErr
 	}
 	return Snapshot{}, nativeUnknown()
 }
 func (e *NativeEngine) SetRuntimeSelection(ctx context.Context, scope SelectionScope, node string, expected int64) (Selection, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	check := e.cloneState()
+	if err := e.checkNativeCorrelation(ctx, &check); err != nil {
+		return Selection{}, err
+	}
 	if scope.Transport != "" && scope.Transport != "both" {
 		return Selection{}, &Error{Code: "unsupported", Operation: "selection.set_runtime", Detail: "native group selection is shared by TCP and UDP; use transport both", Cause: ErrUnsupported}
 	}
@@ -598,7 +648,7 @@ func (e *NativeEngine) SetRuntimeSelection(ctx context.Context, scope SelectionS
 	if err != nil {
 		return Selection{}, err
 	}
-	if err = e.reconcile(ctx, inv); err != nil {
+	if err = e.reconcile(ctx, &inv); err != nil {
 		return Selection{}, err
 	}
 	name, r, ok := nativeManagedGroup(e.state, scope.GroupID)
@@ -630,6 +680,9 @@ func (e *NativeEngine) SetRuntimeSelection(ctx context.Context, scope SelectionS
 		selection := Selection{Scope: scope, DesiredNodeID: node, ObservedNodeID: node, Revision: expected + 1, UpdatedAt: time.Now().UTC()}
 		next := e.cloneState()
 		next.Selections[scope.GroupID] = selection
+		if err := e.recordNativeNoop(ctx, &next, inv.Generation); err != nil {
+			return Selection{}, err
+		}
 		if err := e.persist(ctx, next, "selection_unchanged"); err != nil {
 			return Selection{}, err
 		}
@@ -637,18 +690,12 @@ func (e *NativeEngine) SetRuntimeSelection(ctx context.Context, scope SelectionS
 	}
 	next := e.cloneState()
 	next.Pending = &nativePendingSelection{Scope: scope, Node: node, BaseGeneration: inv.Generation, ExpectedRevision: expected}
-	if err = e.persist(ctx, next, "selection_pending"); err != nil {
+	wire := nativeSelectionRequest{ExpectedGeneration: inv.Generation, Handle: group.Handle, CandidateID: node}
+	if err = e.nativeBeginOperation(ctx, &next, "selection_set", "/v1/selection", wire); err != nil {
 		return Selection{}, err
 	}
-	var ack nativeMutationResponse
-	mutationErr := e.do(ctx, http.MethodPost, "/v1/selection", nativeSelectionRequest{ExpectedGeneration: inv.Generation, Handle: group.Handle, CandidateID: node}, &ack)
-	if definiteNativeRejection(mutationErr) {
-		next := e.cloneState()
-		next.Pending = nil
-		if err := e.persist(context.WithoutCancel(ctx), next, "selection_rejected"); err != nil {
-			return Selection{}, err
-		}
-		return Selection{}, mutationErr
+	if err = e.persist(ctx, next, "selection_pending"); err != nil {
+		return Selection{}, err
 	}
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.Timeout)
 	defer cancel()
@@ -656,15 +703,12 @@ func (e *NativeEngine) SetRuntimeSelection(ctx context.Context, scope SelectionS
 	if readErr != nil {
 		return Selection{}, nativeUnknown()
 	}
-	if err = e.reconcile(readCtx, read); err != nil {
+	if err = e.reconcile(readCtx, &read); err != nil {
 		return Selection{}, err
 	}
 	selection := e.state.Selections[scope.GroupID]
 	if selection.Revision > expected && selection.ObservedNodeID == node {
 		return selection, nil
-	}
-	if mutationErr != nil {
-		return Selection{}, mutationErr
 	}
 	return Selection{}, nativeUnknown()
 }
@@ -681,7 +725,7 @@ func (e *NativeEngine) Capabilities(ctx context.Context) (Capabilities, error) {
 	_, err := e.inventory(ctx)
 	c := Capabilities{Implementation: "dae-native-unix", Version: "v1", Items: make([]Capability, 0, len(AllCapabilities))}
 	for _, name := range AllCapabilities {
-		supported := err == nil && (name == CapabilityInventoryRead || name == CapabilityProviderStage || name == CapabilityProviderPublish || name == CapabilitySelectionRuntime || name == CapabilitySelectionPersist)
+		supported := err == nil && (name == CapabilityInventoryRead || name == CapabilityProviderStage || name == CapabilityProviderPublish || name == CapabilityGroupPublish || name == CapabilitySelectionRuntime || name == CapabilitySelectionPersist)
 		item := Capability{Name: name, Supported: supported, Implementation: c.Implementation}
 		if name == CapabilityProviderStage || name == CapabilityProviderPublish {
 			item.Restrictions = []string{"One provider per group; predeclared native group names; private native links required; encrypted agent journal required."}
@@ -761,7 +805,7 @@ func nativePublishWire(r ProviderStageRequest) nativePublishRequest {
 		request.Nodes = append(request.Nodes, nativeNode{ID: n.ID, Link: n.Connection})
 	}
 	for _, g := range r.Groups {
-		request.Groups = append(request.Groups, nativePublicationGroup{Name: g.Name, CandidateIDs: g.CandidateIDs, Selection: g.SelectedNodeID})
+		request.Groups = append(request.Groups, nativePublicationGroup{Name: g.Name, Revision: g.Revision, CandidateIDs: g.CandidateIDs, Selection: g.SelectedNodeID})
 	}
 	return request
 }

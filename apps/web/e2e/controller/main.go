@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"github.com/egressdeck/homelab-proxy-controller/internal/api"
 	"github.com/egressdeck/homelab-proxy-controller/internal/auth"
 	"github.com/egressdeck/homelab-proxy-controller/internal/domain"
+	"github.com/egressdeck/homelab-proxy-controller/internal/gateway"
 	"github.com/egressdeck/homelab-proxy-controller/internal/outbounds"
 	"github.com/egressdeck/homelab-proxy-controller/internal/providers"
 	"github.com/egressdeck/homelab-proxy-controller/internal/store"
@@ -39,6 +41,8 @@ func main() {
 	s.Services.ProviderStageEnabled = true
 	var publicationMutex sync.Mutex
 	published := map[string]int64{}
+	runtimeGroups := map[string]gateway.OutboundGroup{}
+	runtimeGeneration := int64(0)
 	s.Services.ProviderPublisher = func(_ context.Context, p domain.Provider, revision providers.Revision) error {
 		if strings.Contains(p.Name, "publication-failure") {
 			return errors.New("fixture gateway publication failed")
@@ -53,11 +57,49 @@ func main() {
 		defer publicationMutex.Unlock()
 		return published[p.ID], nil
 	}
-	s.Services.SelectionApplier = func(_ context.Context, g outbounds.Group, selection outbounds.Selection) (outbounds.Selection, error) {
-		if _, err := s.Services.Outbounds.MarkApplied(g.ID, selection.Scope, selection.DesiredNodeID, 1); err != nil {
-			return outbounds.Selection{}, err
+	groupSnapshot := func() gateway.Snapshot {
+		groups := make(map[string]gateway.OutboundGroup, len(runtimeGroups))
+		for id, group := range runtimeGroups {
+			group.NodeIDs = slices.Clone(group.NodeIDs)
+			groups[id] = group
 		}
-		return s.Services.Outbounds.Observe(g.ID, selection.Scope, selection.DesiredNodeID, 1)
+		return gateway.Snapshot{Generation: runtimeGeneration, Groups: groups}
+	}
+	s.Services.GroupPublisher = func(_ context.Context, group outbounds.Group) (gateway.Snapshot, error) {
+		publicationMutex.Lock()
+		defer publicationMutex.Unlock()
+		runtimeGeneration++
+		runtimeGroups[group.ID] = gateway.OutboundGroup{ID: group.ID, Name: group.Name, Revision: group.Revision, NodeIDs: slices.Clone(group.NodeIDs), SelectionMode: string(group.Mode)}
+		return groupSnapshot(), nil
+	}
+	s.Services.GroupReadback = func(_ context.Context, _ outbounds.Group) (gateway.Snapshot, error) {
+		publicationMutex.Lock()
+		defer publicationMutex.Unlock()
+		return groupSnapshot(), nil
+	}
+	s.Services.SelectionPreflight = func(_ context.Context, group outbounds.Group) error {
+		publicationMutex.Lock()
+		defer publicationMutex.Unlock()
+		remote, exists := runtimeGroups[group.ID]
+		desiredIDs, remoteIDs := slices.Clone(group.NodeIDs), slices.Clone(remote.NodeIDs)
+		slices.Sort(desiredIDs)
+		slices.Sort(remoteIDs)
+		if !exists || remote.Revision != group.Revision || !slices.Equal(desiredIDs, remoteIDs) {
+			return gateway.RejectBeforeMutation("group_configuration_not_applied", "apply the desired group configuration before selecting a node", domain.ErrConflict)
+		}
+		return nil
+	}
+	// Native dae uses one manual selection for both transports. Keep that
+	// production contract active even though the external mutation is a fixture.
+	s.Services.SelectionScopeMode = func(outbounds.Group) string { return "shared" }
+	s.Services.SelectionApplier = func(_ context.Context, _ outbounds.Group, selection outbounds.Selection) (outbounds.Selection, error) {
+		publicationMutex.Lock()
+		defer publicationMutex.Unlock()
+		runtimeGeneration++
+		selection.AppliedNodeID = selection.DesiredNodeID
+		selection.ObservedNodeID = selection.DesiredNodeID
+		selection.Generation = runtimeGeneration
+		return selection, nil
 	}
 	if _, err := s.Store.CreateGateway(context.Background(), domain.Gateway{ID: "fixture-gateway", Name: "Fixture gateway", Endpoint: "https://fixture-gateway.invalid", Adapter: "test"}); err != nil {
 		logger.Fatal(err)
