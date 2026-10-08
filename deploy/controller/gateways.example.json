@@ -1,0 +1,22 @@
+{
+  "gateways": [
+    {
+      "id": "replace-with-registered-gateway-id",
+      "endpoint": "https://gateway.example.invalid:9090",
+      "token": "replace-with-agent-token",
+      "client_cert": "/run/egressdeck/operator/agent-client.crt",
+      "client_key": "/run/egressdeck/operator/agent-client.key",
+      "ca_file": "/run/egressdeck/operator/agent-ca.crt",
+      "server_name": "gateway.example.invalid",
+      "runtime": {
+        "enable_provider_publish": false,
+        "enable_selection": false,
+        "expected_implementation": "dae-native-unix",
+        "shared_transport_selection": true,
+        "groups": {}
+      },
+      "enable_policy_apply": false,
+      "policy_format": "native_dae"
+    }
+  ]
+}

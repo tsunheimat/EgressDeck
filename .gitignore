@@ -1,0 +1,7 @@
+/.local/
+/controller
+/gateway-agent
+/coverage.out
+/artifacts/
+/.env
+/deploy/compose/agent-certs/

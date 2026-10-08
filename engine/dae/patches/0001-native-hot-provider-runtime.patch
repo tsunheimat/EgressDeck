@@ -1,0 +1,4926 @@
+diff --git a/cmd/hot_control.go b/cmd/hot_control.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..de7e1b889f8d02c0a2b0b9cb965b8b19e34c9a46
+--- /dev/null
++++ b/cmd/hot_control.go
+@@ -0,0 +1,401 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package cmd
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"time"
++
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/control"
++	"golang.org/x/sys/unix"
++)
++
++const hotControlMaxBody = 1 << 20
++const hotReloadDisabledMessage = "full reload and suspend are disabled with hot inventory; stop dae before deploying a new routing policy"
++
++func validateHotControlFlags(stateDir, socket string) error {
++	if (stateDir == "") != (socket == "") {
++		return errors.New("--hot-state-dir and --hot-control-socket must be supplied together")
++	}
++	if stateDir != "" && (!filepath.IsAbs(stateDir) || filepath.Clean(stateDir) != stateDir || !filepath.IsAbs(socket) || filepath.Clean(socket) != socket) {
++		return errors.New("hot state and socket paths must be absolute clean paths")
++	}
++	return nil
++}
++
++// hotControlAPI is deliberately small: it is the only interface exposed by
++// the management socket, which keeps the HTTP layer independent of the
++// concrete control-plane implementation and makes malformed requests safe to
++// exercise in tests.
++type hotControlAPI interface {
++	EnableHotInventory(string) error
++	PublishHotProvider(context.Context, control.HotProviderRequest) (outbound.HotInventoryPublication, error)
++	SetHotSelection(context.Context, uint64, uint8, string) (outbound.HotInventoryPublication, error)
++	HotInventorySnapshot() (outbound.HotInventorySnapshot, error)
++}
++
++type hotControlServer struct {
++	server    *http.Server
++	listener  net.Listener
++	admission *hotControlAdmission
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func (s *hotControlServer) Close() error {
++	if s == nil {
++		return nil
++	}
++	s.closeOnce.Do(func() {
++		if s.admission != nil {
++			s.admission.mu.Lock()
++			s.admission.closed = true
++			s.admission.mu.Unlock()
++		}
++		if s.server != nil {
++			s.closeErr = s.server.Close()
++		}
++		// Close the listener explicitly as well: Close can race with the
++		// serving goroutine before net/http has registered its listener.
++		if s.listener != nil {
++			if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
++				s.closeErr = errors.Join(s.closeErr, err)
++			}
++		}
++		if s.admission != nil {
++			s.admission.active.Wait()
++		}
++	})
++	return s.closeErr
++}
++
++// startHotControl creates the private local management socket and starts its
++// serving goroutine. stateDir is initialized by the control plane before this
++// function is called; retaining it here would permit accidental state writes
++// outside the control package.
++func startHotControl(api hotControlAPI, socket string) (*hotControlServer, error) {
++	if api == nil {
++		return nil, errors.New("hot control: nil control plane")
++	}
++	if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket {
++		return nil, errors.New("hot control: socket must be an absolute clean path")
++	}
++	parent := filepath.Dir(socket)
++	if err := ensureHotPrivateDir(parent); err != nil {
++		return nil, err
++	}
++	if info, err := os.Lstat(socket); err == nil {
++		if info.Mode()&os.ModeSocket == 0 {
++			return nil, fmt.Errorf("hot control socket path is not a socket: %s", socket)
++		}
++		if err := ensureHotOwned(info, socket); err != nil {
++			return nil, err
++		}
++		conn, dialErr := net.DialTimeout("unix", socket, time.Second)
++		if dialErr == nil {
++			_ = conn.Close()
++			return nil, errors.New("hot control socket is already serving")
++		}
++		if !errors.Is(dialErr, syscall.ECONNREFUSED) && !errors.Is(dialErr, os.ErrNotExist) {
++			return nil, errors.New("hot control socket could not be verified as stale")
++		}
++		if err := os.Remove(socket); err != nil {
++			return nil, fmt.Errorf("remove stale hot control socket: %w", err)
++		}
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return nil, fmt.Errorf("inspect hot control socket: %w", err)
++	}
++
++	listener, err := net.Listen("unix", socket)
++	if err != nil {
++		return nil, fmt.Errorf("listen hot control socket: %w", err)
++	}
++	cleanup := func(e error) (*hotControlServer, error) {
++		_ = listener.Close()
++		_ = os.Remove(socket)
++		return nil, e
++	}
++	if err := os.Chmod(socket, 0o600); err != nil {
++		return cleanup(fmt.Errorf("chmod hot control socket: %w", err))
++	}
++	if info, err := os.Stat(socket); err != nil {
++		return cleanup(fmt.Errorf("stat hot control socket: %w", err))
++	} else if err := ensureHotOwned(info, socket); err != nil {
++		return cleanup(err)
++	}
++
++	h := &hotControlAdmission{handler: newHotControlHandler(api)}
++	server := &http.Server{
++		Handler:           h,
++		ReadHeaderTimeout: 5 * time.Second,
++		ReadTimeout:       30 * time.Second,
++		WriteTimeout:      30 * time.Second,
++		IdleTimeout:       30 * time.Second,
++		MaxHeaderBytes:    8 << 10,
++		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
++			uid := uint32(^uint32(0))
++			if uc, ok := conn.(*net.UnixConn); ok {
++				uid = hotPeerUID(uc)
++			}
++			return context.WithValue(ctx, hotPeerUIDKey{}, uid)
++		},
++	}
++	s := &hotControlServer{server: server, listener: listener, admission: h}
++	go func() { _ = server.Serve(listener) }()
++	return s, nil
++}
++
++type hotPeerUIDKey struct{}
++
++// Closing HTTP connections cancels request contexts but does not itself wait
++// for handler completion. Keep control-plane teardown behind the last handler
++// so an in-progress durable commit cannot race with datapath destruction.
++type hotControlAdmission struct {
++	mu      sync.Mutex
++	closed  bool
++	active  sync.WaitGroup
++	handler http.Handler
++}
++
++func (a *hotControlAdmission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	a.mu.Lock()
++	if a.closed {
++		a.mu.Unlock()
++		writeHotError(w, http.StatusServiceUnavailable, "inventory_closed", "inventory_closed")
++		return
++	}
++	a.active.Add(1)
++	a.mu.Unlock()
++	defer a.active.Done()
++	a.handler.ServeHTTP(w, r)
++}
++
++func hotPeerUID(conn *net.UnixConn) uint32 {
++	var uid uint32 = ^uint32(0)
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return uid
++	}
++	_ = raw.Control(func(fd uintptr) {
++		cred, err := unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
++		if err == nil && cred != nil {
++			uid = cred.Uid
++		}
++	})
++	return uid
++}
++
++func ensureHotPrivateDir(path string) error {
++	for component := path; ; component = filepath.Dir(component) {
++		info, err := os.Lstat(component)
++		if err == nil {
++			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
++				return errors.New("hot control directory path must not contain symlinks")
++			}
++		} else if !errors.Is(err, os.ErrNotExist) {
++			return fmt.Errorf("inspect hot control directory path: %w", err)
++		}
++		if component == filepath.Dir(component) {
++			break
++		}
++	}
++	if err := os.MkdirAll(path, 0o700); err != nil {
++		return fmt.Errorf("create hot control directory: %w", err)
++	}
++	info, err := os.Lstat(path)
++	if err != nil {
++		return fmt.Errorf("stat hot control directory: %w", err)
++	}
++	if !info.IsDir() || info.Mode().Perm() != 0o700 {
++		return errors.New("hot control socket directory must be a private directory with mode 0700")
++	}
++	return ensureHotOwned(info, path)
++}
++
++func ensureHotOwned(info os.FileInfo, path string) error {
++	if info == nil {
++		return fmt.Errorf("hot control path has no metadata: %s", path)
++	}
++	st, ok := info.Sys().(*syscall.Stat_t)
++	if !ok {
++		return fmt.Errorf("hot control path ownership unavailable: %s", path)
++	}
++	if st.Uid != uint32(os.Geteuid()) {
++		return fmt.Errorf("hot control path is not owned by the daemon uid: %s", path)
++	}
++	return nil
++}
++
++func newHotControlHandler(api hotControlAPI) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if uid, ok := r.Context().Value(hotPeerUIDKey{}).(uint32); !ok || uid != uint32(os.Geteuid()) {
++			writeHotError(w, http.StatusForbidden, "forbidden", "local peer is not the daemon user")
++			return
++		}
++		if r.URL.Path == "/v1/inventory" && r.Method == http.MethodGet {
++			snapshot, err := api.HotInventorySnapshot()
++			if err != nil {
++				writeHotMappedError(w, err)
++				return
++			}
++			writeHotJSON(w, http.StatusOK, snapshotResponse(snapshot))
++			return
++		}
++		if r.URL.Path == "/v1/providers/publish" && r.Method == http.MethodPost {
++			var req control.HotProviderRequest
++			if err := decodeHotJSON(w, r, &req); err != nil {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", err.Error())
++				return
++			}
++			publication, err := api.PublishHotProvider(r.Context(), req)
++			if err != nil {
++				writeHotMappedError(w, err)
++				return
++			}
++			writeHotJSON(w, http.StatusOK, publicationResponse(publication))
++			return
++		}
++		if r.URL.Path == "/v1/selection" && r.Method == http.MethodPost {
++			var req hotSelectionRequest
++			if err := decodeHotJSON(w, r, &req); err != nil {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", err.Error())
++				return
++			}
++			if req.ExpectedGeneration == 0 || req.CandidateID == "" {
++				writeHotError(w, http.StatusBadRequest, "invalid_request", "positive expected generation and candidate ID are required")
++				return
++			}
++			publication, err := api.SetHotSelection(r.Context(), req.ExpectedGeneration, req.Handle, req.CandidateID)
++			if err != nil {
++				writeHotMappedError(w, err)
++				return
++			}
++			writeHotJSON(w, http.StatusOK, publicationResponse(publication))
++			return
++		}
++		switch r.URL.Path {
++		case "/v1/inventory":
++			w.Header().Set("Allow", http.MethodGet)
++		case "/v1/providers/publish", "/v1/selection":
++			w.Header().Set("Allow", http.MethodPost)
++		default:
++			writeHotError(w, http.StatusNotFound, "not_found", "unknown endpoint")
++			return
++		}
++		writeHotError(w, http.StatusMethodNotAllowed, "method_not_allowed", "unsupported method")
++	})
++}
++
++type hotSelectionRequest struct {
++	ExpectedGeneration uint64 `json:"expected_generation"`
++	Handle             uint8  `json:"handle"`
++	CandidateID        string `json:"candidate_id"`
++}
++
++type hotSnapshotGroup struct {
++	Handle    uint8  `json:"handle"`
++	Name      string `json:"name"`
++	Identity  string `json:"identity"`
++	Selection string `json:"selection"`
++}
++type hotSnapshotResponse struct {
++	Generation uint64             `json:"generation"`
++	Groups     []hotSnapshotGroup `json:"groups"`
++}
++type hotPublicationResponse struct {
++	Snapshot       hotSnapshotResponse `json:"snapshot"`
++	Adopted        []int               `json:"adopted"`
++	CleanupPending bool                `json:"cleanup_pending"`
++}
++
++func snapshotResponse(s outbound.HotInventorySnapshot) hotSnapshotResponse {
++	groups := make([]hotSnapshotGroup, 0, len(s.Groups))
++	for _, g := range s.Groups {
++		groups = append(groups, hotSnapshotGroup{Handle: g.Handle, Name: g.Name, Identity: g.Identity, Selection: g.Selection})
++	}
++	return hotSnapshotResponse{Generation: s.Generation, Groups: groups}
++}
++func publicationResponse(p outbound.HotInventoryPublication) hotPublicationResponse {
++	adopted := make([]int, len(p.Adopted))
++	for i, handle := range p.Adopted {
++		adopted[i] = int(handle)
++	}
++	return hotPublicationResponse{Snapshot: snapshotResponse(p.Snapshot), Adopted: adopted, CleanupPending: p.CleanupError != nil}
++}
++
++func decodeHotJSON(w http.ResponseWriter, r *http.Request, dst any) error {
++	r.Body = http.MaxBytesReader(w, r.Body, hotControlMaxBody)
++	defer r.Body.Close()
++	body, err := io.ReadAll(r.Body)
++	if err != nil {
++		return errors.New("request body exceeds limit or cannot be read")
++	}
++	if len(bytes.TrimSpace(body)) == 0 || bytes.TrimSpace(body)[0] != '{' {
++		return errors.New("request body must contain one JSON object")
++	}
++	dec := json.NewDecoder(bytes.NewReader(body))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(dst); err != nil {
++		return errors.New("request body contains invalid JSON or unknown fields")
++	}
++	var extra any
++	if err := dec.Decode(&extra); err == nil {
++		return errors.New("request body must contain one JSON object")
++	} else if !errors.Is(err, io.EOF) {
++		return errors.New("request body must contain one JSON object")
++	}
++	return nil
++}
++
++func writeHotJSON(w http.ResponseWriter, status int, value any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(value)
++}
++
++type hotErrorResponse struct {
++	Error hotErrorBody `json:"error"`
++}
++type hotErrorBody struct {
++	Code    string `json:"code"`
++	Message string `json:"message"`
++}
++
++func writeHotError(w http.ResponseWriter, status int, code, message string) {
++	writeHotJSON(w, status, hotErrorResponse{Error: hotErrorBody{Code: code, Message: message}})
++}
++
++func writeHotMappedError(w http.ResponseWriter, err error) {
++	code, status := "internal_error", http.StatusInternalServerError
++	switch {
++	case errors.Is(err, control.ErrHotInventoryStorageOutcomeUnknown):
++		writeHotError(w, http.StatusServiceUnavailable, "outcome_unknown", "storage commit uncertain; native inventory fenced")
++	case errors.Is(err, control.ErrHotInventoryDatapathOutcomeUnknown):
++		writeHotError(w, http.StatusServiceUnavailable, "outcome_unknown", "kernel admission readback failed; native inventory fenced")
++		return
++	case errors.Is(err, outbound.ErrHotInventoryConflict):
++		code, status = "generation_conflict", http.StatusConflict
++	case errors.Is(err, outbound.ErrHotInventoryBusy):
++		code, status = "inventory_busy", http.StatusTooManyRequests
++	case errors.Is(err, outbound.ErrHotInventoryClosed):
++		code, status = "inventory_closed", http.StatusServiceUnavailable
++	case errors.Is(err, outbound.ErrHotInventoryInvalid), errors.Is(err, outbound.ErrHotInventoryUnmanaged):
++		code, status = "invalid_request", http.StatusBadRequest
++	}
++	writeHotError(w, status, code, code)
++}
+diff --git a/cmd/hot_control_test.go b/cmd/hot_control_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..513964cfdb6e831f6448ff717fe302834bc7fff6
+--- /dev/null
++++ b/cmd/hot_control_test.go
+@@ -0,0 +1,332 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package cmd
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/control"
++)
++
++type hotControlFixture struct {
++	err          error
++	publications atomic.Int32
++	selections   atomic.Int32
++	reads        atomic.Int32
++	provider     control.HotProviderRequest
++	expected     uint64
++	handle       uint8
++	candidate    string
++}
++
++func TestHotControlCloseWaitsForAdmittedHandlers(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	a := &hotControlAdmission{handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
++		close(entered)
++		<-release
++	})}
++	go a.ServeHTTP(httptest.NewRecorder(), hotFixtureRequest(http.MethodGet, "/v1/inventory", ""))
++	<-entered
++	s := &hotControlServer{admission: a}
++	closed := make(chan struct{})
++	go func() { _ = s.Close(); close(closed) }()
++	deadline := time.After(time.Second)
++	for {
++		a.mu.Lock()
++		closing := a.closed
++		a.mu.Unlock()
++		if closing {
++			break
++		}
++		select {
++		case <-deadline:
++			t.Fatal("close did not fence admission")
++		default:
++			time.Sleep(time.Millisecond)
++		}
++	}
++	w := httptest.NewRecorder()
++	a.ServeHTTP(w, hotFixtureRequest(http.MethodGet, "/v1/inventory", ""))
++	if w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("admitted work after close: %d", w.Code)
++	}
++	select {
++	case <-closed:
++		t.Fatal("closed while handler still using control plane")
++	default:
++	}
++	close(release)
++	select {
++	case <-closed:
++	case <-time.After(time.Second):
++		t.Fatal("did not close after handler finished")
++	}
++}
++
++func (*hotControlFixture) EnableHotInventory(string) error { return nil }
++func (f *hotControlFixture) PublishHotProvider(_ context.Context, req control.HotProviderRequest) (outbound.HotInventoryPublication, error) {
++	f.publications.Add(1)
++	f.provider = req
++	return outbound.HotInventoryPublication{Snapshot: hotFixtureSnapshot(), Adopted: []uint8{2}, CleanupError: errors.New("secret cleanup details")}, f.err
++}
++func (f *hotControlFixture) SetHotSelection(_ context.Context, expected uint64, handle uint8, candidate string) (outbound.HotInventoryPublication, error) {
++	f.selections.Add(1)
++	f.expected, f.handle, f.candidate = expected, handle, candidate
++	return outbound.HotInventoryPublication{Snapshot: hotFixtureSnapshot()}, f.err
++}
++func (f *hotControlFixture) HotInventorySnapshot() (outbound.HotInventorySnapshot, error) {
++	f.reads.Add(1)
++	return hotFixtureSnapshot(), f.err
++}
++func hotFixtureSnapshot() outbound.HotInventorySnapshot {
++	return outbound.HotInventorySnapshot{Generation: 12, Groups: []outbound.HotInventoryGroup{{Handle: 2, Name: "main", Identity: "sha256:opaque", Selection: "candidate-a"}}}
++}
++func hotFixtureRequest(method, path, body string) *http.Request {
++	r := httptest.NewRequest(method, path, strings.NewReader(body))
++	return r.WithContext(context.WithValue(r.Context(), hotPeerUIDKey{}, uint32(os.Geteuid())))
++}
++
++func TestHotControlReadPublishAndSelect(t *testing.T) {
++	f := &hotControlFixture{}
++	h := newHotControlHandler(f)
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodGet, "/v1/inventory", ""))
++	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"generation":12`) || strings.Contains(w.Body.String(), "Generation") {
++		t.Fatalf("readback: status=%d body=%s", w.Code, w.Body.String())
++	}
++
++	w = httptest.NewRecorder()
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/providers/publish", `{"expected_generation":11,"provider_id":"p","revision_id":"r","nodes":[{"id":"candidate-a","link":"socks5://user:secret@127.0.0.1:1080"}],"groups":[{"name":"main","candidate_ids":["candidate-a"],"selection":"candidate-a"}]}`))
++	if w.Code != http.StatusOK || f.publications.Load() != 1 || f.provider.ProviderID != "p" || f.provider.ExpectedGeneration != 11 || strings.Contains(w.Body.String(), "secret") || !strings.Contains(w.Body.String(), `"cleanup_pending":true`) || !strings.Contains(w.Body.String(), `"adopted":[2]`) {
++		t.Fatalf("publication: status=%d body=%s calls=%d", w.Code, w.Body.String(), f.publications.Load())
++	}
++	w = httptest.NewRecorder()
++	h.ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"expected_generation":12,"handle":2,"candidate_id":"candidate-a"}`))
++	if w.Code != http.StatusOK || f.selections.Load() != 1 || f.expected != 12 || f.handle != 2 || f.candidate != "candidate-a" {
++		t.Fatalf("selection: status=%d body=%s calls=%d", w.Code, w.Body.String(), f.selections.Load())
++	}
++}
++
++func TestHotControlRejectsMalformedRequestsBeforeMutation(t *testing.T) {
++	for _, body := range []string{
++		`{"expected_generation":1,"handle":2,"candidate_id":"n","socks5://user:secret@host":1}`,
++		`{"expected_generation":1,"handle":2,"candidate_id":"n"} {}`,
++		`{"expected_generation":1,"handle":2,"candidate_id":"n"} {`,
++		`{"expected_generation":1,"handle":256,"candidate_id":"n"}`,
++		`{"expected_generation":1,"handle":2,"candidate_id":""}`,
++		`{"handle":2,"candidate_id":"n"}`,
++		`null`, `[]`, ``, `{`,
++		`{"candidate_id":"` + strings.Repeat("x", hotControlMaxBody) + `"}`,
++	} {
++		f := &hotControlFixture{}
++		w := httptest.NewRecorder()
++		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", body))
++		if w.Code != http.StatusBadRequest || f.selections.Load() != 0 || strings.Contains(w.Body.String(), "secret") {
++			t.Errorf("malformed request length %d: status=%d calls=%d body=%s", len(body), w.Code, f.selections.Load(), w.Body.String())
++		}
++	}
++	for _, body := range []string{`{"secret":"credential"}`, `null`, `{}` + strings.Repeat(" ", hotControlMaxBody)} {
++		f := &hotControlFixture{}
++		w := httptest.NewRecorder()
++		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/providers/publish", body))
++		if w.Code != http.StatusBadRequest || f.publications.Load() != 0 || strings.Contains(w.Body.String(), "credential") {
++			t.Fatalf("invalid provider request was accepted: %d %s", w.Code, w.Body.String())
++		}
++	}
++}
++
++func TestHotControlMethodPathsAndPeerAuthentication(t *testing.T) {
++	for _, tc := range []struct {
++		method, path string
++		status       int
++	}{
++		{http.MethodPost, "/v1/inventory", http.StatusMethodNotAllowed},
++		{http.MethodHead, "/v1/inventory", http.StatusMethodNotAllowed},
++		{http.MethodGet, "/v1/providers/publish", http.StatusMethodNotAllowed},
++		{http.MethodGet, "/v1/selection", http.StatusMethodNotAllowed},
++		{http.MethodGet, "/v1/inventory/", http.StatusNotFound},
++		{http.MethodGet, "/api/v1/inventory", http.StatusNotFound},
++	} {
++		f := &hotControlFixture{}
++		w := httptest.NewRecorder()
++		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(tc.method, tc.path, "{}"))
++		if w.Code != tc.status || f.reads.Load()+f.publications.Load()+f.selections.Load() != 0 {
++			t.Errorf("%s %s: status=%d calls occurred=%v", tc.method, tc.path, w.Code, f.reads.Load()+f.publications.Load()+f.selections.Load() != 0)
++		}
++	}
++	for _, authenticated := range []bool{false, true} {
++		f := &hotControlFixture{}
++		r := httptest.NewRequest(http.MethodGet, "/v1/inventory", nil)
++		if authenticated {
++			r = r.WithContext(context.WithValue(r.Context(), hotPeerUIDKey{}, uint32(os.Geteuid()+1)))
++		}
++		w := httptest.NewRecorder()
++		newHotControlHandler(f).ServeHTTP(w, r)
++		if w.Code != http.StatusForbidden || f.reads.Load() != 0 {
++			t.Fatalf("unauthorized read: %d", w.Code)
++		}
++	}
++}
++
++func TestHotControlSanitizesTypedErrors(t *testing.T) {
++	for _, tc := range []struct {
++		err    error
++		status int
++		code   string
++	}{
++		{control.ErrHotInventoryStorageOutcomeUnknown, http.StatusServiceUnavailable, "outcome_unknown"},
++		{control.ErrHotInventoryDatapathOutcomeUnknown, http.StatusServiceUnavailable, "outcome_unknown"},
++		{outbound.ErrHotInventoryConflict, http.StatusConflict, "generation_conflict"},
++		{outbound.ErrHotInventoryBusy, http.StatusTooManyRequests, "inventory_busy"},
++		{outbound.ErrHotInventoryClosed, http.StatusServiceUnavailable, "inventory_closed"},
++		{outbound.ErrHotInventoryInvalid, http.StatusBadRequest, "invalid_request"},
++		{outbound.ErrHotInventoryUnmanaged, http.StatusBadRequest, "invalid_request"},
++		{errors.New("native parse error"), http.StatusInternalServerError, "internal_error"},
++	} {
++		f := &hotControlFixture{err: fmt.Errorf("socks5://secret:credential@host: %w", tc.err)}
++		w := httptest.NewRecorder()
++		newHotControlHandler(f).ServeHTTP(w, hotFixtureRequest(http.MethodPost, "/v1/selection", `{"expected_generation":2,"handle":2,"candidate_id":"n"}`))
++		if w.Code != tc.status || !strings.Contains(w.Body.String(), tc.code) || strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "credential") {
++			t.Errorf("sanitized error: %d %s", w.Code, w.Body.String())
++		}
++	}
++}
++
++func shortHotControlDir(t *testing.T) string {
++	t.Helper()
++	dir, err := os.MkdirTemp("/tmp", "dae-hot-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = os.RemoveAll(dir) })
++	return dir
++}
++
++func TestHotControlUnixSocketPermissionsAndLifecycle(t *testing.T) {
++	dir := shortHotControlDir(t)
++	socket := filepath.Join(dir, "control.sock")
++	f := &hotControlFixture{}
++	s, err := startHotControl(f, socket)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = s.Close() })
++	for _, tc := range []struct {
++		path string
++		mode os.FileMode
++	}{{dir, 0o700}, {socket, 0o600}} {
++		info, err := os.Stat(tc.path)
++		if err != nil || info.Mode().Perm() != tc.mode {
++			t.Fatalf("permissions %s: info=%v err=%v", tc.path, info, err)
++		}
++	}
++	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
++	}}
++	t.Cleanup(transport.CloseIdleConnections)
++	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
++	resp, err := client.Get("http://local/v1/inventory")
++	if err != nil {
++		t.Fatal(err)
++	}
++	body, err := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if err != nil || resp.StatusCode != http.StatusOK || !json.Valid(body) || f.reads.Load() != 1 {
++		t.Fatalf("socket read: status=%d body=%s err=%v", resp.StatusCode, body, err)
++	}
++	if second, err := startHotControl(f, socket); err == nil {
++		_ = second.Close()
++		t.Fatal("replaced active socket")
++	}
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Lstat(socket); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("socket still exists: %v", err)
++	}
++}
++
++func TestHotControlRejectsUnsafeSocketPaths(t *testing.T) {
++	t.Run("public-directory", func(t *testing.T) {
++		dir := shortHotControlDir(t)
++		if err := os.Chmod(dir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if s, err := startHotControl(&hotControlFixture{}, filepath.Join(dir, "control.sock")); err == nil {
++			_ = s.Close()
++			t.Fatal("accepted public socket directory")
++		}
++		info, _ := os.Stat(dir)
++		if info.Mode().Perm() != 0o755 {
++			t.Fatal("changed existing directory permissions")
++		}
++	})
++	t.Run("symlink-directory", func(t *testing.T) {
++		dir := shortHotControlDir(t)
++		link := filepath.Join(dir, "link")
++		if err := os.Symlink(dir, link); err != nil {
++			t.Fatal(err)
++		}
++		if s, err := startHotControl(&hotControlFixture{}, filepath.Join(link, "control.sock")); err == nil {
++			_ = s.Close()
++			t.Fatal("accepted symlink socket directory")
++		}
++	})
++	t.Run("existing-file", func(t *testing.T) {
++		dir := shortHotControlDir(t)
++		file := filepath.Join(dir, "control.sock")
++		if err := os.WriteFile(file, []byte("preserve me"), 0o600); err != nil {
++			t.Fatal(err)
++		}
++		if s, err := startHotControl(&hotControlFixture{}, file); err == nil {
++			_ = s.Close()
++			t.Fatal("accepted existing file")
++		}
++		if content, _ := os.ReadFile(file); string(content) != "preserve me" {
++			t.Fatal("changed existing file")
++		}
++	})
++}
++
++func TestHotControlFlagsAndReloadFence(t *testing.T) {
++	for _, tc := range []struct {
++		state, socket string
++		valid         bool
++	}{
++		{"", "", true}, {"/tmp/state", "/tmp/run/control.sock", true},
++		{"/tmp/state", "", false}, {"", "/tmp/control.sock", false},
++		{"state", "/tmp/control.sock", false}, {"/tmp/state", "control.sock", false},
++	} {
++		if err := validateHotControlFlags(tc.state, tc.socket); (err == nil) != tc.valid {
++			t.Errorf("flags %q %q: %v", tc.state, tc.socket, err)
++		}
++	}
++	old := hotStateDir
++	hotStateDir = "/tmp/hot-state"
++	t.Cleanup(func() { hotStateDir = old })
++	// A nil configuration intentionally proves the fence runs before parsing,
++	// network access, or constructing any replacement control plane.
++	if _, err := newControlPlaneWithMode(context.Background(), nil, nil, nil, nil, nil, false, false, true); err == nil || err.Error() != hotReloadDisabledMessage {
++		t.Fatalf("reload fence: %v", err)
++	}
++}
+diff --git a/cmd/run.go b/cmd/run.go
+index 6213ee6cf571212146c260c4f006abd0e184531a..66eb43f9d95fa90f7c6b95bedc23eb1c08977e3f 100644
+--- a/cmd/run.go
++++ b/cmd/run.go
+@@ -212,6 +212,8 @@ func init() {
+ 	runCmd.PersistentFlags().BoolVar(&disableTimestamp, "disable-timestamp", false, "Disable timestamp.")
+ 	runCmd.PersistentFlags().BoolVar(&disablePidFile, "disable-pidfile", false, "Not generate /var/run/dae.pid.")
+ 	runCmd.PersistentFlags().BoolVar(&disableAuthSudo, "disable-sudo", false, "Disable sudo prompt ,may cause startup failure due to insufficient permissions")
++	runCmd.PersistentFlags().StringVar(&hotStateDir, "hot-state-dir", "", "Private durable directory for hot provider state; requires --hot-control-socket.")
++	runCmd.PersistentFlags().StringVar(&hotControlSocket, "hot-control-socket", "", "Unix socket for local hot provider control; requires --hot-state-dir.")
+ 	rand.Shuffle(len(CheckNetworkLinks), func(i, j int) {
+ 		CheckNetworkLinks[i], CheckNetworkLinks[j] = CheckNetworkLinks[j], CheckNetworkLinks[i]
+ 	})
+@@ -225,6 +227,8 @@ var (
+ 	disableTimestamp  bool
+ 	disablePidFile    bool
+ 	disableAuthSudo   bool
++	hotStateDir       string
++	hotControlSocket  string
+ 
+ 	runCmd = &cobra.Command{
+ 		Use:   "run",
+@@ -352,6 +356,9 @@ func (t *serveExitTracker) fatalFor(plane *control.ControlPlane) error {
+ }
+ 
+ func (r *Runner) Run() (err error) {
++	if err := validateHotControlFlags(hotStateDir, hotControlSocket); err != nil {
++		return err
++	}
+ 	log := r.log
+ 	conf := r.conf
+ 	externGeoDataDirs := r.externGeoDataDirs
+@@ -380,6 +387,14 @@ func (r *Runner) Run() (err error) {
+ 		_ = c.Close()
+ 		return fmt.Errorf("attach process session manager: %w", err)
+ 	}
++	var hotServer *hotControlServer
++	if hotStateDir != "" {
++		if err := c.EnableHotInventory(hotStateDir); err != nil {
++			cancel()
++			_ = c.Close()
++			return fmt.Errorf("enable hot inventory: %w", err)
++		}
++	}
+ 	runtimeSupervisor := newRuntimeSupervisor(&runtimeGeneration{
+ 		controlPlane: c,
+ 		cancel:       currCancel,
+@@ -404,6 +419,16 @@ func (r *Runner) Run() (err error) {
+ 		_ = c.Close()
+ 		return fmt.Errorf("record initial runtime generation: %w", supervisorErr)
+ 	}
++	if hotStateDir != "" {
++		hotServer, err = startHotControl(c, hotControlSocket)
++		if err != nil {
++			_ = listener.Close()
++			cancel()
++			_ = c.Close()
++			return err
++		}
++		defer func() { err = errors.Join(err, hotServer.Close()) }()
++	}
+ 
+ 	// w carries the mutable run state that Run's signal loop and the reload
+ 	// worker goroutine exchange; see reloadWorker for the sharing contract.
+@@ -494,12 +519,22 @@ loop:
+ 				fastExit = true
+ 				break loop
+ 			case syscall.SIGUSR2:
++				if hotStateDir != "" {
++					w.log.Warn(hotReloadDisabledMessage)
++					_ = setRunSignalProgress(consts.ReloadError, hotReloadDisabledMessage)
++					continue
++				}
+ 				reloadManager.queueReloadRequest(w.log, reloadRequest{
+ 					isSuspend:       true,
+ 					requestedAt:     time.Now(),
+ 					requestedAtMono: monotonicNowNano(),
+ 				})
+ 			case syscall.SIGUSR1:
++				if hotStateDir != "" {
++					w.log.Warn(hotReloadDisabledMessage)
++					_ = setRunSignalProgress(consts.ReloadError, hotReloadDisabledMessage)
++					continue
++				}
+ 				reloadManager.queueReloadRequest(w.log, reloadRequest{
+ 					isSuspend:       false,
+ 					requestedAt:     time.Now(),
+@@ -886,8 +921,11 @@ loop:
+ 		cancel:       w.currCancel,
+ 		conf:         w.conf,
+ 	}, fastExit)
++	// Stop the mutation endpoint before control-plane teardown. Close also
++	// cancels active request contexts, preventing new durable publications.
++	hotControlErr := hotServer.Close()
+ 	shutdownErr := shutdownAfterSignalWithHandoff(w.log, w.listener, w.c, control.GetDaeNetns(), fastExit, shutdownHandoff)
+-	return errors.Join(fatalRunErr, shutdownErr)
++	return errors.Join(fatalRunErr, hotControlErr, shutdownErr)
+ }
+ 
+ func init() {
+diff --git a/cmd/run_controlplane.go b/cmd/run_controlplane.go
+index 8707cf56fc5eea72e497e9bc1a4f8bee732087d5..ff08e1db0a8fad6b46e8df06a274047f71c7061e 100644
+--- a/cmd/run_controlplane.go
++++ b/cmd/run_controlplane.go
+@@ -162,6 +162,9 @@ func configureGcMemoryLimit(log *logrus.Logger) {
+ }
+ 
+ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
++	if hotStateDir != "" && isReloadBuild {
++		return nil, errors.New(hotReloadDisabledMessage)
++	}
+ 	// Deep copy to prevent modification.
+ 	conf = deepcopy.Copy(conf).(*config.Config)
+ 	if conf.Global.SoMarkFromDae == 0 {
+diff --git a/component/outbound/dialer/hot_option.go b/component/outbound/dialer/hot_option.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..92ce1f3691fb57bf9914a543c015275e6e44fd89
+--- /dev/null
++++ b/component/outbound/dialer/hot_option.go
+@@ -0,0 +1,48 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package dialer
++
++// CloneForHot makes a generation-private option for a dialer built by the hot
++// provider path. GlobalOption contains lazy check state and a transport-cache
++// namespace; copying it as a Go struct would alias both. This method copies
++// configuration only, resets lazy state, and always allocates a fresh
++// namespace. Runtime dependencies are retained as references because they are
++// generation services, while every mutable option cache remains private.
++func (o *GlobalOption) CloneForHot() *GlobalOption {
++	if o == nil {
++		return nil
++	}
++	c := &GlobalOption{
++		ExtraOption:             o.ExtraOption,
++		Log:                     o.Log,
++		DaeDNS:                  o.DaeDNS,
++		DirectDialer:            o.DirectDialer,
++		FullconeDirectDialer:    o.FullconeDirectDialer,
++		SystemDNSResolver:       o.SystemDNSResolver,
++		CheckInterval:           o.CheckInterval,
++		CheckTolerance:          o.CheckTolerance,
++		CheckDnsTcp:             o.CheckDnsTcp,
++		SoMarkFromDae:           o.SoMarkFromDae,
++		Mptcp:                   o.Mptcp,
++		TransportCacheNamespace: newTransportCacheNamespace(),
++	}
++	c.TcpCheckOptionRaw = TcpCheckOptionRaw{
++		Log:               o.TcpCheckOptionRaw.Log,
++		Raw:               append([]string(nil), o.TcpCheckOptionRaw.Raw...),
++		ResolverNetwork:   o.TcpCheckOptionRaw.ResolverNetwork,
++		Method:            o.TcpCheckOptionRaw.Method,
++		DirectDialer:      o.TcpCheckOptionRaw.DirectDialer,
++		SystemDNSResolver: o.TcpCheckOptionRaw.SystemDNSResolver,
++	}
++	c.CheckDnsOptionRaw = CheckDnsOptionRaw{
++		Raw:               append([]string(nil), o.CheckDnsOptionRaw.Raw...),
++		ResolverNetwork:   o.CheckDnsOptionRaw.ResolverNetwork,
++		Somark:            o.CheckDnsOptionRaw.Somark,
++		DirectDialer:      o.CheckDnsOptionRaw.DirectDialer,
++		SystemDNSResolver: o.CheckDnsOptionRaw.SystemDNSResolver,
++	}
++	return c
++}
+diff --git a/component/outbound/hot_inventory.go b/component/outbound/hot_inventory.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef4e4bb1e937a1ec3f93fbd6efb587570233da01
+--- /dev/null
++++ b/component/outbound/hot_inventory.go
+@@ -0,0 +1,629 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"reflect"
++	"sort"
++	"sync"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++)
++
++var (
++	ErrHotInventoryBusy      = errors.New("hot inventory retirement limit reached")
++	ErrHotInventoryConflict  = errors.New("hot inventory generation conflict")
++	ErrHotInventoryClosed    = errors.New("hot inventory closed")
++	ErrHotInventoryInvalid   = errors.New("invalid prepared hot inventory")
++	ErrHotInventoryUnmanaged = errors.New("outbound uses the borrowed baseline inventory")
++)
++
++// HotInventoryEntry describes an already prepared native group. Identity is an
++// opaque revision identity covering membership and connection definitions;
++// it must not expose credentials. Selection has its own generation change.
++// Names and handles are fixed at construction. Adding, removing or renumbering
++// handles requires a separate
++// policy deployment and is deliberately not supported here.
++type HotInventoryEntry struct {
++	Handle     uint8
++	Identity   string
++	Group      *DialerGroup
++	Candidates []HotInventoryCandidate
++	Selection  string
++	// Borrowed is allowed only at construction. The baseline control plane
++	// keeps lifetime ownership; AcquireManaged tells callers to use its normal
++	// selection path until an owned hot publication replaces this handle.
++	Borrowed bool
++}
++
++// HotInventoryCandidate gives a provider-scoped stable identity to one native
++// dialer. Candidates must be aligned one-for-one with Group.Dialers. Their IDs
++// survive refreshes when the normalized connection definition is unchanged.
++type HotInventoryCandidate struct {
++	ID     string
++	Dialer *dialer.Dialer
++}
++
++// HotInventoryGroup is a resource-free readback record.
++type HotInventoryGroup struct {
++	Handle    uint8
++	Name      string
++	Identity  string
++	Selection string
++}
++
++type HotInventorySnapshot struct {
++	Generation uint64
++	Groups     []HotInventoryGroup
++}
++
++// HotInventoryPublication explicitly identifies the prepared groups whose
++// ownership transferred. In particular, fresh groups supplied with an already
++// active identity remain caller-owned, including in a partly no-op publication.
++// Supplying an already owned group for a no-op does not return its ownership.
++type HotInventoryPublication struct {
++	Snapshot     HotInventorySnapshot
++	Adopted      []uint8
++	CleanupError error
++}
++
++// HotInventoryCommit must durably commit the supplied readback before returning
++// nil; an error must leave the old durable revision authoritative. It runs under
++// the inventory mutex and MUST NOT call inventory methods. After it returns nil,
++// publication completes even if the request context has since been cancelled.
++type HotInventoryCommit func(context.Context, HotInventorySnapshot) error
++
++type hotInventoryGroup struct {
++	entry      HotInventoryEntry
++	name       string
++	dialers    []*dialer.Dialer
++	candidates map[string]*dialer.Dialer
++	selection  string
++	leases     int
++	active     bool
++	closing    bool
++	retirement *hotInventoryRetirement
++}
++
++type hotInventoryResource struct {
++	dialer    *dialer.Dialer
++	option    *dialer.GlobalOption
++	transport any
++	namespace string
++	groups    int
++	closing   bool
++}
++
++type hotInventoryRetirement struct{ remaining int }
++
++type hotInventoryCleanup struct {
++	group     *hotInventoryGroup
++	resources []*hotInventoryResource
++}
++
++// HotInventory is an in-process prerequisite, not a management server or a
++// ControlPlane integration. Callers build and validate native groups separately
++// with inert kernel callbacks; this primitive does not activate or version-gate
++// connectivity callbacks, alter routing, attach BPF, or reload a daemon.
++//
++// Successful construction/publication transfers exclusive ownership of adopted
++// groups and their resources. Membership, names, selection configuration and
++// dialer definitions must then remain immutable. Native health updates remain
++// allowed. Exact *dialer.Dialer pointers may be shared across owned groups, but
++// distinct dialers must have private GlobalOptions and concrete transports:
++// native Close mutates GlobalOption and may close the underlying transport.
++// Every distinct dialer also needs a unique nonempty TransportCacheNamespace.
++// These shallow identity checks cannot discover shared closers hidden inside
++// wrappers; absence of hidden lifecycle sharing remains a caller precondition.
++// Previously transferred and subsequently drained resources must never be
++// submitted again. The caller owns rejected and identity-no-op preparations.
++//
++// A lease pins all candidates in one group before selection/dialing. Retired
++// batches, including cleanup in progress, are bounded. A long-lived lease can
++// retain a complete old group, so callers should also bound group size and flow
++// lifetime; this primitive never forcibly terminates a session.
++type HotInventory struct {
++	mu                 sync.Mutex
++	generation         uint64
++	active             map[uint8]*hotInventoryGroup
++	groups             map[*DialerGroup]*hotInventoryGroup
++	resources          map[*dialer.Dialer]*hotInventoryResource
++	retirements        map[*hotInventoryRetirement]struct{}
++	maxRetired         int
++	closed             bool
++	borrowedDialers    map[*dialer.Dialer]bool
++	borrowedOptions    map[*dialer.GlobalOption]bool
++	borrowedTransports map[any]bool
++	borrowedNamespaces map[string]bool
++	cleanupNamespace   func(string)
++}
++
++// NewHotInventory fixes the handle table and transfers owned entries on success.
++// The initial generation is one. maxRetired must be positive.
++func NewHotInventory(entries []HotInventoryEntry, maxRetired int) (*HotInventory, error) {
++	return NewHotInventoryAtGeneration(entries, maxRetired, 1)
++}
++
++// NewHotInventoryAtGeneration restores an already durably committed inventory.
++// The caller must supply its complete current state; no history is replayed.
++// A positive generation preserves stale-writer fencing over process restart.
++func NewHotInventoryAtGeneration(entries []HotInventoryEntry, maxRetired int, generation uint64) (*HotInventory, error) {
++	if maxRetired < 1 || len(entries) == 0 || generation == 0 {
++		return nil, fmt.Errorf("%w: nonempty entries and positive retirement limit required", ErrHotInventoryInvalid)
++	}
++	h := &HotInventory{
++		generation: generation, active: make(map[uint8]*hotInventoryGroup),
++		groups:      make(map[*DialerGroup]*hotInventoryGroup),
++		resources:   make(map[*dialer.Dialer]*hotInventoryResource),
++		retirements: make(map[*hotInventoryRetirement]struct{}), maxRetired: maxRetired,
++		borrowedDialers:    make(map[*dialer.Dialer]bool),
++		borrowedOptions:    make(map[*dialer.GlobalOption]bool),
++		borrowedTransports: make(map[any]bool),
++		borrowedNamespaces: make(map[string]bool),
++		cleanupNamespace:   dialer.CleanupTransportCacheNamespace,
++	}
++	// Reserve baseline identities without taking lifecycle ownership. Entries
++	// restored as owned must not share closers with any borrowed native group.
++	for _, entry := range entries {
++		if entry.Borrowed && entry.Group != nil {
++			for _, d := range entry.Group.Dialers {
++				if d == nil {
++					continue
++				}
++				h.borrowedDialers[d] = true
++				if d.GlobalOption != nil {
++					h.borrowedOptions[d.GlobalOption] = true
++					if d.TransportCacheNamespace != "" {
++						h.borrowedNamespaces[d.TransportCacheNamespace] = true
++					}
++				}
++				if value := reflect.ValueOf(d.Dialer); value.IsValid() && value.Kind() == reflect.Pointer && !value.IsNil() {
++					h.borrowedTransports[d.Dialer] = true
++				}
++			}
++		}
++	}
++	prepared, err := h.validateLocked(entries, true)
++	if err != nil {
++		return nil, err
++	}
++	for _, group := range prepared {
++		h.adoptLocked(group)
++	}
++	return h, nil
++}
++
++func (h *HotInventory) validateLocked(entries []HotInventoryEntry, initial bool) ([]*hotInventoryGroup, error) {
++	seenHandles := make(map[uint8]bool)
++	seenNames := make(map[string]bool)
++	seenGroups := make(map[*DialerGroup]bool)
++	seenDialers := make(map[*dialer.Dialer]bool)
++	options := make(map[*dialer.GlobalOption]*dialer.Dialer)
++	transports := make(map[any]*dialer.Dialer)
++	namespaces := make(map[string]*dialer.Dialer)
++	for d, resource := range h.resources {
++		options[resource.option] = d
++		transports[resource.transport] = d
++		namespaces[resource.namespace] = d
++	}
++	var prepared []*hotInventoryGroup
++	for _, entry := range entries {
++		if entry.Handle < uint8(consts.OutboundUserDefinedMin) || entry.Handle > uint8(consts.OutboundUserDefinedMax) ||
++			entry.Identity == "" || entry.Group == nil || entry.Group.Name == "" || seenHandles[entry.Handle] {
++			return nil, fmt.Errorf("%w: duplicate handle or missing/invalid entry", ErrHotInventoryInvalid)
++		}
++		if entry.Borrowed {
++			if !initial || seenNames[entry.Group.Name] || seenGroups[entry.Group] {
++				return nil, fmt.Errorf("%w: borrowed entries are unique constructor-only baseline groups", ErrHotInventoryInvalid)
++			}
++			seenHandles[entry.Handle], seenNames[entry.Group.Name], seenGroups[entry.Group] = true, true, true
++			entry.Candidates, entry.Selection = nil, ""
++			prepared = append(prepared, &hotInventoryGroup{entry: entry, name: entry.Group.Name, active: true})
++			continue
++		}
++		if len(entry.Group.Dialers) == 0 || len(entry.Candidates) != len(entry.Group.Dialers) || entry.Selection == "" {
++			return nil, fmt.Errorf("%w: owned groups require aligned candidates and selection", ErrHotInventoryInvalid)
++		}
++		policy := entry.Group.currentSelectionState().policy
++		if policy.Policy == consts.DialerSelectionPolicy_Fixed && (policy.FixedIndex < 0 || policy.FixedIndex >= len(entry.Group.Dialers)) {
++			return nil, fmt.Errorf("%w: fixed selection is outside group membership", ErrHotInventoryInvalid)
++		}
++		seenHandles[entry.Handle] = true
++		current := h.active[entry.Handle]
++		if !initial {
++			if current == nil || current.name != entry.Group.Name {
++				return nil, fmt.Errorf("%w: handles and group names are fixed", ErrHotInventoryInvalid)
++			}
++			if current.entry.Identity == entry.Identity {
++				if current.selection != entry.Selection {
++					return nil, fmt.Errorf("%w: selection changes require SetSelection", ErrHotInventoryInvalid)
++				}
++				continue
++			}
++		}
++		if seenNames[entry.Group.Name] || seenGroups[entry.Group] || h.groups[entry.Group] != nil {
++			return nil, fmt.Errorf("%w: group or name is already owned", ErrHotInventoryInvalid)
++		}
++		seenNames[entry.Group.Name], seenGroups[entry.Group] = true, true
++		group := &hotInventoryGroup{entry: entry, name: entry.Group.Name, active: true}
++		group.selection = entry.Selection
++		group.candidates = make(map[string]*dialer.Dialer, len(entry.Candidates))
++		members := make(map[*dialer.Dialer]bool)
++		for i, candidate := range entry.Candidates {
++			d := candidate.Dialer
++			if candidate.ID == "" || group.candidates[candidate.ID] != nil || d != entry.Group.Dialers[i] {
++				return nil, fmt.Errorf("%w: candidate IDs and native group membership must align", ErrHotInventoryInvalid)
++			}
++			group.candidates[candidate.ID] = d
++			if d == nil || d.GlobalOption == nil || d.Dialer == nil || d.TransportCacheNamespace == "" {
++				return nil, fmt.Errorf("%w: incomplete native dialer", ErrHotInventoryInvalid)
++			}
++			transport := reflect.ValueOf(d.Dialer)
++			if transport.Kind() != reflect.Pointer || transport.IsNil() {
++				return nil, fmt.Errorf("%w: concrete transport must have nonnil pointer identity", ErrHotInventoryInvalid)
++			}
++			if h.borrowedDialers[d] || h.borrowedOptions[d.GlobalOption] || h.borrowedTransports[d.Dialer] || h.borrowedNamespaces[d.TransportCacheNamespace] {
++				return nil, fmt.Errorf("%w: owned candidate aliases borrowed native lifecycle", ErrHotInventoryInvalid)
++			}
++			if members[d] {
++				return nil, fmt.Errorf("%w: duplicate native dialer candidate", ErrHotInventoryInvalid)
++			}
++			members[d] = true
++			group.dialers = append(group.dialers, d)
++			if resource := h.resources[d]; resource != nil {
++				if resource.closing || resource.option != d.GlobalOption || resource.transport != any(d.Dialer) || resource.namespace != d.TransportCacheNamespace {
++					return nil, fmt.Errorf("%w: owned dialer changed or is closing", ErrHotInventoryInvalid)
++				}
++				continue
++			}
++			if seenDialers[d] {
++				continue
++			}
++			if options[d.GlobalOption] != nil || transports[d.Dialer] != nil || namespaces[d.TransportCacheNamespace] != nil {
++				return nil, fmt.Errorf("%w: distinct dialers share lifecycle ownership", ErrHotInventoryInvalid)
++			}
++			seenDialers[d] = true
++			options[d.GlobalOption], transports[d.Dialer] = d, d
++			namespaces[d.TransportCacheNamespace] = d
++		}
++		if group.candidates[group.selection] == nil {
++			return nil, fmt.Errorf("%w: selected candidate is absent", ErrHotInventoryInvalid)
++		}
++		// Keep the latest user choice across provider publication whenever the
++		// stable ID still exists. A missing choice requires the caller's explicit
++		// valid replacement in entry.Selection; there is no implicit Direct.
++		if current != nil && group.candidates[current.selection] != nil {
++			group.selection = current.selection
++		}
++		// Retain private metadata, never the caller's mutable candidate slice.
++		group.entry.Candidates = nil
++		prepared = append(prepared, group)
++	}
++	return prepared, nil
++}
++
++func (h *HotInventory) adoptLocked(group *hotInventoryGroup) {
++	h.active[group.entry.Handle] = group
++	h.groups[group.entry.Group] = group
++	for _, d := range group.dialers {
++		resource := h.resources[d]
++		if resource == nil {
++			resource = &hotInventoryResource{dialer: d, option: d.GlobalOption, transport: d.Dialer, namespace: d.TransportCacheNamespace}
++			h.resources[d] = resource
++		}
++		resource.groups++
++	}
++}
++
++func hotInventoryReadback(generation uint64, groups map[uint8]*hotInventoryGroup) HotInventorySnapshot {
++	snapshot := HotInventorySnapshot{Generation: generation, Groups: make([]HotInventoryGroup, 0, len(groups))}
++	for handle, group := range groups {
++		snapshot.Groups = append(snapshot.Groups, HotInventoryGroup{Handle: handle, Name: group.name, Identity: group.entry.Identity, Selection: group.selection})
++	}
++	sort.Slice(snapshot.Groups, func(i, j int) bool { return snapshot.Groups[i].Handle < snapshot.Groups[j].Handle })
++	return snapshot
++}
++
++func (h *HotInventory) Snapshot() HotInventorySnapshot {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return hotInventoryReadback(h.generation, h.active)
++}
++
++// Publish atomically replaces only supplied groups after validation and durable
++// commit. Unaffected groups keep their exact native pointers. Errors transfer
++// no ownership. Identity no-ops neither call commit nor advance the generation.
++func (h *HotInventory) Publish(ctx context.Context, expected uint64, entries []HotInventoryEntry, commit HotInventoryCommit) (HotInventoryPublication, error) {
++	h.mu.Lock()
++	if h.closed {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, ErrHotInventoryClosed
++	}
++	if h.generation != expected {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, ErrHotInventoryConflict
++	}
++	prepared, err := h.validateLocked(entries, false)
++	if err != nil {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, err
++	}
++	if len(prepared) == 0 {
++		result := HotInventoryPublication{Snapshot: hotInventoryReadback(h.generation, h.active)}
++		h.mu.Unlock()
++		return result, nil
++	}
++	if len(h.retirements) >= h.maxRetired {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, ErrHotInventoryBusy
++	}
++	if commit == nil || h.generation == ^uint64(0) {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, fmt.Errorf("%w: durable commit required and generation must not overflow", ErrHotInventoryInvalid)
++	}
++	if err := ctx.Err(); err != nil {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, err
++	}
++	next := make(map[uint8]*hotInventoryGroup, len(h.active))
++	for handle, group := range h.active {
++		next[handle] = group
++	}
++	for _, group := range prepared {
++		next[group.entry.Handle] = group
++	}
++	if err := commit(ctx, hotInventoryReadback(h.generation+1, next)); err != nil {
++		h.mu.Unlock()
++		return HotInventoryPublication{}, err
++	}
++	retirement := &hotInventoryRetirement{remaining: len(prepared)}
++	h.retirements[retirement] = struct{}{}
++	var previous []*hotInventoryGroup
++	result := HotInventoryPublication{}
++	for _, group := range prepared {
++		old := h.active[group.entry.Handle]
++		old.active, old.retirement = false, retirement
++		previous = append(previous, old)
++		h.adoptLocked(group)
++		result.Adopted = append(result.Adopted, group.entry.Handle)
++	}
++	h.generation++
++	result.Snapshot = hotInventoryReadback(h.generation, h.active)
++	var cleanup []hotInventoryCleanup
++	for _, group := range previous {
++		if group.leases == 0 {
++			cleanup = append(cleanup, h.cleanupLocked(group))
++		}
++	}
++	h.mu.Unlock()
++	// Cleanup errors are distinct from publication acknowledgement: readback is
++	// already authoritative. Native group/dialer Close currently return nil.
++	result.CleanupError = h.runCleanup(cleanup)
++	return result, nil
++}
++
++// HotInventoryLease must be obtained before reading/selecting a native group,
++// and held through dialing and the entire established session lifetime. Group
++// and its candidates may be used until Release; they must never be mutated.
++// Dialer is authoritative for the flow, including manual SetSelection; do not
++// call Group.Select afterward because its immutable native policy may retain a
++// different fixed index.
++// Release is idempotent. A caller must not race use of this lease with Release.
++type HotInventoryLease struct {
++	Group       *DialerGroup
++	Dialer      *dialer.Dialer
++	CandidateID string
++	Generation  uint64
++	Handle      uint8
++	Identity    string
++	owner       *HotInventory
++	group       *hotInventoryGroup
++	once        sync.Once
++	err         error
++}
++
++// SetSelection persists a stable candidate choice without replacing the native
++// group. It uses the same generation CAS and durable-before-publish ordering as
++// Publish. Identity no-ops skip the callback and generation increment.
++func (h *HotInventory) SetSelection(ctx context.Context, expected uint64, handle uint8, candidateID string, commit HotInventoryCommit) (HotInventoryPublication, error) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.closed {
++		return HotInventoryPublication{}, ErrHotInventoryClosed
++	}
++	if h.generation != expected {
++		return HotInventoryPublication{}, ErrHotInventoryConflict
++	}
++	group := h.active[handle]
++	if group != nil && group.entry.Borrowed {
++		return HotInventoryPublication{}, ErrHotInventoryUnmanaged
++	}
++	if group == nil || group.candidates[candidateID] == nil {
++		return HotInventoryPublication{}, fmt.Errorf("%w: unknown handle or candidate", ErrHotInventoryInvalid)
++	}
++	if group.selection == candidateID {
++		return HotInventoryPublication{Snapshot: hotInventoryReadback(h.generation, h.active)}, nil
++	}
++	if commit == nil || h.generation == ^uint64(0) {
++		return HotInventoryPublication{}, fmt.Errorf("%w: durable commit required and generation must not overflow", ErrHotInventoryInvalid)
++	}
++	if err := ctx.Err(); err != nil {
++		return HotInventoryPublication{}, err
++	}
++	next := make(map[uint8]*hotInventoryGroup, len(h.active))
++	for handle, current := range h.active {
++		if handle == group.entry.Handle {
++			copy := *current
++			copy.selection = candidateID
++			copy.entry.Selection = candidateID
++			next[handle] = &copy
++		} else {
++			next[handle] = current
++		}
++	}
++	if err := commit(ctx, hotInventoryReadback(h.generation+1, next)); err != nil {
++		return HotInventoryPublication{}, err
++	}
++	group.selection = candidateID
++	group.entry.Selection = candidateID
++	h.generation++
++	return HotInventoryPublication{Snapshot: hotInventoryReadback(h.generation, h.active)}, nil
++}
++
++func (h *HotInventory) Acquire(handle uint8) (*HotInventoryLease, error) {
++	lease, managed, err := h.AcquireManaged(handle)
++	if err != nil {
++		return nil, err
++	}
++	if !managed {
++		return nil, ErrHotInventoryUnmanaged
++	}
++	return lease, nil
++}
++
++// AcquireManaged atomically decides between borrowed baseline handling and a
++// retained hot decision. An unmanaged result is (nil, false, nil); callers must
++// retain their existing baseline control-plane admission lease while falling
++// back. A hot publication may follow that decision without invalidating the
++// borrowed native resources, which remain owned by the baseline control plane.
++func (h *HotInventory) AcquireManaged(handle uint8) (*HotInventoryLease, bool, error) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.closed {
++		return nil, false, ErrHotInventoryClosed
++	}
++	group := h.active[handle]
++	if group == nil {
++		return nil, false, fmt.Errorf("%w: unknown handle", ErrHotInventoryInvalid)
++	}
++	if group.entry.Borrowed {
++		return nil, false, nil
++	}
++	lease, err := h.acquireGroupLocked(group, group.selection)
++	return lease, true, err
++}
++
++// IsHot is a status query, not a substitute for atomic AcquireManaged.
++func (h *HotInventory) IsHot(handle uint8) bool {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	group := h.active[handle]
++	return !h.closed && group != nil && !group.entry.Borrowed
++}
++
++// AcquireCandidate pins a group and returns the requested stable candidate.
++// It is useful for deterministic probes; ordinary flows should use Acquire so
++// the current persisted selection is honored.
++func (h *HotInventory) AcquireCandidate(handle uint8, candidateID string) (*HotInventoryLease, error) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.closed {
++		return nil, ErrHotInventoryClosed
++	}
++	group := h.active[handle]
++	if group == nil {
++		return nil, fmt.Errorf("%w: unknown handle", ErrHotInventoryInvalid)
++	}
++	if group.entry.Borrowed {
++		return nil, ErrHotInventoryUnmanaged
++	}
++	return h.acquireGroupLocked(group, candidateID)
++}
++
++func (h *HotInventory) acquireGroupLocked(group *hotInventoryGroup, candidateID string) (*HotInventoryLease, error) {
++	d := group.candidates[candidateID]
++	if d == nil {
++		return nil, fmt.Errorf("%w: unknown candidate", ErrHotInventoryInvalid)
++	}
++	group.leases++
++	return &HotInventoryLease{Group: group.entry.Group, Dialer: d, CandidateID: candidateID, Generation: h.generation, Handle: group.entry.Handle, Identity: group.entry.Identity, owner: h, group: group}, nil
++}
++
++func (l *HotInventoryLease) Release() error {
++	if l == nil {
++		return nil
++	}
++	l.once.Do(func() {
++		h := l.owner
++		h.mu.Lock()
++		l.group.leases--
++		var cleanup []hotInventoryCleanup
++		if l.group.leases == 0 && !l.group.active {
++			cleanup = append(cleanup, h.cleanupLocked(l.group))
++		}
++		h.mu.Unlock()
++		l.err = h.runCleanup(cleanup)
++	})
++	return l.err
++}
++
++func (h *HotInventory) cleanupLocked(group *hotInventoryGroup) hotInventoryCleanup {
++	group.closing = true
++	cleanup := hotInventoryCleanup{group: group}
++	for _, d := range group.dialers {
++		resource := h.resources[d]
++		resource.groups--
++		if resource.groups == 0 {
++			resource.closing = true
++			cleanup.resources = append(cleanup.resources, resource)
++		}
++	}
++	return cleanup
++}
++
++func (h *HotInventory) runCleanup(cleanups []hotInventoryCleanup) error {
++	var errs []error
++	for _, cleanup := range cleanups {
++		if !cleanup.group.entry.Borrowed {
++			errs = append(errs, cleanup.group.entry.Group.Close())
++		}
++		for _, resource := range cleanup.resources {
++			errs = append(errs, resource.dialer.Close())
++			h.cleanupNamespace(resource.namespace)
++		}
++		h.mu.Lock()
++		delete(h.groups, cleanup.group.entry.Group)
++		for _, resource := range cleanup.resources {
++			delete(h.resources, resource.dialer)
++		}
++		retirement := cleanup.group.retirement
++		retirement.remaining--
++		if retirement.remaining == 0 {
++			delete(h.retirements, retirement)
++		}
++		h.mu.Unlock()
++	}
++	return errors.Join(errs...)
++}
++
++// Close stops admission and releases active ownership. It does not invalidate
++// existing leases; their final Release closes the remaining native resources.
++func (h *HotInventory) Close() error {
++	h.mu.Lock()
++	if h.closed {
++		h.mu.Unlock()
++		return nil
++	}
++	h.closed = true
++	retirement := &hotInventoryRetirement{remaining: len(h.active)}
++	if retirement.remaining > 0 {
++		h.retirements[retirement] = struct{}{}
++	}
++	var cleanup []hotInventoryCleanup
++	for _, group := range h.active {
++		group.active, group.retirement = false, retirement
++		if group.leases == 0 {
++			cleanup = append(cleanup, h.cleanupLocked(group))
++		}
++	}
++	h.active = make(map[uint8]*hotInventoryGroup)
++	h.mu.Unlock()
++	return h.runCleanup(cleanup)
++}
+diff --git a/component/outbound/hot_inventory_test.go b/component/outbound/hot_inventory_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5aca83fcf2a98fcf6f584baf1f344b169ab51ec9
+--- /dev/null
++++ b/component/outbound/hot_inventory_test.go
+@@ -0,0 +1,609 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	"github.com/daeuniverse/outbound/netproxy"
++	"github.com/sirupsen/logrus"
++)
++
++type hotInventoryTestTransport struct {
++	mu        sync.Mutex
++	conns     []net.Conn
++	closed    atomic.Int32
++	closeWait <-chan struct{}
++	closing   chan<- struct{}
++}
++
++func (d *hotInventoryTestTransport) DialContext(context.Context, string, string) (netproxy.Conn, error) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.closed.Load() != 0 {
++		return nil, net.ErrClosed
++	}
++	left, right := net.Pipe()
++	d.conns = append(d.conns, left, right)
++	go func() { _, _ = io.Copy(right, right) }()
++	return left, nil
++}
++
++func (d *hotInventoryTestTransport) Close() error {
++	d.closed.Add(1)
++	if d.closing != nil {
++		d.closing <- struct{}{}
++	}
++	if d.closeWait != nil {
++		<-d.closeWait
++	}
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	for _, conn := range d.conns {
++		_ = conn.Close()
++	}
++	return nil
++}
++
++var hotInventoryTestNamespace atomic.Uint64
++
++func hotInventoryTestOption() *dialer.GlobalOption {
++	log := logrus.New()
++	log.SetOutput(io.Discard)
++	return &dialer.GlobalOption{Log: log, CheckInterval: time.Hour, TransportCacheNamespace: fmt.Sprintf("hot-test-%d", hotInventoryTestNamespace.Add(1))}
++}
++
++func hotInventoryTestDialer(option *dialer.GlobalOption, transport *hotInventoryTestTransport) *dialer.Dialer {
++	return dialer.NewDialerContext(context.Background(), transport, option,
++		dialer.InstanceOption{DisableCheck: true}, &dialer.Property{})
++}
++
++func hotInventoryTestGroup(name string, d *dialer.Dialer) *DialerGroup {
++	return NewDialerGroup(d.GlobalOption, name, []*dialer.Dialer{d}, []*dialer.Annotation{{}},
++		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++}
++
++func hotInventoryTestEntry(t *testing.T, handle uint8, name, identity string) (HotInventoryEntry, *hotInventoryTestTransport) {
++	t.Helper()
++	transport := &hotInventoryTestTransport{}
++	d := hotInventoryTestDialer(hotInventoryTestOption(), transport)
++	group := hotInventoryTestGroup(name, d)
++	t.Cleanup(func() { _ = group.Close(); _ = d.Close() })
++	return hotInventoryTestPrepared(handle, identity, group), transport
++}
++
++func hotInventoryTestPrepared(handle uint8, identity string, group *DialerGroup) HotInventoryEntry {
++	candidates := make([]HotInventoryCandidate, len(group.Dialers))
++	for i, d := range group.Dialers {
++		candidates[i] = HotInventoryCandidate{ID: fmt.Sprintf("node-%d", i), Dialer: d}
++	}
++	return HotInventoryEntry{Handle: handle, Identity: identity, Group: group, Candidates: candidates, Selection: "node-0"}
++}
++
++func hotInventoryTestNew(t *testing.T, limit int, entries ...HotInventoryEntry) *HotInventory {
++	t.Helper()
++	h, err := NewHotInventory(entries, limit)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = h.Close() })
++	return h
++}
++
++func hotInventoryTestAcquire(t *testing.T, h *HotInventory, handle uint8) *HotInventoryLease {
++	t.Helper()
++	lease, err := h.Acquire(handle)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = lease.Release() })
++	return lease
++}
++
++func hotInventoryTestCommit(context.Context, HotInventorySnapshot) error { return nil }
++
++func hotInventoryTestEcho(t *testing.T, conn netproxy.Conn, payload string) {
++	t.Helper()
++	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := conn.Write([]byte(payload)); err != nil {
++		t.Fatal(err)
++	}
++	got := make([]byte, len(payload))
++	if _, err := io.ReadFull(conn, got); err != nil || string(got) != payload {
++		t.Fatalf("echo = %q, %v", got, err)
++	}
++}
++
++func TestHotInventoryPublicationPreservesHandlesAndHeldNativeFlow(t *testing.T) {
++	a, oldTransport := hotInventoryTestEntry(t, 2, "a", "a1")
++	b, bTransport := hotInventoryTestEntry(t, 9, "b", "b1")
++	h := hotInventoryTestNew(t, 2, a, b)
++	old := hotInventoryTestAcquire(t, h, 2) // Pin before selecting or dialing.
++	conn, err := old.Dialer.DialContext(context.Background(), "tcp", "fixture")
++	if err != nil {
++		t.Fatal(err)
++	}
++	hotInventoryTestEcho(t, conn, "before")
++	replacement, _ := hotInventoryTestEntry(t, 2, "a", "a2")
++	var commits int
++	result, err := h.Publish(context.Background(), 1, []HotInventoryEntry{replacement}, func(_ context.Context, snapshot HotInventorySnapshot) error {
++		commits++
++		if snapshot.Generation != 2 || snapshot.Groups[0].Identity != "a2" || snapshot.Groups[1].Handle != 9 {
++			t.Fatalf("unexpected durable candidate: %+v", snapshot)
++		}
++		snapshot.Groups[0].Identity = "callback must not mutate inventory"
++		return nil
++	})
++	if err != nil || commits != 1 || len(result.Adopted) != 1 || result.Adopted[0] != 2 || result.CleanupError != nil {
++		t.Fatalf("publish = %+v, %v; commits %d", result, err, commits)
++	}
++	if oldTransport.closed.Load() != 0 || bTransport.closed.Load() != 0 {
++		t.Fatal("publication closed retained or unaffected transport")
++	}
++	hotInventoryTestEcho(t, conn, "after")
++	current := hotInventoryTestAcquire(t, h, 2)
++	unaffected := hotInventoryTestAcquire(t, h, 9)
++	if current.Group != replacement.Group || unaffected.Group != b.Group || current.Identity != "a2" || current.Generation != 2 {
++		t.Fatal("group identity or stable handle changed incorrectly")
++	}
++	result.Snapshot.Groups[0].Identity = "caller mutation"
++	if h.Snapshot().Groups[0].Identity != "a2" {
++		t.Fatal("readback aliases mutable caller data")
++	}
++	if err := old.Release(); err != nil {
++		t.Fatal(err)
++	}
++	_ = old.Release()
++	if oldTransport.closed.Load() != 1 {
++		t.Fatal("old native resource did not close exactly once after drain")
++	}
++}
++
++func TestHotInventoryFailedCommitStaleAndNoopTransferNoOwnership(t *testing.T) {
++	a, aTransport := hotInventoryTestEntry(t, 2, "a", "a1")
++	h := hotInventoryTestNew(t, 1, a)
++	replacement, transport := hotInventoryTestEntry(t, 2, "a", "a2")
++	commits := 0
++	failure := errors.New("durability unavailable")
++	commit := func(context.Context, HotInventorySnapshot) error { commits++; return failure }
++	if _, err := h.Publish(context.Background(), 0, []HotInventoryEntry{replacement}, commit); !errors.Is(err, ErrHotInventoryConflict) || commits != 0 {
++		t.Fatalf("stale = %v, commits = %d", err, commits)
++	}
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{replacement}, commit); !errors.Is(err, failure) || commits != 1 {
++		t.Fatalf("failed persist = %v, commits = %d", err, commits)
++	}
++	if h.Snapshot().Generation != 1 || transport.closed.Load() != 0 || aTransport.closed.Load() != 0 {
++		t.Fatal("failed publication mutated active state or caller resources")
++	}
++	noop, noopTransport := hotInventoryTestEntry(t, 2, "a", "a1")
++	result, err := h.Publish(context.Background(), 1, []HotInventoryEntry{noop}, commit)
++	if err != nil || commits != 1 || result.Snapshot.Generation != 1 || len(result.Adopted) != 0 || noopTransport.closed.Load() != 0 {
++		t.Fatalf("no-op = %+v, %v; commits = %d", result, err, commits)
++	}
++	if hotInventoryTestAcquire(t, h, 2).Group != a.Group {
++		t.Fatal("no-op replaced the native group")
++	}
++}
++
++func TestHotInventoryRetirementBoundAndCloseWaitForLeases(t *testing.T) {
++	a, transportA := hotInventoryTestEntry(t, 2, "a", "a1")
++	b, transportB := hotInventoryTestEntry(t, 2, "a", "a2")
++	c, transportC := hotInventoryTestEntry(t, 2, "a", "a3")
++	h := hotInventoryTestNew(t, 1, a)
++	old := hotInventoryTestAcquire(t, h, 2)
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{b}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	var called bool
++	if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{c}, func(context.Context, HotInventorySnapshot) error { called = true; return nil }); !errors.Is(err, ErrHotInventoryBusy) || called {
++		t.Fatalf("expected busy before commit, got %v", err)
++	}
++	if transportC.closed.Load() != 0 || transportA.closed.Load() != 0 {
++		t.Fatal("busy closed resources")
++	}
++	_ = old.Release()
++	if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{c}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	if transportA.closed.Load() != 1 || transportB.closed.Load() != 1 {
++		t.Fatal("drained resources were not closed")
++	}
++	current := hotInventoryTestAcquire(t, h, 2)
++	if err := h.Close(); err != nil || transportC.closed.Load() != 0 {
++		t.Fatal("close interrupted a held lease", err)
++	}
++	if _, err := h.Acquire(2); !errors.Is(err, ErrHotInventoryClosed) {
++		t.Fatal("closed inventory admitted a lease", err)
++	}
++	_ = current.Release()
++	if transportC.closed.Load() != 1 {
++		t.Fatal("last lease did not close resource")
++	}
++}
++
++func TestHotInventorySharedExactDialerStaysOpenUntilAllGroupsDrain(t *testing.T) {
++	a, transport := hotInventoryTestEntry(t, 2, "a", "a1")
++	b := hotInventoryTestPrepared(3, "b1", hotInventoryTestGroup("b", a.Group.Dialers[0]))
++	h := hotInventoryTestNew(t, 2, a, b)
++	replacement, _ := hotInventoryTestEntry(t, 2, "a", "a2")
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{replacement}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	if transport.closed.Load() != 0 {
++		t.Fatal("retiring one group closed a shared exact dialer")
++	}
++	lease := hotInventoryTestAcquire(t, h, 3)
++	_ = h.Close()
++	if transport.closed.Load() != 0 {
++		t.Fatal("close ignored shared group's lease")
++	}
++	_ = lease.Release()
++	if transport.closed.Load() != 1 {
++		t.Fatal("shared resource not closed exactly once")
++	}
++}
++
++func TestHotInventoryRejectsRenumberRenameAndAliasedLifecycleOwnership(t *testing.T) {
++	a, aTransport := hotInventoryTestEntry(t, 2, "a", "a1")
++	h := hotInventoryTestNew(t, 2, a)
++	old := hotInventoryTestAcquire(t, h, 2)
++	b, _ := hotInventoryTestEntry(t, 2, "a", "a2")
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{b}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name  string
++		entry HotInventoryEntry
++	}{
++		{"renumber", hotInventoryTestPrepared(3, "x", b.Group)},
++		{"rename", hotInventoryTestPrepared(2, "x", hotInventoryTestGroup("renamed", b.Group.Dialers[0]))},
++		{"reserved", hotInventoryTestPrepared(0, "x", b.Group)},
++		{"reuse owned group", hotInventoryTestPrepared(2, "x", a.Group)},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{test.entry}, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryInvalid) {
++				t.Fatal("accepted invalid handle/group ownership", err)
++			}
++		})
++	}
++	for _, retained := range []*dialer.Dialer{a.Group.Dialers[0], b.Group.Dialers[0]} {
++		for _, shareOption := range []bool{false, true} {
++			option, transport := hotInventoryTestOption(), &hotInventoryTestTransport{}
++			if shareOption {
++				option = retained.GlobalOption
++			} else {
++				transport = retained.Dialer.(*hotInventoryTestTransport)
++			}
++			d := hotInventoryTestDialer(option, transport)
++			group := hotInventoryTestGroup("a", d)
++			candidate := hotInventoryTestPrepared(2, "alias", group)
++			if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{candidate}, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryInvalid) {
++				t.Fatal("accepted aliased native lifecycle", err)
++			}
++			// Caller owns rejection. Detach deliberately invalid shared objects
++			// before cleaning this fixture, so Close cannot damage accepted ones.
++			_ = group.Close()
++			d.GlobalOption = hotInventoryTestOption()
++			d.Dialer = &hotInventoryTestTransport{}
++			_ = d.Close()
++		}
++	}
++	if aTransport.closed.Load() != 0 || h.Snapshot().Generation != 2 {
++		t.Fatal("invalid preparations changed retained native state")
++	}
++	_ = old.Release()
++}
++
++func TestHotInventoryPublicationIsAtomicAndGenerationCASSerializesWriters(t *testing.T) {
++	a, _ := hotInventoryTestEntry(t, 2, "a", "v1")
++	b, _ := hotInventoryTestEntry(t, 3, "b", "v1")
++	h := hotInventoryTestNew(t, 1, a, b)
++	a2, _ := hotInventoryTestEntry(t, 2, "a", "v2")
++	b2, _ := hotInventoryTestEntry(t, 3, "b", "v2")
++	a3, _ := hotInventoryTestEntry(t, 2, "a", "v3")
++	b3, _ := hotInventoryTestEntry(t, 3, "b", "v3")
++	entered, proceed := make(chan struct{}), make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		_, err := h.Publish(context.Background(), 1, []HotInventoryEntry{a2, b2}, func(context.Context, HotInventorySnapshot) error {
++			close(entered)
++			<-proceed
++			return nil
++		})
++		done <- err
++	}()
++	<-entered
++	second := make(chan error, 1)
++	go func() {
++		_, err := h.Publish(context.Background(), 1, []HotInventoryEntry{a3, b3}, hotInventoryTestCommit)
++		second <- err
++	}()
++	observed := make(chan HotInventorySnapshot, 1)
++	go func() { observed <- h.Snapshot() }()
++	close(proceed)
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if err := <-second; !errors.Is(err, ErrHotInventoryConflict) {
++		t.Fatal("concurrent stale writer was not rejected", err)
++	}
++	snapshot := <-observed
++	if snapshot.Generation != 2 || snapshot.Groups[0].Identity != "v2" || snapshot.Groups[1].Identity != "v2" {
++		t.Fatal("reader observed partial publication", snapshot)
++	}
++}
++
++func TestHotInventoryRejectsEmptyInvalidSelectionAndSharedNamespaces(t *testing.T) {
++	a, _ := hotInventoryTestEntry(t, 2, "a", "a1")
++	b, _ := hotInventoryTestEntry(t, 3, "b", "b1")
++	b.Group.Dialers[0].TransportCacheNamespace = a.Group.Dialers[0].TransportCacheNamespace
++	if _, err := NewHotInventory([]HotInventoryEntry{a, b}, 1); !errors.Is(err, ErrHotInventoryInvalid) {
++		t.Fatal("accepted shared cache namespace", err)
++	}
++	b.Group.Dialers[0].TransportCacheNamespace = ""
++	if _, err := NewHotInventory([]HotInventoryEntry{b}, 1); !errors.Is(err, ErrHotInventoryInvalid) {
++		t.Fatal("accepted default shared cache namespace", err)
++	}
++	b.Group.Dialers[0].TransportCacheNamespace = "restored-private"
++	h := hotInventoryTestNew(t, 1, a)
++	for _, index := range []int{-1, 1} {
++		b.Group.SetSelectionPolicy(DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: index})
++		if _, err := NewHotInventory([]HotInventoryEntry{b}, 1); !errors.Is(err, ErrHotInventoryInvalid) {
++			t.Fatal("accepted out-of-range fixed selection", err)
++		}
++	}
++	_ = b.Group.Close()
++	b.Group.Dialers = nil
++	b.Handle, b.Group.Name = 2, "a"
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{b}, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryInvalid) {
++		t.Fatal("accepted empty prepared group", err)
++	}
++}
++
++func TestHotInventoryCleanupInFlightStillCountsTowardBound(t *testing.T) {
++	a, transport := hotInventoryTestEntry(t, 2, "a", "v1")
++	b, _ := hotInventoryTestEntry(t, 2, "a", "v2")
++	c, _ := hotInventoryTestEntry(t, 2, "a", "v3")
++	h := hotInventoryTestNew(t, 1, a)
++	closing, proceed := make(chan struct{}, 1), make(chan struct{})
++	transport.closing, transport.closeWait = closing, proceed
++	done := make(chan error, 1)
++	go func() {
++		_, err := h.Publish(context.Background(), 1, []HotInventoryEntry{b}, hotInventoryTestCommit)
++		done <- err
++	}()
++	<-closing
++	_, err := h.Publish(context.Background(), 2, []HotInventoryEntry{c}, hotInventoryTestCommit)
++	close(proceed)
++	if publishErr := <-done; publishErr != nil {
++		t.Fatal(publishErr)
++	}
++	if !errors.Is(err, ErrHotInventoryBusy) {
++		t.Fatal("cleanup-in-flight did not enforce bound", err)
++	}
++}
++
++func TestHotInventoryStableSelectionDurabilityAndReplacement(t *testing.T) {
++	a, oldTransport := hotInventoryTestEntry(t, 2, "a", "v1")
++	second, secondTransport := hotInventoryTestEntry(t, 3, "spare", "unused")
++	d2 := second.Group.Dialers[0]
++	a.Group.Dialers = append(a.Group.Dialers, d2)
++	a.Candidates = append(a.Candidates, HotInventoryCandidate{ID: "chosen", Dialer: d2})
++	h := hotInventoryTestNew(t, 1, a)
++	old := hotInventoryTestAcquire(t, h, 2)
++	commits := 0
++	failure := errors.New("persist failed")
++	commit := func(_ context.Context, snapshot HotInventorySnapshot) error {
++		commits++
++		if snapshot.Generation != 2 || snapshot.Groups[0].Selection != "chosen" {
++			t.Fatal("incorrect durable selection candidate", snapshot)
++		}
++		return failure
++	}
++	if _, err := h.SetSelection(context.Background(), 0, 2, "chosen", commit); !errors.Is(err, ErrHotInventoryConflict) || commits != 0 {
++		t.Fatal("stale selection was accepted", err)
++	}
++	if _, err := h.SetSelection(context.Background(), 1, 2, "absent", commit); !errors.Is(err, ErrHotInventoryInvalid) || commits != 0 {
++		t.Fatal("unknown stable candidate was accepted", err)
++	}
++	if _, err := h.SetSelection(context.Background(), 1, 2, "chosen", commit); !errors.Is(err, failure) {
++		t.Fatal("failed selection commit was accepted", err)
++	}
++	if h.Snapshot().Generation != 1 || h.Snapshot().Groups[0].Selection != "node-0" {
++		t.Fatal("failed durable commit altered selection")
++	}
++	if _, err := h.SetSelection(context.Background(), 1, 2, "chosen", hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	selected := hotInventoryTestAcquire(t, h, 2)
++	if selected.Dialer != d2 || selected.CandidateID != "chosen" || selected.Group != a.Group || old.Dialer == d2 {
++		t.Fatal("selection did not change new flows while preserving old leases")
++	}
++	if _, err := h.SetSelection(context.Background(), 2, 2, "chosen", commit); err != nil || commits != 1 || h.Snapshot().Generation != 2 {
++		t.Fatal("selection no-op called persistence or advanced generation", err)
++	}
++	probe, err := h.AcquireCandidate(2, "node-0")
++	if err != nil || probe.Dialer != a.Group.Dialers[0] {
++		t.Fatal("stable candidate probe failed", err)
++	}
++	_ = probe.Release()
++	next, _ := hotInventoryTestEntry(t, 2, "a", "v2")
++	nextSecond, _ := hotInventoryTestEntry(t, 3, "replacement", "unused")
++	next.Group.Dialers = append(next.Group.Dialers, nextSecond.Group.Dialers[0])
++	next.Candidates = append(next.Candidates, HotInventoryCandidate{ID: "chosen", Dialer: nextSecond.Group.Dialers[0]})
++	if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{next}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	latest := hotInventoryTestAcquire(t, h, 2)
++	if latest.CandidateID != "chosen" || latest.Dialer != nextSecond.Group.Dialers[0] {
++		t.Fatal("provider replacement lost stable selection")
++	}
++	_ = old.Release()
++	if oldTransport.closed.Load() != 0 || secondTransport.closed.Load() != 0 {
++		t.Fatal("other old selection lease did not pin old group")
++	}
++	_ = selected.Release()
++	if oldTransport.closed.Load() != 1 || secondTransport.closed.Load() != 1 {
++		t.Fatal("selection changed lifecycle ownership and leaked old group")
++	}
++}
++
++func TestHotInventoryConcurrentLeaseAndPublishChurn(t *testing.T) {
++	a, _ := hotInventoryTestEntry(t, 2, "a", "start")
++	h := hotInventoryTestNew(t, 128, a)
++	var wg sync.WaitGroup
++	var failed atomic.Bool
++	for range 8 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for range 100 {
++				lease, err := h.Acquire(2)
++				if err != nil {
++					failed.Store(true)
++					return
++				}
++				if lease.Dialer.Dialer.(*hotInventoryTestTransport).closed.Load() != 0 {
++					failed.Store(true)
++				}
++				_ = lease.Release()
++			}
++		}()
++	}
++	for i := uint64(1); i <= 50; i++ {
++		identity := "odd"
++		if i%2 == 0 {
++			identity = "even"
++		}
++		next, _ := hotInventoryTestEntry(t, 2, "a", identity)
++		if _, err := h.Publish(context.Background(), i, []HotInventoryEntry{next}, hotInventoryTestCommit); err != nil {
++			t.Fatal(err)
++		}
++	}
++	wg.Wait()
++	if failed.Load() {
++		t.Fatal("concurrent lease observed closed native resources")
++	}
++}
++
++func TestHotInventoryBorrowedBaselineFallbackSurvivesReplaceAndClose(t *testing.T) {
++	a, transportA := hotInventoryTestEntry(t, 2, "a", "baseline")
++	transportB := &hotInventoryTestTransport{}
++	// Stock dae legitimately shares a GlobalOption between concrete dialers.
++	d2 := hotInventoryTestDialer(a.Group.Dialers[0].GlobalOption, transportB)
++	b := hotInventoryTestGroup("b", d2)
++	t.Cleanup(func() { _ = b.Close(); _ = d2.Close() })
++	empty := &DialerGroup{Name: "empty"}
++	entries := []HotInventoryEntry{
++		{Handle: 2, Identity: "baseline", Group: a.Group, Borrowed: true},
++		{Handle: 3, Identity: "baseline", Group: b, Borrowed: true},
++		{Handle: 4, Identity: "baseline", Group: empty, Borrowed: true},
++	}
++	h, err := NewHotInventoryAtGeneration(entries, 1, 41)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = h.Close() })
++	if h.Snapshot().Generation != 41 {
++		t.Fatal("restart lost durable generation")
++	}
++	for _, handle := range []uint8{2, 3, 4} {
++		lease, managed, err := h.AcquireManaged(handle)
++		if err != nil || managed || lease != nil || h.IsHot(handle) {
++			t.Fatalf("borrowed acquisition = %v, %v, %v", lease, managed, err)
++		}
++		if _, err := h.Acquire(handle); !errors.Is(err, ErrHotInventoryUnmanaged) {
++			t.Fatal("missing unmanaged error", err)
++		}
++	}
++	if _, err := h.Publish(context.Background(), 41, entries, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryInvalid) {
++		t.Fatal("accepted borrowed publication", err)
++	}
++	// A distinct owned group must not assume ownership of a baseline dialer.
++	alias := hotInventoryTestPrepared(2, "owned", hotInventoryTestGroup("a", a.Group.Dialers[0]))
++	if _, err := h.Publish(context.Background(), 41, []HotInventoryEntry{alias}, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryInvalid) {
++		t.Fatal("accepted borrowed native resource alias", err)
++	}
++	_ = alias.Group.Close()
++	owned, ownedTransport := hotInventoryTestEntry(t, 2, "a", "owned")
++	if _, err := h.Publish(context.Background(), 40, []HotInventoryEntry{owned}, hotInventoryTestCommit); !errors.Is(err, ErrHotInventoryConflict) {
++		t.Fatal(err)
++	}
++	if _, err := h.Publish(context.Background(), 41, []HotInventoryEntry{owned}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	lease, managed, err := h.AcquireManaged(2)
++	if err != nil || !managed || lease.Group != owned.Group || !h.IsHot(2) {
++		t.Fatal("owned override was not acquired", err)
++	}
++	if transportA.closed.Load() != 0 || transportB.closed.Load() != 0 {
++		t.Fatal("publication closed borrowed resources")
++	}
++	_ = h.Close()
++	if transportA.closed.Load() != 0 || transportB.closed.Load() != 0 || ownedTransport.closed.Load() != 0 {
++		t.Fatal("close did not respect ownership and leases")
++	}
++	_ = lease.Release()
++	if ownedTransport.closed.Load() != 1 || transportA.closed.Load() != 0 || transportB.closed.Load() != 0 {
++		t.Fatal("release closed borrowed resources or leaked owned one")
++	}
++}
++
++func TestHotInventoryNamespaceCleanupFollowsLastLeaseAndHoldsRetirementBound(t *testing.T) {
++	a, transport := hotInventoryTestEntry(t, 2, "a", "v1")
++	b, _ := hotInventoryTestEntry(t, 2, "a", "v2")
++	c, _ := hotInventoryTestEntry(t, 2, "a", "v3")
++	h := hotInventoryTestNew(t, 1, a)
++	oldNamespace := a.Group.Dialers[0].TransportCacheNamespace
++	entered, proceed := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	var closedBeforeNamespace atomic.Bool
++	h.cleanupNamespace = func(namespace string) {
++		if namespace == oldNamespace {
++			calls.Add(1)
++			closedBeforeNamespace.Store(transport.closed.Load() == 1)
++			close(entered)
++			<-proceed
++		}
++		dialer.CleanupTransportCacheNamespace(namespace)
++	}
++	lease := hotInventoryTestAcquire(t, h, 2)
++	if _, err := h.Publish(context.Background(), 1, []HotInventoryEntry{b}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++	if calls.Load() != 0 {
++		t.Fatal("namespace cleanup ran while old lease still held")
++	}
++	done := make(chan error, 1)
++	go func() { done <- lease.Release() }()
++	<-entered
++	_, busyErr := h.Publish(context.Background(), 2, []HotInventoryEntry{c}, hotInventoryTestCommit)
++	close(proceed)
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if !errors.Is(busyErr, ErrHotInventoryBusy) {
++		t.Fatal("namespace cleanup escaped retirement bound", busyErr)
++	}
++	if calls.Load() != 1 || !closedBeforeNamespace.Load() {
++		t.Fatal("namespace cleanup did not follow the sole native close")
++	}
++	if _, err := h.Publish(context.Background(), 2, []HotInventoryEntry{c}, hotInventoryTestCommit); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/control/connectivity.go b/control/connectivity.go
+index 284f9b9ae1e7b500ccf40ea9cfe8a302ff3ff2b6..d8347b9274e5c8813895953eb39eb921bd8b51f2 100644
+--- a/control/connectivity.go
++++ b/control/connectivity.go
+@@ -6,6 +6,8 @@
+ package control
+ 
+ import (
++	"errors"
++	"fmt"
+ 	"github.com/cilium/ebpf"
+ 	"github.com/daeuniverse/dae/common/consts"
+ 	"github.com/daeuniverse/dae/component/outbound/dialer"
+@@ -143,7 +145,7 @@ func (c *ControlPlane) resumeOutboundConnectivityUpdates(publish func(uint8, boo
+ 			// Match ordinary callback publication. Random policies and non-IP
+ 			// modes keep kernel admission open for userspace selection/fallback.
+ 			policy := group.GetSelectionPolicy()
+-			publishHealth := c.dialMode == consts.DialMode_Ip &&
++			publishHealth := !c.core.hotOutboundConnectivity[outboundID].Load() && c.dialMode == consts.DialMode_Ip &&
+ 				policy != consts.DialerSelectionPolicy_Random && policy != consts.DialerSelectionPolicy_Fixed
+ 			for _, healthKey := range dialer.StandardHealthKeys() {
+ 				networkType := healthKey.NetworkType()
+@@ -174,10 +176,49 @@ func (c *controlPlaneCore) outboundAliveChangeCallback(outbound uint8, dryrun bo
+ 		if c.retired.Load() || c.outboundConnectivityPaused {
+ 			return
+ 		}
++		if c.hotOutboundConnectivity[outbound].Load() {
++			return
++		}
+ 		c.writeOutboundConnectivityLocked(outbound, alive, networkType)
+ 	}
+ }
+ 
++// publishHotOutboundConnectivity takes availability ownership from the original
++// immutable group after an inventory commit. Manual groups never silently fail
++// over; userspace dials the selected candidate even when its health is unknown.
++func (c *ControlPlane) publishHotOutboundConnectivity(handles []uint8) error {
++	if c == nil || c.core == nil {
++		return nil // Native component fixtures have no kernel plane.
++	}
++	c.core.outboundConnectivityMu.Lock()
++	defer c.core.outboundConnectivityMu.Unlock()
++	bpf := c.core.PeekBpf()
++	if bpf == nil || bpf.OutboundConnectivityMap == nil {
++		return errors.New("hot outbound kernel availability map is unavailable")
++	}
++	for _, handle := range handles {
++		c.core.hotOutboundConnectivity[handle].Store(true)
++		if c.core.retired.Load() || c.core.outboundConnectivityPaused {
++			return errors.New("hot outbound kernel availability owner is retired or paused")
++		}
++		for _, healthKey := range dialer.StandardHealthKeys() {
++			key := outboundConnectivityMapKey(handle, healthKey.NetworkType())
++			value := uint32(1)
++			if err := bpf.OutboundConnectivityMap.Update(key, value, ebpf.UpdateAny); err != nil {
++				return fmt.Errorf("publish hot outbound availability: %w", err)
++			}
++			var observed uint32
++			if err := bpf.OutboundConnectivityMap.Lookup(key, &observed); err != nil {
++				return fmt.Errorf("read hot outbound availability: %w", err)
++			}
++			if observed != value {
++				return errors.New("hot outbound availability readback mismatch")
++			}
++		}
++	}
++	return nil
++}
++
+ func (c *controlPlaneCore) dialerAliveTransitionCallback(d *dialer.Dialer) func(networkType *dialer.NetworkType, alive bool) {
+ 	return func(networkType *dialer.NetworkType, alive bool) {
+ 		if alive || d == nil || networkType == nil || networkType.L4Proto != consts.L4ProtoStr_UDP {
+diff --git a/control/control_plane.go b/control/control_plane.go
+index e420286bbcab1832bc4f0dc8e1e5b05a03badfeb..f8661bbb9240ff911c4925b4cebe3649e67f343b 100644
+--- a/control/control_plane.go
++++ b/control/control_plane.go
+@@ -63,6 +63,8 @@ type ControlPlane struct {
+ 	ownsSessionManager    bool
+ 	sessionManagerBinding atomic.Pointer[controlPlaneSessionManagerBinding]
+ 	egressRuntime         *egressRuntime
++	hotInventory          atomic.Pointer[hotProviderRuntime]
++	hotDialerOption       *dialer.GlobalOption
+ 	drainTracker          *controlPlaneDrainTracker
+ 
+ 	controlPlaneRoutingEpochRuntime
+@@ -841,13 +843,14 @@ func NewControlPlaneWithContextOptions(
+ 	// New control plane.
+ 	cctx, cancel := context.WithCancel(context.Background())
+ 	plane = &ControlPlane{
+-		log:           log,
+-		directDialer:  directDialer,
+-		runtimeStats:  newRuntimeStats(),
+-		core:          core,
+-		deferFuncs:    planeDeferFuncs,
+-		listenIp:      "0.0.0.0",
+-		egressRuntime: egressRuntime,
++		log:             log,
++		directDialer:    directDialer,
++		runtimeStats:    newRuntimeStats(),
++		core:            core,
++		deferFuncs:      planeDeferFuncs,
++		listenIp:        "0.0.0.0",
++		egressRuntime:   egressRuntime,
++		hotDialerOption: option,
+ 		controlPlaneGenerationState: controlPlaneGenerationState{
+ 			outbounds:           outbounds,
+ 			referencedOutbounds: referencedOutbounds,
+@@ -2833,6 +2836,9 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+ ) (*dialArgument, error) {
+ 	now := time.Now()
+ 	snapshotKey, snapshotEnabled := buildDnsDialerSnapshotKeyForSnapshot(snapshot, dnsUpstream)
++	// Hot providers carry concrete leases. Cached dial arguments must never
++	// outlive or bypass those leases; ordinary DNS answer caching is unaffected.
++	snapshotEnabled = snapshotEnabled && c.hotInventory.Load() == nil
+ 	if snapshotEnabled {
+ 		if cachedDialArg, hit := c.loadDnsDialerSnapshot(snapshotKey, now); hit {
+ 			return cachedDialArg, nil
+@@ -2846,6 +2852,15 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+ 		bestCandidate          *dnsDialerCandidate
+ 		bestPenalizedCandidate *dnsDialerCandidate
+ 	)
++	var candidateLeases []*outbound.HotInventoryLease
++	var selectedLease *outbound.HotInventoryLease
++	defer func() {
++		for _, lease := range candidateLeases {
++			if lease != selectedLease {
++				_ = lease.Release()
++			}
++		}
++	}()
+ 	// Get the min latency path.
+ 	networkType := dialer.NetworkType{
+ 		IsDns:           true,
+@@ -2880,9 +2895,11 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+ 			if int(outboundIndex) >= len(c.outbounds) {
+ 				return nil, fmt.Errorf("bad outbound index: %v", outboundIndex)
+ 			}
+-			dialerGroup := c.outbounds[outboundIndex]
+ 			// DNS always dial IP.
+-			d, latency, err := dialerGroup.Select(&networkType, true)
++			d, dialerGroup, latency, lease, err := c.selectDnsOutbound(uint8(outboundIndex), &networkType)
++			if lease != nil {
++				candidateLeases = append(candidateLeases, lease)
++			}
+ 			if err != nil {
+ 				continue
+ 			}
+@@ -2895,6 +2912,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+ 					bestTarget:   netip.AddrPortFrom(dAddr, dnsUpstream.Port),
+ 					mark:         mark,
+ 					mptcp:        c.mptcp,
++					hotLease:     lease,
+ 				},
+ 				latency: latency,
+ 			}
+@@ -2941,6 +2959,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+ 	if snapshotEnabled && !selectedPenalized {
+ 		c.storeDnsDialerSnapshot(snapshotKey, &selected, now)
+ 	}
++	selectedLease = selected.hotLease
+ 	return &selected, nil
+ }
+ 
+@@ -3037,6 +3056,9 @@ func ResetGlobalUdpState() {
+ 
+ func (c *ControlPlane) closeTail() error {
+ 	var errs []error
++	if err := c.closeHotInventory(); err != nil {
++		errs = append(errs, err)
++	}
+ 
+ 	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
+ 		if e := c.deferFuncs[i](); e != nil {
+diff --git a/control/control_plane_core.go b/control/control_plane_core.go
+index 3b66558c0d603e934d77d3ba0599b2b1bf797ef1..41b7f5f80581ad6a3bfa46ef4df4e58faecefee3 100644
+--- a/control/control_plane_core.go
++++ b/control/control_plane_core.go
+@@ -121,6 +121,10 @@ type controlPlaneCore struct {
+ 	// plane is published and is read-only afterwards, so concurrent readers
+ 	// (health callbacks, logging) need no lock.
+ 	outboundId2Name map[uint8]string
++	// Hot manual groups always admit to userspace, where the selected native
++	// dialer enforces success/failure. Retired baseline health must not close
++	// admission for a replacement occupying the same stable kernel slot.
++	hotOutboundConnectivity [256]atomic.Bool
+ 	// tcpSockmapOffloadReady is set once setupTCPRelayOffload attaches the
+ 	// sk_skb stream-verdict program to fast_sock (kernel passes the
+ 	// CVE-2025-38165 gate). tryOffloadTCPRelay consults it per relay.
+diff --git a/control/dial.go b/control/dial.go
+index fa712e27775434d90c578c096191674a5feb2d49..01cc862793027beb2d033add141ad5463d214e60 100644
+--- a/control/dial.go
++++ b/control/dial.go
+@@ -34,6 +34,7 @@ type proxyDialParam struct {
+ }
+ 
+ type proxyDialResult struct {
++	hotLease                *ob.HotInventoryLease
+ 	OutboundIndex           consts.OutboundIndex
+ 	Outbound                *ob.DialerGroup
+ 	Dialer                  *dialer.Dialer
+@@ -183,8 +184,24 @@ func (c *ControlPlane) chooseProxyDialer(p *proxyDialParam) (*proxyDialResult, e
+ 	}
+ 
+ 	strictIpVersion := dialIp
+-	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResult(selectionNetworkType, strictIpVersion, p.Excluded)
+-	if stderrors.Is(err, ob.ErrNoAliveDialer) {
++	lease, hot, err := c.acquireHotOutbound(uint8(outboundIndex))
++	if err != nil {
++		return nil, err
++	}
++	var d *dialer.Dialer
++	var admissionNetworkType *dialer.NetworkType
++	if hot {
++		// Acquire fixes the persisted candidate and pins its group before dial.
++		// Group.Select would use the immutable group's original fixed index.
++		outbound, d = lease.Group, lease.Dialer
++		admissionNetworkType = selectionNetworkType
++		if alt := alternateNetworkType(selectionNetworkType); !d.MustGetAlive(selectionNetworkType) && alt != nil && d.MustGetAlive(alt) {
++			admissionNetworkType = alt
++		}
++	} else {
++		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResult(selectionNetworkType, strictIpVersion, p.Excluded)
++	}
++	if !hot && stderrors.Is(err, ob.ErrNoAliveDialer) {
+ 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
+ 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
+ 		altType := alternateNetworkType(selectionNetworkType)
+@@ -195,6 +212,7 @@ func (c *ControlPlane) chooseProxyDialer(p *proxyDialParam) (*proxyDialResult, e
+ 	}
+ 
+ 	if err != nil {
++		_ = lease.Release()
+ 		return &proxyDialResult{
+ 				OutboundIndex:           outboundIndex,
+ 				Outbound:                outbound,
+@@ -217,6 +235,7 @@ func (c *ControlPlane) chooseProxyDialer(p *proxyDialParam) (*proxyDialResult, e
+ 	selectionNetworkType = endpointNetworkTypeForSelection(selectionNetworkType, admissionNetworkType)
+ 
+ 	return &proxyDialResult{
++		hotLease:      lease,
+ 		OutboundIndex: outboundIndex,
+ 		Outbound:      outbound,
+ 		Dialer:        d,
+@@ -251,13 +270,19 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
+ 			return nil, res, err
+ 		}
+ 		lastRes = res
++		defer func() { _ = res.hotLease.Release() }()
+ 
+ 		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+ 		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
+ 		cancel()
+ 		if err == nil {
++			conn = retainHotConnection(conn, res.hotLease)
++			res.hotLease = nil // The returned connection now owns this lease.
+ 			return conn, res, nil
+ 		}
++		if conn != nil {
++			_ = conn.Close()
++		}
+ 		lastErr = err
+ 		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
+ 			l4proto := consts.L4ProtoStr(p.Network)
+@@ -265,6 +290,8 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
+ 				l4proto = res.SelectionNetworkTypeObj.L4Proto
+ 			}
+ 			notifyProxyDialerHealthCheck(res.Dialer, l4proto, err)
++			_ = res.hotLease.Release()
++			res.hotLease = nil
+ 			return nil, res, err
+ 		}
+ 		if res.SelectionNetworkTypeObj != nil {
+@@ -273,6 +300,8 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
+ 				fmt.Errorf("proxy dial failed: %w", err),
+ 			)
+ 		}
++		_ = res.hotLease.Release()
++		res.hotLease = nil
+ 	}
+ 	return nil, lastRes, lastErr
+ }
+diff --git a/control/dns_controller_forwarder.go b/control/dns_controller_forwarder.go
+index ce74a8493e5185d3e2570b8b84f7122a1b119341..6930930bfbd9cc01df114ee1d5f9ec9892151203 100644
+--- a/control/dns_controller_forwarder.go
++++ b/control/dns_controller_forwarder.go
+@@ -32,6 +32,9 @@ type dialArgument struct {
+ 	bestTarget   netip.AddrPort
+ 	mark         uint32
+ 	mptcp        bool
++	// hotLease pins the exact native group until this exchange's forwarder has
++	// closed. Such arguments are never stored in pointer-bearing DNS caches.
++	hotLease *outbound.HotInventoryLease
+ }
+ 
+ type dnsForwarderKey struct {
+@@ -369,6 +372,9 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg
+ 
+ func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (*dnsmessage.Msg, error) {
+ 	c.requireStore()
++	if dialArg != nil && dialArg.hotLease != nil {
++		return c.forwardHotDNS(ctx, upstream, dialArg, data)
++	}
+ 	key := newDnsForwarderKey(upstream, dialArg)
+ 	for range 2 {
+ 		entry, err := c.getOrCreateDnsForwarder(upstream, dialArg)
+diff --git a/control/dns_controller_handle.go b/control/dns_controller_handle.go
+index 3dbe0ebc475a3de5f97a11aa0b82bb86d73195fe..6865f7672441294c70af9a888dd6a07d6b9a284a 100644
+--- a/control/dns_controller_handle.go
++++ b/control/dns_controller_handle.go
+@@ -123,6 +123,9 @@ func (c *DnsController) forwardWithFallback(
+ 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %w", primaryErr, chooseErr)
+ 	}
+ 	if fallbackDialArg == nil || fallbackDialArg.l4proto != consts.L4ProtoStr_TCP {
++		if fallbackDialArg != nil && fallbackDialArg.hotLease != nil {
++			_ = fallbackDialArg.hotLease.Release()
++		}
+ 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select returned invalid network", primaryErr)
+ 	}
+ 
+diff --git a/control/hot_connection.go b/control/hot_connection.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8d305305a684cbffb047c1fd2663c0100c58c49
+--- /dev/null
++++ b/control/hot_connection.go
+@@ -0,0 +1,106 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"errors"
++	"net"
++	"net/netip"
++	"sync"
++
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/outbound/netproxy"
++)
++
++// hotOwnedConn keeps the exact inventory decision alive from before DialContext
++// until the returned connection closes. The private marker prevents the session
++// manager from also claiming this dialer through the baseline egress runtime.
++type hotOwnedConn struct {
++	netproxy.Conn
++	lease *outbound.HotInventoryLease
++	once  sync.Once
++	err   error
++}
++
++func (c *hotOwnedConn) ownsHotEgress() {}
++
++func (c *hotOwnedConn) Close() error {
++	c.once.Do(func() {
++		defer func() { c.err = errors.Join(c.err, c.lease.Release()) }()
++		c.err = c.Conn.Close()
++	})
++	return c.err
++}
++
++func (c *hotOwnedConn) CloseWrite() error            { return netproxy.ForwardCloseWrite(c.Conn) }
++func (c *hotOwnedConn) IntrinsicConn() netproxy.Conn { return c.Conn }
++func (c *hotOwnedConn) UnderlyingConn() net.Conn {
++	if conn, ok := c.Conn.(net.Conn); ok {
++		return conn
++	}
++	if provider, ok := c.Conn.(netproxy.UnderlyingConnProvider); ok {
++		return provider.UnderlyingConn()
++	}
++	return nil
++}
++func (c *hotOwnedConn) WriteDeadlineClosesSession() bool {
++	return netproxy.WriteDeadlineClosesSession(c.Conn)
++}
++
++type hotOwnedPacketConn struct {
++	*hotOwnedConn
++	packet netproxy.PacketConn
++}
++
++func (c *hotOwnedPacketConn) ReadFrom(b []byte) (int, netip.AddrPort, error) {
++	return c.packet.ReadFrom(b)
++}
++func (c *hotOwnedPacketConn) WriteTo(b []byte, addr string) (int, error) {
++	return c.packet.WriteTo(b, addr)
++}
++func (c *hotOwnedPacketConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
++	if receiver, ok := c.packet.(netproxy.PacketReceiver); ok {
++		return receiver.RegisterPacketReceiver(handler)
++	}
++	return nil, false
++}
++func (c *hotOwnedPacketConn) TransportDone() <-chan struct{} {
++	if lifecycle, ok := c.packet.(netproxy.TransportLifecycle); ok {
++		return lifecycle.TransportDone()
++	}
++	return nil
++}
++
++// Advertise batch writes only when the real packet connection supports them;
++// endpoint accounting chooses different paths based on this capability.
++type hotOwnedBatchPacketConn struct {
++	*hotOwnedPacketConn
++	batch netproxy.PacketBatchWriter
++}
++
++func (c *hotOwnedBatchPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
++	return c.batch.WriteBatch(items)
++}
++
++func retainHotConnection(conn netproxy.Conn, lease *outbound.HotInventoryLease) netproxy.Conn {
++	if lease == nil {
++		return conn
++	}
++	owned := &hotOwnedConn{Conn: conn, lease: lease}
++	if packet, ok := conn.(netproxy.PacketConn); ok {
++		wrapped := &hotOwnedPacketConn{hotOwnedConn: owned, packet: packet}
++		if batch, ok := packet.(netproxy.PacketBatchWriter); ok {
++			return &hotOwnedBatchPacketConn{hotOwnedPacketConn: wrapped, batch: batch}
++		}
++		return wrapped
++	}
++	return owned
++}
++
++func connectionOwnsHotEgress(conn netproxy.Conn) bool {
++	_, ok := conn.(interface{ ownsHotEgress() })
++	return ok
++}
+diff --git a/control/hot_connection_test.go b/control/hot_connection_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..08281223fd0040f371e1e586e98ac45ac317c031
+--- /dev/null
++++ b/control/hot_connection_test.go
+@@ -0,0 +1,367 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	"github.com/daeuniverse/outbound/netproxy"
++	"golang.org/x/sys/unix"
++)
++
++type hotConnectionTransport struct {
++	dial   func(context.Context) (netproxy.Conn, error)
++	closed atomic.Int32
++}
++
++func (d *hotConnectionTransport) DialContext(ctx context.Context, _, _ string) (netproxy.Conn, error) {
++	if d.closed.Load() != 0 {
++		return nil, net.ErrClosed
++	}
++	if d.dial != nil {
++		return d.dial(ctx)
++	}
++	return nil, io.EOF
++}
++func (d *hotConnectionTransport) Close() error { d.closed.Add(1); return nil }
++
++var hotConnectionNamespace atomic.Uint64
++
++func hotConnectionEntry(t *testing.T, revision string, transport *hotConnectionTransport) outbound.HotInventoryEntry {
++	t.Helper()
++	option := &dialer.GlobalOption{Log: discardLogger(), CheckInterval: time.Hour, TransportCacheNamespace: fmt.Sprintf("hot-connection-%d", hotConnectionNamespace.Add(1))}
++	d := dialer.NewDialerContext(context.Background(), transport, option, dialer.InstanceOption{DisableCheck: true}, &dialer.Property{})
++	group := outbound.NewDialerGroup(option, "hot-test", []*dialer.Dialer{d}, []*dialer.Annotation{{}}, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++	t.Cleanup(func() { _ = group.Close(); _ = d.Close() })
++	return outbound.HotInventoryEntry{Handle: uint8(consts.OutboundUserDefinedMin), Identity: revision, Group: group, Candidates: []outbound.HotInventoryCandidate{{ID: "node", Dialer: d}}, Selection: "node"}
++}
++
++func hotConnectionPlane(t *testing.T, entry outbound.HotInventoryEntry) (*ControlPlane, *outbound.HotInventory) {
++	t.Helper()
++	h, err := outbound.NewHotInventory([]outbound.HotInventoryEntry{entry}, 4)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = h.Close() })
++	baseline := newTestEndpointDialer()
++	baselineGroup := newTestFixedOutboundGroup(baseline)
++	cp := newTestDialControlPlane(baselineGroup)
++	cp.log = discardLogger()
++	cp.hotInventory.Store(&hotProviderRuntime{inventory: h})
++	cp.egressRuntime = newEgressRuntime(cp.log, nil)
++	cp.egressRuntime.configureResources([]*outbound.DialerGroup{baselineGroup}, []*dialer.Dialer{baseline}, nil)
++	t.Cleanup(func() { _ = cp.egressRuntime.releaseOwner() })
++	return cp, h
++}
++
++func hotConnectionParam(network string) *proxyDialParam {
++	return &proxyDialParam{Outbound: consts.OutboundUserDefinedMin, Src: netip.MustParseAddrPort("192.0.2.10:40000"), Dest: netip.MustParseAddrPort("198.51.100.20:443"), Network: network}
++}
++
++func hotConnectionPublish(t *testing.T, h *outbound.HotInventory, entry outbound.HotInventoryEntry) {
++	t.Helper()
++	_, err := h.Publish(context.Background(), h.Snapshot().Generation, []outbound.HotInventoryEntry{entry}, func(context.Context, outbound.HotInventorySnapshot) error { return nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestHotTCPAdmissionRetainsDialAndSessionAcrossPublication(t *testing.T) {
++	started, resume := make(chan struct{}), make(chan struct{})
++	left, right := net.Pipe()
++	t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
++	old := &hotConnectionTransport{dial: func(ctx context.Context) (netproxy.Conn, error) {
++		close(started)
++		select {
++		case <-resume:
++			return left, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}}
++	entry := hotConnectionEntry(t, "old", old)
++	cp, h := hotConnectionPlane(t, entry)
++	type result struct {
++		conn netproxy.Conn
++		res  *proxyDialResult
++		err  error
++	}
++	finished := make(chan result, 1)
++	go func() {
++		conn, res, err := cp.routeDial(context.Background(), hotConnectionParam("tcp"))
++		finished <- result{conn, res, err}
++	}()
++	waitForCloseSignal(t, started, "hot TCP dial admission")
++	hotConnectionPublish(t, h, hotConnectionEntry(t, "new", &hotConnectionTransport{}))
++	if old.closed.Load() != 0 {
++		t.Fatal("publication closed dialer while DialContext was pending")
++	}
++	close(resume)
++	got := <-finished
++	if got.err != nil {
++		t.Fatal(got.err)
++	}
++	t.Cleanup(func() { _ = got.conn.Close() })
++	manager := NewSessionManager(context.Background())
++	t.Cleanup(func() { _ = manager.Close() })
++	ingress, peer := net.Pipe()
++	t.Cleanup(func() { _ = ingress.Close(); _ = peer.Close() })
++	flow, err := manager.adoptTCP(ingress, got.conn, newTcpFlowBinding(1, got.res), cp.egressRuntime, nil)
++	if err != nil {
++		t.Fatalf("adopt hot TCP against baseline runtime: %v", err)
++	}
++	if flow.egressLease != nil {
++		t.Fatal("baseline runtime took ownership of hot dialer")
++	}
++	if flow.binding.Egress.Outbound == entry.Group {
++		t.Fatal("session retained full mutable selection group")
++	}
++	writeDone := make(chan error, 1)
++	go func() { _, err := right.Write([]byte("alive")); writeDone <- err }()
++	_ = got.conn.SetReadDeadline(time.Now().Add(time.Second))
++	payload := make([]byte, 5)
++	if _, err := io.ReadFull(got.conn, payload); err != nil || string(payload) != "alive" {
++		t.Fatalf("retained TCP payload %q: %v", payload, err)
++	}
++	if err := <-writeDone; err != nil {
++		t.Fatal(err)
++	}
++	closeEstablishedTCPFlow(got.conn, flow)
++	_ = got.conn.Close()
++	if old.closed.Load() != 1 {
++		t.Fatalf("native transport close count = %d", old.closed.Load())
++	}
++}
++
++func TestHotTCPDialFailureAndRetryReleaseOldSelection(t *testing.T) {
++	for _, dialErr := range []error{io.EOF, unix.ENETUNREACH} {
++		t.Run(dialErr.Error(), func(t *testing.T) {
++			old := &hotConnectionTransport{}
++			entry := hotConnectionEntry(t, "old", old)
++			cp, h := hotConnectionPlane(t, entry)
++			replacement := &hotConnectionTransport{}
++			left, right := net.Pipe()
++			t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
++			replacement.dial = func(context.Context) (netproxy.Conn, error) { return left, nil }
++			next := hotConnectionEntry(t, "new", replacement)
++			old.dial = func(context.Context) (netproxy.Conn, error) { hotConnectionPublish(t, h, next); return nil, dialErr }
++			conn, _, err := cp.routeDial(context.Background(), hotConnectionParam("tcp"))
++			if errors.Is(dialErr, unix.ENETUNREACH) {
++				if err != nil {
++					t.Fatal(err)
++				}
++				_ = conn.Close()
++			} else if !errors.Is(err, dialErr) {
++				t.Fatalf("dial error = %v", err)
++			}
++			if old.closed.Load() != 1 {
++				t.Fatalf("failed dial retained old inventory, closes=%d", old.closed.Load())
++			}
++		})
++	}
++}
++
++func TestHotUDPAdmissionRetainsEndpointAcrossPublication(t *testing.T) {
++	started, resume := make(chan struct{}), make(chan struct{})
++	packet := &scriptedPacketConn{reads: make(chan scriptedPacketRead), closeCh: make(chan struct{})}
++	old := &hotConnectionTransport{dial: func(ctx context.Context) (netproxy.Conn, error) {
++		close(started)
++		select {
++		case <-resume:
++			return packet, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}}
++	cp, h := hotConnectionPlane(t, hotConnectionEntry(t, "old", old))
++	pool := NewUdpEndpointPool()
++	t.Cleanup(pool.Close)
++	manager := NewSessionManager(context.Background())
++	t.Cleanup(func() { _ = manager.Close() })
++	key := UdpEndpointKey{Src: hotConnectionParam("udp").Src}
++	type result struct {
++		endpoint *UdpEndpoint
++		err      error
++	}
++	finished := make(chan result, 1)
++	go func() {
++		endpoint, _, err := pool.GetOrCreate(key, &UdpEndpointOptions{
++			Ctx: context.Background(), NatTimeout: time.Hour, Log: discardLogger(), Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil }, sessionManager: manager, egressRuntime: cp.egressRuntime,
++			GetDialOption: func(context.Context) (*DialOption, error) {
++				res, err := cp.chooseProxyDialer(hotConnectionParam("udp"))
++				if err != nil {
++					return nil, err
++				}
++				return &DialOption{hotLease: res.hotLease, Dialer: res.Dialer, Outbound: res.Outbound, Target: res.DialTarget, Network: res.Network, NetworkType: res.SelectionNetworkTypeObj}, nil
++			},
++		})
++		finished <- result{endpoint, err}
++	}()
++	waitForCloseSignal(t, started, "hot UDP dial admission")
++	hotConnectionPublish(t, h, hotConnectionEntry(t, "new", &hotConnectionTransport{}))
++	if old.closed.Load() != 0 {
++		t.Fatal("publication closed pending UDP dialer")
++	}
++	close(resume)
++	got := <-finished
++	if got.err != nil {
++		t.Fatal(got.err)
++	}
++	if got.endpoint.sessionRuntime == nil || got.endpoint.sessionRuntime.egressLease != nil {
++		t.Fatal("hot UDP did not use connection-owned inventory")
++	}
++	if _, err := got.endpoint.WriteTo([]byte("alive"), "198.51.100.20:443"); err != nil {
++		t.Fatal(err)
++	}
++	if old.closed.Load() != 0 {
++		t.Fatal("retired inventory closed live endpoint")
++	}
++	_ = got.endpoint.Close()
++	_ = got.endpoint.Close()
++	if old.closed.Load() != 1 || packet.closeCalls.Load() != 1 {
++		t.Fatalf("close counts transport=%d packet=%d", old.closed.Load(), packet.closeCalls.Load())
++	}
++}
++
++func TestHotUDPDialFailureRetryAndAdoptionFailureReleaseLeases(t *testing.T) {
++	for _, scenario := range []string{"dial failure", "retry", "unsupported UDP", "manager closed"} {
++		t.Run(scenario, func(t *testing.T) {
++			old := &hotConnectionTransport{}
++			cp, h := hotConnectionPlane(t, hotConnectionEntry(t, "old", old))
++			packet := &scriptedPacketConn{reads: make(chan scriptedPacketRead), closeCh: make(chan struct{})}
++			left, right := net.Pipe()
++			t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
++			next := hotConnectionEntry(t, "new", &hotConnectionTransport{dial: func(context.Context) (netproxy.Conn, error) { return packet, nil }})
++			old.dial = func(context.Context) (netproxy.Conn, error) {
++				hotConnectionPublish(t, h, next)
++				switch scenario {
++				case "retry":
++					return nil, unix.ENETUNREACH
++				case "unsupported UDP":
++					return left, nil
++				case "manager closed":
++					return packet, nil
++				default:
++					return nil, io.EOF
++				}
++			}
++			pool := NewUdpEndpointPool()
++			t.Cleanup(pool.Close)
++			manager := NewSessionManager(context.Background())
++			t.Cleanup(func() { _ = manager.Close() })
++			if scenario == "manager closed" {
++				_ = manager.Close()
++			}
++			endpoint, _, err := pool.GetOrCreate(UdpEndpointKey{Src: hotConnectionParam("udp").Src}, &UdpEndpointOptions{
++				Ctx: context.Background(), NatTimeout: time.Hour, Log: discardLogger(), Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil }, sessionManager: manager, egressRuntime: cp.egressRuntime,
++				GetDialOption: func(context.Context) (*DialOption, error) {
++					res, err := cp.chooseProxyDialer(hotConnectionParam("udp"))
++					if err != nil {
++						return nil, err
++					}
++					return &DialOption{hotLease: res.hotLease, Dialer: res.Dialer, Outbound: res.Outbound, Target: res.DialTarget, Network: res.Network, NetworkType: res.SelectionNetworkTypeObj}, nil
++				},
++			})
++			if scenario == "retry" {
++				if err != nil {
++					t.Fatal(err)
++				}
++				_ = endpoint.Close()
++			} else if err == nil {
++				t.Fatal("expected endpoint creation failure")
++			}
++			if old.closed.Load() != 1 {
++				t.Fatalf("old inventory lease leaked, closes=%d", old.closed.Load())
++			}
++			if scenario == "manager closed" && packet.closeCalls.Load() != 1 {
++				t.Fatalf("rejected packet conn closes=%d", packet.closeCalls.Load())
++			}
++		})
++	}
++}
++
++type hotCapabilityPacketConn struct {
++	*scriptedPacketConn
++	done       chan struct{}
++	batchItems []netproxy.BatchItem
++	receiver   netproxy.PacketReceiveHandler
++}
++
++func (c *hotCapabilityPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
++	c.batchItems = items
++	return 1, io.ErrShortWrite
++}
++func (c *hotCapabilityPacketConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
++	c.receiver = handler
++	return func() { c.receiver = nil }, true
++}
++func (c *hotCapabilityPacketConn) TransportDone() <-chan struct{}   { return c.done }
++func (c *hotCapabilityPacketConn) WriteDeadlineClosesSession() bool { return true }
++
++func TestHotPacketWrapperPreservesNativeCapabilities(t *testing.T) {
++	for _, batch := range []bool{false, true} {
++		t.Run(fmt.Sprint(batch), func(t *testing.T) {
++			base := &scriptedPacketConn{reads: make(chan scriptedPacketRead), closeCh: make(chan struct{})}
++			var native netproxy.Conn = base
++			capable := &hotCapabilityPacketConn{scriptedPacketConn: base, done: make(chan struct{})}
++			if batch {
++				native = capable
++			}
++			_, h := hotConnectionPlane(t, hotConnectionEntry(t, "old", &hotConnectionTransport{}))
++			lease, err := h.Acquire(uint8(consts.OutboundUserDefinedMin))
++			if err != nil {
++				t.Fatal(err)
++			}
++			wrapped := retainHotConnection(native, lease)
++			defer wrapped.Close()
++			writer, hasBatch := wrapped.(netproxy.PacketBatchWriter)
++			if hasBatch != batch {
++				t.Fatalf("batch capability = %v", hasBatch)
++			}
++			if batch {
++				items := []netproxy.BatchItem{{Data: []byte("first"), Addr: "192.0.2.1:53"}, {Data: []byte("second"), Addr: "192.0.2.2:53"}}
++				if n, err := writer.WriteBatch(items); n != 1 || !errors.Is(err, io.ErrShortWrite) {
++					t.Fatalf("native partial result lost: %d %v", n, err)
++				}
++				if &capable.batchItems[0] != &items[0] {
++					t.Fatal("batch data changed")
++				}
++				if !netproxy.WriteDeadlineClosesSession(wrapped) {
++					t.Fatal("lost destructive deadline marker")
++				}
++				if wrapped.(netproxy.TransportLifecycle).TransportDone() != capable.done {
++					t.Fatal("lost transport lifecycle")
++				}
++				stop, ok := wrapped.(netproxy.PacketReceiver).RegisterPacketReceiver(func(*netproxy.ReceivedPacket) bool { return true })
++				if !ok || capable.receiver == nil {
++					t.Fatal("lost packet receiver")
++				}
++				stop()
++				if capable.receiver != nil {
++					t.Fatal("receiver unregister not forwarded")
++				}
++			} else {
++				if netproxy.WriteDeadlineClosesSession(wrapped) {
++					t.Fatal("invented destructive deadline marker")
++				}
++				if _, ok := wrapped.(netproxy.PacketReceiver).RegisterPacketReceiver(nil); ok {
++					t.Fatal("invented receiver")
++				}
++			}
++		})
++	}
++}
+diff --git a/control/hot_dns.go b/control/hot_dns.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..92daeb30dd91fa32f3d90e2e470769776a4ecda4
+--- /dev/null
++++ b/control/hot_dns.go
+@@ -0,0 +1,63 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/daeuniverse/dae/component/dns"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	dnsmessage "github.com/miekg/dns"
++)
++
++// selectDnsOutbound pins hot groups before inspecting their native dialers.
++// The lease's persisted selection is authoritative; Group.Select would use the
++// original fixed index and could silently undo a later manual selection.
++func (c *ControlPlane) selectDnsOutbound(handle uint8, networkType *dialer.NetworkType) (*dialer.Dialer, *outbound.DialerGroup, time.Duration, *outbound.HotInventoryLease, error) {
++	lease, hot, err := c.acquireHotOutbound(handle)
++	if err != nil {
++		return nil, nil, 0, nil, err
++	}
++	if hot {
++		return lease.Dialer, lease.Group, 0, lease, nil
++	}
++	if int(handle) >= len(c.outbounds) || c.outbounds[handle] == nil {
++		return nil, nil, 0, nil, fmt.Errorf("bad outbound index: %v", handle)
++	}
++	group := c.outbounds[handle]
++	d, latency, err := group.Select(networkType, true)
++	return d, group, latency, nil, err
++}
++
++// forwardHotDNS uses an exchange-owned forwarder. DNS answer caching remains
++// available, but transport pooling across hot exchanges is intentionally
++// disabled: names are not native resource identities and retaining a forwarder
++// after releasing its group lease would permit use-after-retirement. Close the
++// forwarder before releasing the lease, including cancellation and failures.
++func (c *DnsController) forwardHotDNS(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (*dnsmessage.Msg, error) {
++	defer dialArg.hotLease.Release()
++	if c.dnsForwardersClosed.Load() {
++		return nil, ErrDnsForwardersClosed
++	}
++	forwarder, err := dnsForwarderFactory(upstream, *dialArg, c.log)
++	if err != nil {
++		return nil, err
++	}
++	defer forwarder.Close()
++	if c.dnsForwardersClosed.Load() {
++		return nil, ErrDnsForwardersClosed
++	}
++	response, err := forwarder.ForwardDNS(ctx, data)
++	if err != nil && !errors.Is(err, ErrDNSTruncated) {
++		c.logDnsForwardFailure(upstream, dialArg, err)
++		c.reportDnsForwardFailure(dialArg, err)
++	}
++	return response, err
++}
+diff --git a/control/hot_dns_test.go b/control/hot_dns_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb3cd218e330a929246d22db2db1adf9242cefd0
+--- /dev/null
++++ b/control/hot_dns_test.go
+@@ -0,0 +1,288 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/daeuniverse/dae/common/consts"
++	componentdns "github.com/daeuniverse/dae/component/dns"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	"github.com/daeuniverse/outbound/netproxy"
++	dnsmessage "github.com/miekg/dns"
++	"github.com/sirupsen/logrus"
++)
++
++// Exercise the native TCP DNS forwarder, including framing and connection pool
++// teardown. Only the final transport is a pipe to a deterministic DNS server.
++type hotDNSTestConn struct {
++	net.Conn
++	closed atomic.Bool
++}
++
++func (c *hotDNSTestConn) Close() error {
++	c.closed.Store(true)
++	return c.Conn.Close()
++}
++
++type hotDNSTestTransport struct {
++	answer      net.IP
++	entered     chan struct{}
++	proceed     <-chan struct{}
++	dialErr     error
++	mu          sync.Mutex
++	conns       []*hotDNSTestConn
++	closed      atomic.Int32
++	openAtClose atomic.Int32
++	dials       atomic.Int32
++}
++
++func (d *hotDNSTestTransport) DialContext(ctx context.Context, _, _ string) (netproxy.Conn, error) {
++	d.dials.Add(1)
++	if d.dialErr != nil {
++		return nil, d.dialErr
++	}
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.closed.Load() != 0 {
++		return nil, net.ErrClosed
++	}
++	client, server := net.Pipe()
++	conn := &hotDNSTestConn{Conn: client}
++	d.conns = append(d.conns, conn)
++	go func() {
++		defer server.Close()
++		for {
++			var size [2]byte
++			if _, err := io.ReadFull(server, size[:]); err != nil {
++				return
++			}
++			wire := make([]byte, binary.BigEndian.Uint16(size[:]))
++			if _, err := io.ReadFull(server, wire); err != nil {
++				return
++			}
++			var query dnsmessage.Msg
++			if err := query.Unpack(wire); err != nil || len(query.Question) == 0 {
++				return
++			}
++			if d.entered != nil {
++				select {
++				case d.entered <- struct{}{}:
++				default:
++				}
++			}
++			if d.proceed != nil {
++				select {
++				case <-d.proceed:
++				case <-ctx.Done():
++					return
++				}
++			}
++			response := new(dnsmessage.Msg)
++			response.SetReply(&query)
++			response.Answer = []dnsmessage.RR{&dnsmessage.A{
++				Hdr: dnsmessage.RR_Header{Name: query.Question[0].Name, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
++				A:   d.answer,
++			}}
++			wire, err := response.Pack()
++			if err != nil {
++				return
++			}
++			binary.BigEndian.PutUint16(size[:], uint16(len(wire)))
++			if _, err := server.Write(append(size[:], wire...)); err != nil {
++				return
++			}
++		}
++	}()
++	return conn, nil
++}
++
++func (d *hotDNSTestTransport) Close() error {
++	d.closed.Add(1)
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	for _, conn := range d.conns {
++		if !conn.closed.Load() {
++			d.openAtClose.Add(1)
++		}
++		_ = conn.Close()
++	}
++	return nil
++}
++
++var hotDNSTestNamespace atomic.Uint64
++
++func hotDNSTestEntry(t *testing.T, identity, answer string) (outbound.HotInventoryEntry, *hotDNSTestTransport) {
++	t.Helper()
++	transport := &hotDNSTestTransport{answer: net.ParseIP(answer)}
++	log := logrus.New()
++	log.SetOutput(io.Discard)
++	option := &dialer.GlobalOption{Log: log, CheckInterval: time.Hour,
++		TransportCacheNamespace: fmt.Sprintf("hot-dns-test-%d", hotDNSTestNamespace.Add(1))}
++	property := &dialer.Property{}
++	property.Name = "same-dialer"
++	d := dialer.NewDialerContext(context.Background(), transport, option,
++		dialer.InstanceOption{DisableCheck: true}, property)
++	group := outbound.NewDialerGroup(option, "same-group", []*dialer.Dialer{d}, []*dialer.Annotation{{}},
++		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++	t.Cleanup(func() { _ = group.Close(); _ = d.Close() })
++	return outbound.HotInventoryEntry{Handle: 2, Identity: identity, Group: group,
++		Candidates: []outbound.HotInventoryCandidate{{ID: "node", Dialer: d}}, Selection: "node"}, transport
++}
++
++func hotDNSTestInventory(t *testing.T, entry outbound.HotInventoryEntry) *outbound.HotInventory {
++	t.Helper()
++	h, err := outbound.NewHotInventory([]outbound.HotInventoryEntry{entry}, 4)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = h.Close() })
++	return h
++}
++
++func hotDNSTestArgument(t *testing.T, inventory *outbound.HotInventory) *dialArgument {
++	t.Helper()
++	lease, err := inventory.Acquire(2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = lease.Release() })
++	return &dialArgument{l4proto: consts.L4ProtoStr_TCP, ipversion: consts.IpVersionStr_4,
++		bestDialer: lease.Dialer, bestOutbound: lease.Group,
++		bestTarget: netip.MustParseAddrPort("192.0.2.53:53"), hotLease: lease}
++}
++
++func hotDNSTestPublish(t *testing.T, inventory *outbound.HotInventory, entry outbound.HotInventoryEntry) {
++	t.Helper()
++	_, err := inventory.Publish(context.Background(), inventory.Snapshot().Generation, []outbound.HotInventoryEntry{entry},
++		func(context.Context, outbound.HotInventorySnapshot) error { return nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func hotDNSTestController() *DnsController {
++	c := newTestDnsController()
++	c.log = logrus.New()
++	c.log.SetOutput(io.Discard)
++	return c
++}
++
++func hotDNSTestQuery(t *testing.T) (*componentdns.Upstream, []byte) {
++	t.Helper()
++	query := new(dnsmessage.Msg)
++	query.SetQuestion("hot-dns.example.", dnsmessage.TypeA)
++	wire, err := query.Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &componentdns.Upstream{Scheme: componentdns.UpstreamScheme_TCP, Hostname: "192.0.2.53", Port: 53}, wire
++}
++
++func TestHotDNSReplacementUsesNativeTransportAndRetainsRunningExchange(t *testing.T) {
++	old, oldTransport := hotDNSTestEntry(t, "old", "198.51.100.1")
++	inventory := hotDNSTestInventory(t, old)
++	c := hotDNSTestController()
++	upstream, query := hotDNSTestQuery(t)
++	oldArg := hotDNSTestArgument(t, inventory)
++	proceed := make(chan struct{})
++	oldTransport.proceed = proceed
++	oldTransport.entered = make(chan struct{}, 1)
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	type result struct {
++		msg *dnsmessage.Msg
++		err error
++	}
++	done := make(chan result, 1)
++	go func() { msg, err := c.forwardWithDialArg(ctx, upstream, oldArg, query); done <- result{msg, err} }()
++	select {
++	case <-oldTransport.entered:
++	case <-ctx.Done():
++		t.Fatal("native DNS exchange did not start")
++	}
++
++	next, nextTransport := hotDNSTestEntry(t, "new", "198.51.100.2")
++	hotDNSTestPublish(t, inventory, next)
++	if oldTransport.closed.Load() != 0 {
++		t.Fatal("publication closed a running DNS exchange")
++	}
++	nextArg := hotDNSTestArgument(t, inventory)
++	if newDnsForwarderKey(upstream, oldArg) != newDnsForwarderKey(upstream, nextArg) {
++		t.Fatal("fixture must collide in the ordinary name-based forwarder cache")
++	}
++	response, err := c.forwardWithDialArg(ctx, upstream, nextArg, query)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := response.Answer[0].(*dnsmessage.A).A.String(); got != "198.51.100.2" {
++		t.Fatalf("next exchange used old native transport: %s", got)
++	}
++	close(proceed)
++	select {
++	case result := <-done:
++		if result.err != nil {
++			t.Fatal(result.err)
++		}
++		if got := result.msg.Answer[0].(*dnsmessage.A).A.String(); got != "198.51.100.1" {
++			t.Fatalf("held exchange changed native transport: %s", got)
++		}
++	case <-ctx.Done():
++		t.Fatal("held native DNS exchange did not finish")
++	}
++	if oldTransport.closed.Load() != 1 || oldTransport.openAtClose.Load() != 0 {
++		t.Fatalf("retirement close count=%d, forwarder connections still open=%d", oldTransport.closed.Load(), oldTransport.openAtClose.Load())
++	}
++	if nextTransport.dials.Load() != 1 {
++		t.Fatal("replacement native transport was not dialed")
++	}
++	c.dnsForwarderCache.Range(func(_, _ any) bool { t.Error("hot forwarder escaped into name-based cache"); return true })
++}
++
++func TestHotDNSFailuresReleaseRetiredNativeGroup(t *testing.T) {
++	for _, failure := range []string{"construction", "dial", "controller_closed", "cancel"} {
++		t.Run(failure, func(t *testing.T) {
++			old, transport := hotDNSTestEntry(t, "old", "198.51.100.1")
++			inventory := hotDNSTestInventory(t, old)
++			arg := hotDNSTestArgument(t, inventory)
++			c := hotDNSTestController()
++			upstream, query := hotDNSTestQuery(t)
++			next, _ := hotDNSTestEntry(t, "next", "198.51.100.2")
++			hotDNSTestPublish(t, inventory, next)
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			switch failure {
++			case "construction":
++				upstream.Scheme = componentdns.UpstreamScheme_UDP
++			case "dial":
++				transport.dialErr = errors.New("fixture dial failure")
++			case "controller_closed":
++				c.dnsForwardersClosed.Store(true)
++			case "cancel":
++				transport.proceed = make(chan struct{})
++				cancel()
++			}
++			if _, err := c.forwardWithDialArg(ctx, upstream, arg, query); err == nil {
++				t.Fatal("expected DNS failure")
++			}
++			if transport.closed.Load() != 1 || transport.openAtClose.Load() != 0 {
++				t.Fatalf("failure leaked lease or closed transport before forwarder: closed=%d open=%d", transport.closed.Load(), transport.openAtClose.Load())
++			}
++			c.dnsForwarderCache.Range(func(_, _ any) bool { t.Error("failed hot forwarder escaped into cache"); return true })
++		})
++	}
++}
+diff --git a/control/hot_inventory.go b/control/hot_inventory.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..14ec515f2c8163cff1038865ed9217a03f91a32b
+--- /dev/null
++++ b/control/hot_inventory.go
+@@ -0,0 +1,855 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"bytes"
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	"golang.org/x/sys/unix"
++)
++
++const (
++	hotStateFile        = "inventory.json"
++	hotMaxStateBytes    = 32 << 20
++	hotMaxEnvelopeBytes = 48 << 20
++	hotStateAAD         = "dae-hot-inventory/aes-256-gcm/v1"
++	hotMaxNodes         = 4096
++	hotMaxRevisions     = 128
++	hotMaxLinkBytes     = 16384
++)
++
++// HotProviderRequest replaces all groups owned by one provider. Groups must
++// already exist in the configured policy; their numeric handles never move.
++// Selection is required for a group's first publication and when its selected
++// stable candidate disappears. An existing candidate retains its selection.
++// Node links are secrets and are accepted only on the private management path.
++type HotProviderRequest struct {
++	ExpectedGeneration uint64             `json:"expected_generation"`
++	ProviderID         string             `json:"provider_id"`
++	RevisionID         string             `json:"revision_id"`
++	Nodes              []HotProviderNode  `json:"nodes"`
++	Groups             []HotProviderGroup `json:"groups"`
++}
++
++type HotProviderNode struct {
++	ID   string `json:"id"`
++	Link string `json:"link"`
++}
++
++type HotProviderGroup struct {
++	Name         string   `json:"name"`
++	CandidateIDs []string `json:"candidate_ids"`
++	Selection    string   `json:"selection"`
++}
++
++type hotProviderRuntime struct {
++	mu        sync.Mutex
++	inventory *outbound.HotInventory
++	providers map[string]HotProviderRequest
++	revisions map[string]map[string]string
++	handles   map[string]uint8
++	stateDir  *os.File
++	aead      cipher.AEAD
++	syncDir   func() error
++	closed    bool
++}
++
++type hotStateEnvelope struct {
++	Version    int    `json:"version"`
++	Nonce      []byte `json:"nonce"`
++	Ciphertext []byte `json:"ciphertext"`
++}
++
++func hotStateCipher() (cipher.AEAD, error) {
++	encoded := os.Getenv("DAE_HOT_STATE_KEY")
++	key, err := hex.DecodeString(encoded)
++	if err != nil || len(key) != 32 {
++		return nil, errors.New("DAE_HOT_STATE_KEY must contain a 32-byte hex key")
++	}
++	defer clear(key)
++	block, err := aes.NewCipher(key)
++	if err != nil {
++		return nil, errors.New("cannot initialize hot inventory encryption")
++	}
++	return cipher.NewGCM(block)
++}
++
++type hotDurableState struct {
++	Version    int                           `json:"version"`
++	Generation uint64                        `json:"generation"`
++	Handles    map[string]uint8              `json:"handles"`
++	Providers  map[string]HotProviderRequest `json:"providers"`
++	Revisions  map[string]map[string]string  `json:"revisions"`
++}
++
++// EnableHotInventory restores the latest committed provider definitions and
++// choices without subscription downloads. It must run before ingress begins.
++// The state directory is private, rejects symlinks in every path component,
++// and is locked exclusively for the lifetime of this control plane. Journal
++// definitions are encrypted with the externally supplied DAE_HOT_STATE_KEY
++// (64 hexadecimal characters); the key is never written to the state directory.
++func (c *ControlPlane) EnableHotInventory(stateDir string) (retErr error) {
++	if c.hotInventory.Load() != nil {
++		return errors.New("hot inventory already enabled")
++	}
++	if c.hotDialerOption != nil && c.hotDialerOption.AllowInsecure {
++		return fmt.Errorf("%w: hot inventory requires TLS verification in runtime defaults", outbound.ErrHotInventoryInvalid)
++	}
++	aead, err := hotStateCipher()
++	if err != nil {
++		return err
++	}
++	root, err := openHotStateDir(stateDir)
++	if err != nil {
++		return err
++	}
++	runtime := &hotProviderRuntime{providers: make(map[string]HotProviderRequest), revisions: make(map[string]map[string]string), handles: make(map[string]uint8), stateDir: root, aead: aead}
++	defer func() {
++		if retErr != nil {
++			_ = runtime.close()
++		}
++	}()
++	entries := make(map[uint8]outbound.HotInventoryEntry)
++	for i, group := range c.outbounds {
++		if i < int(consts.OutboundUserDefinedMin) {
++			continue
++		}
++		if i > int(consts.OutboundUserDefinedMax) || group == nil || group.Name == "" {
++			return errors.New("invalid configured hot outbound handle")
++		}
++		for _, candidate := range group.Dialers {
++			if candidate != nil && candidate.GlobalOption != nil && candidate.AllowInsecure {
++				return fmt.Errorf("%w: hot inventory requires TLS verification in configured outbound options", outbound.ErrHotInventoryInvalid)
++			}
++		}
++		if _, exists := runtime.handles[group.Name]; exists {
++			return errors.New("duplicate configured hot outbound name")
++		}
++		runtime.handles[group.Name] = uint8(i)
++		entries[uint8(i)] = outbound.HotInventoryEntry{Handle: uint8(i), Identity: "baseline", Group: group, Borrowed: true}
++	}
++	if len(entries) == 0 {
++		return errors.New("hot inventory requires a configured user outbound")
++	}
++	generation := uint64(1)
++	state, exists, err := runtime.readState()
++	if err != nil {
++		return err
++	}
++	var prepared []outbound.HotInventoryEntry
++	defer func() {
++		if retErr != nil {
++			closeHotPrepared(prepared)
++		}
++	}()
++	if exists {
++		if state.Version != 1 || state.Generation == 0 || !equalHotHandles(state.Handles, runtime.handles) {
++			return errors.New("hot inventory state does not match configured policy handles")
++		}
++		generation = state.Generation
++		if err := validateHotRevisionHistory(state); err != nil {
++			return err
++		}
++		runtime.revisions = cloneHotRevisionHistory(state.Revisions)
++		ids := make([]string, 0, len(state.Providers))
++		for id := range state.Providers {
++			ids = append(ids, id)
++		}
++		sort.Strings(ids)
++		for _, id := range ids {
++			req := state.Providers[id]
++			if id != req.ProviderID {
++				return errors.New("invalid hot inventory provider state")
++			}
++			if err := runtime.validateRequest(req); err != nil {
++				return fmt.Errorf("invalid stored hot provider: %w", err)
++			}
++			next, err := c.prepareHotProvider(context.Background(), runtime, req, nil)
++			if err != nil {
++				return err
++			}
++			prepared = append(prepared, next...)
++			for _, entry := range next {
++				entries[entry.Handle] = entry
++			}
++			runtime.providers[id] = cloneHotRequest(req)
++		}
++	}
++	initial := make([]outbound.HotInventoryEntry, 0, len(entries))
++	for _, entry := range entries {
++		initial = append(initial, entry)
++	}
++	runtime.inventory, err = outbound.NewHotInventoryAtGeneration(initial, 8, generation)
++	if err != nil {
++		return err
++	}
++	prepared = nil // Ownership has transferred to the native inventory.
++	if !c.hotInventory.CompareAndSwap(nil, runtime) {
++		return errors.New("hot inventory already enabled")
++	}
++	var managedHandles []uint8
++	for _, entry := range initial {
++		if !entry.Borrowed {
++			managedHandles = append(managedHandles, entry.Handle)
++		}
++	}
++	if err := c.publishHotOutboundConnectivity(managedHandles); err != nil {
++		runtime.mu.Lock()
++		c.fenceHotOutcome(runtime, ErrHotInventoryDatapathOutcomeUnknown)
++		runtime.mu.Unlock()
++		return ErrHotInventoryDatapathOutcomeUnknown
++	}
++	return nil
++}
++
++func (c *ControlPlane) acquireHotOutbound(handle uint8) (*outbound.HotInventoryLease, bool, error) {
++	if handle < uint8(consts.OutboundUserDefinedMin) || handle > uint8(consts.OutboundUserDefinedMax) {
++		return nil, false, nil
++	}
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return nil, false, nil
++	}
++	return runtime.inventory.AcquireManaged(handle)
++}
++
++func (c *ControlPlane) HotInventorySnapshot() (outbound.HotInventorySnapshot, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return outbound.HotInventorySnapshot{}, errors.New("hot inventory is disabled")
++	}
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return outbound.HotInventorySnapshot{}, outbound.ErrHotInventoryClosed
++	}
++	return runtime.inventory.Snapshot(), nil
++}
++
++// PublishHotProvider prepares native dialers and groups, commits their exact
++// restart representation, then atomically replaces only this provider's groups.
++// No subscription download, policy compilation, daemon reload or kernel attach
++// occurs here. Parse failures never return secret connection URLs.
++func (c *ControlPlane) PublishHotProvider(ctx context.Context, req HotProviderRequest) (outbound.HotInventoryPublication, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return outbound.HotInventoryPublication{}, errors.New("hot inventory is disabled")
++	}
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
++	}
++	before := runtime.inventory.Snapshot()
++	if req.ExpectedGeneration != before.Generation {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryConflict
++	}
++	if err := ctx.Err(); err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	req = cloneHotRequest(req)
++	if err := runtime.validateRequest(req); err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	digest := hotRevisionDigest(req)
++	history := runtime.revisions[req.ProviderID]
++	if previous, known := history[req.RevisionID]; known {
++		if previous != digest {
++			return outbound.HotInventoryPublication{}, fmt.Errorf("%w: provider revision identity was reused with different content", outbound.ErrHotInventoryConflict)
++		}
++	} else if len(history) >= hotMaxRevisions {
++		return outbound.HotInventoryPublication{}, fmt.Errorf("%w: provider revision history limit reached", outbound.ErrHotInventoryBusy)
++	}
++	if old, ok := runtime.providers[req.ProviderID]; ok && old.RevisionID == req.RevisionID {
++		if !sameHotRevision(old, req) {
++			return outbound.HotInventoryPublication{}, errors.New("hot provider revision identity was reused with different content")
++		}
++		return outbound.HotInventoryPublication{Snapshot: before}, nil
++	}
++	selected := make(map[string]string, len(before.Groups))
++	for _, group := range before.Groups {
++		selected[group.Name] = group.Selection
++	}
++	entries, err := c.prepareHotProvider(ctx, runtime, req, selected)
++	if err != nil {
++		return outbound.HotInventoryPublication{}, err
++	}
++	adopted := false
++	defer func() {
++		if !adopted {
++			closeHotPrepared(entries)
++		}
++	}()
++	providers := cloneHotProviders(runtime.providers)
++	providers[req.ProviderID] = req
++	revisions := cloneHotRevisionHistory(runtime.revisions)
++	if revisions[req.ProviderID] == nil {
++		revisions[req.ProviderID] = make(map[string]string)
++	}
++	revisions[req.ProviderID][req.RevisionID] = digest
++	publication, err := runtime.inventory.Publish(ctx, req.ExpectedGeneration, entries, func(ctx context.Context, snapshot outbound.HotInventorySnapshot) error {
++		syncHotSelections(providers, snapshot)
++		return runtime.writeState(ctx, hotDurableState{Version: 1, Generation: snapshot.Generation, Handles: runtime.handles, Providers: providers, Revisions: revisions})
++	})
++	if err != nil {
++		c.fenceHotOutcome(runtime, err)
++		return outbound.HotInventoryPublication{}, err
++	}
++	adopted = true
++	runtime.providers = providers
++	runtime.revisions = revisions
++	if err := c.publishHotOutboundConnectivity(publication.Adopted); err != nil {
++		c.fenceHotOutcome(runtime, ErrHotInventoryDatapathOutcomeUnknown)
++		return publication, ErrHotInventoryDatapathOutcomeUnknown
++	}
++	return publication, nil
++}
++
++// SetHotSelection changes the stable candidate for one managed group and
++// commits the selected identity before it becomes visible to new flows.
++func (c *ControlPlane) SetHotSelection(ctx context.Context, expected uint64, handle uint8, candidateID string) (outbound.HotInventoryPublication, error) {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return outbound.HotInventoryPublication{}, errors.New("hot inventory is disabled")
++	}
++	runtime.mu.Lock()
++	defer runtime.mu.Unlock()
++	if runtime.closed {
++		return outbound.HotInventoryPublication{}, outbound.ErrHotInventoryClosed
++	}
++	providers := cloneHotProviders(runtime.providers)
++	publication, err := runtime.inventory.SetSelection(ctx, expected, handle, candidateID, func(ctx context.Context, snapshot outbound.HotInventorySnapshot) error {
++		syncHotSelections(providers, snapshot)
++		return runtime.writeState(ctx, hotDurableState{Version: 1, Generation: snapshot.Generation, Handles: runtime.handles, Providers: providers, Revisions: runtime.revisions})
++	})
++	if err == nil {
++		runtime.providers = providers
++	} else {
++		c.fenceHotOutcome(runtime, err)
++	}
++	return publication, err
++}
++
++// ErrHotInventoryStorageOutcomeUnknown means an atomic rename occurred but
++// neither its directory sync nor durable rollback completed. New flow admission
++// is fenced, mutations are stopped, and restart must read the journal.
++var ErrHotInventoryStorageOutcomeUnknown = errors.New("hot inventory storage outcome unknown; restart and readback required")
++
++// ErrHotInventoryDatapathOutcomeUnknown means a revision is durable, but its
++// stable kernel admission slots could not be confirmed. The runtime is fenced
++// and recovery requires restart and readback of the accepted journal.
++var ErrHotInventoryDatapathOutcomeUnknown = errors.New("hot inventory datapath outcome unknown; restart and readback required")
++
++func (c *ControlPlane) fenceHotOutcome(r *hotProviderRuntime, err error) {
++	if !errors.Is(err, ErrHotInventoryStorageOutcomeUnknown) && !errors.Is(err, ErrHotInventoryDatapathOutcomeUnknown) {
++		return
++	}
++	r.closed = true
++	_ = r.inventory.Close()
++	_ = r.stateDir.Close()
++	c.rejectNewConnections.Store(true)
++	if c.cancel != nil {
++		c.cancel()
++	}
++}
++
++func (r *hotProviderRuntime) validateRequest(req HotProviderRequest) error {
++	invalid := func(message string) error { return fmt.Errorf("%w: %s", outbound.ErrHotInventoryInvalid, message) }
++	if !hotToken(req.ProviderID) || !hotToken(req.RevisionID) || len(req.Nodes) == 0 || len(req.Nodes) > hotMaxNodes || len(req.Groups) == 0 || len(req.Groups) > len(r.handles) {
++		return invalid("invalid provider, revision, or inventory size")
++	}
++	nodes := make(map[string]bool, len(req.Nodes))
++	referenced := make(map[string]bool)
++	total := 0
++	for _, node := range req.Nodes {
++		total += len(node.Link)
++		if !hotToken(node.ID) || nodes[node.ID] || len(node.Link) == 0 || len(node.Link) > hotMaxLinkBytes || total > 8<<20 {
++			return invalid("invalid node identity or connection definition size")
++		}
++		nodes[node.ID] = true
++	}
++	names := make(map[string]bool, len(req.Groups))
++	candidateCount := 0
++	for _, group := range req.Groups {
++		candidateCount += len(group.CandidateIDs)
++		if candidateCount > hotMaxNodes {
++			return invalid("total native candidate count exceeds limit")
++		}
++		if _, ok := r.handles[group.Name]; !ok || names[group.Name] || len(group.CandidateIDs) == 0 || len(group.CandidateIDs) > hotMaxNodes {
++			return invalid("unknown group, duplicate group or invalid membership size")
++		}
++		names[group.Name] = true
++		seen := make(map[string]bool, len(group.CandidateIDs))
++		for _, id := range group.CandidateIDs {
++			if !nodes[id] || seen[id] {
++				return invalid("unknown or duplicate candidate")
++			}
++			seen[id] = true
++			referenced[id] = true
++		}
++		if group.Selection != "" && !seen[group.Selection] {
++			return invalid("selected candidate is absent")
++		}
++	}
++	if len(referenced) != len(nodes) {
++		return invalid("unreferenced provider node")
++	}
++	for id, provider := range r.providers {
++		for _, group := range provider.Groups {
++			if id == req.ProviderID && !names[group.Name] {
++				return invalid("provider publication omitted an owned group")
++			}
++			if id != req.ProviderID && names[group.Name] {
++				return invalid("a managed group may contain only one provider")
++			}
++		}
++	}
++	return nil
++}
++
++func (c *ControlPlane) prepareHotProvider(ctx context.Context, runtime *hotProviderRuntime, req HotProviderRequest, selected map[string]string) (entries []outbound.HotInventoryEntry, retErr error) {
++	links := make(map[string]string, len(req.Nodes))
++	for _, node := range req.Nodes {
++		links[node.ID] = node.Link
++	}
++	defer func() {
++		if retErr != nil {
++			closeHotPrepared(entries)
++		}
++	}()
++	nativeCtx := c.ctx
++	if nativeCtx == nil {
++		nativeCtx = context.Background()
++	}
++	for _, spec := range req.Groups {
++		if err := ctx.Err(); err != nil {
++			return entries, err
++		}
++		handle := runtime.handles[spec.Name]
++		source := c.hotDialerOption
++		if baseline := c.outbounds[handle]; len(baseline.Dialers) > 0 {
++			source = baseline.Dialers[0].GlobalOption
++		}
++		if source == nil || source.Log == nil {
++			return entries, errors.New("hot dialer runtime options are unavailable")
++		}
++		if source.AllowInsecure {
++			return entries, fmt.Errorf("%w: hot inventory requires TLS verification in native dialer options", outbound.ErrHotInventoryInvalid)
++		}
++		choice := spec.Selection
++		for _, id := range spec.CandidateIDs {
++			if id == selected[spec.Name] {
++				choice = id
++			}
++		}
++		if choice == "" {
++			return entries, fmt.Errorf("%w: selected candidate disappeared; explicit replacement required", outbound.ErrHotInventoryInvalid)
++		}
++		found := false
++		for _, id := range spec.CandidateIDs {
++			if id == choice {
++				found = true
++			}
++		}
++		if !found {
++			return entries, fmt.Errorf("%w: selected candidate disappeared; explicit replacement required", outbound.ErrHotInventoryInvalid)
++		}
++		entry := outbound.HotInventoryEntry{Handle: handle, Identity: req.ProviderID + "/" + req.RevisionID, Selection: choice}
++		var native []*dialer.Dialer
++		var annotations []*dialer.Annotation
++		fixed := 0
++		for i, id := range spec.CandidateIDs {
++			scheme, _, _ := strings.Cut(links[id], ":")
++			if strings.EqualFold(scheme, "direct") || strings.EqualFold(scheme, "block") {
++				for _, built := range native {
++					_ = built.Close()
++					dialer.CleanupTransportCacheNamespace(built.TransportCacheNamespace)
++				}
++				return entries, fmt.Errorf("%w: provider candidates must be proxy connections", outbound.ErrHotInventoryInvalid)
++			}
++			option := source.CloneForHot()
++			d, err := dialer.NewFromLinkContext(nativeCtx, option, dialer.InstanceOption{DisableCheck: true}, links[id], req.ProviderID)
++			if err != nil {
++				dialer.CleanupTransportCacheNamespace(option.TransportCacheNamespace)
++				for _, built := range native {
++					_ = built.Close()
++					dialer.CleanupTransportCacheNamespace(built.TransportCacheNamespace)
++				}
++				return entries, fmt.Errorf("%w: invalid native connection definition for candidate %q", outbound.ErrHotInventoryInvalid, id)
++			}
++			native = append(native, d)
++			annotations = append(annotations, &dialer.Annotation{})
++			entry.Candidates = append(entry.Candidates, outbound.HotInventoryCandidate{ID: id, Dialer: d})
++			if id == choice {
++				fixed = i
++			}
++		}
++		entry.Group = outbound.NewDialerGroup(native[0].GlobalOption, spec.Name, native, annotations, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: fixed}, func(bool, *dialer.NetworkType, bool) {})
++		entries = append(entries, entry)
++	}
++	return entries, nil
++}
++
++func closeHotPrepared(entries []outbound.HotInventoryEntry) {
++	seen := make(map[*dialer.Dialer]bool)
++	for _, entry := range entries {
++		if entry.Borrowed {
++			continue
++		}
++		if entry.Group != nil {
++			_ = entry.Group.Close()
++		}
++		for _, candidate := range entry.Candidates {
++			d := candidate.Dialer
++			if d != nil && !seen[d] {
++				seen[d] = true
++				_ = d.Close()
++				dialer.CleanupTransportCacheNamespace(d.TransportCacheNamespace)
++			}
++		}
++	}
++}
++
++func (c *ControlPlane) closeHotInventory() error {
++	runtime := c.hotInventory.Load()
++	if runtime == nil {
++		return nil
++	}
++	// Keep the pointer installed so admission after Close cannot fall through
++	// to baseline resources that may already be retiring.
++	return runtime.close()
++}
++
++func (r *hotProviderRuntime) close() error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.closed {
++		return nil
++	}
++	r.closed = true
++	var errs []error
++	if r.inventory != nil {
++		errs = append(errs, r.inventory.Close())
++	}
++	if r.stateDir != nil {
++		errs = append(errs, r.stateDir.Close())
++	}
++	return errors.Join(errs...)
++}
++
++func hotToken(value string) bool {
++	if len(value) == 0 || len(value) > 256 {
++		return false
++	}
++	for _, c := range value {
++		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._:-", c)) {
++			return false
++		}
++	}
++	return true
++}
++
++func cloneHotRequest(req HotProviderRequest) HotProviderRequest {
++	req.Nodes = append([]HotProviderNode(nil), req.Nodes...)
++	req.Groups = append([]HotProviderGroup(nil), req.Groups...)
++	for i := range req.Groups {
++		req.Groups[i].CandidateIDs = append([]string(nil), req.Groups[i].CandidateIDs...)
++	}
++	return req
++}
++func cloneHotProviders(providers map[string]HotProviderRequest) map[string]HotProviderRequest {
++	cloned := make(map[string]HotProviderRequest, len(providers))
++	for id, req := range providers {
++		cloned[id] = cloneHotRequest(req)
++	}
++	return cloned
++}
++func sameHotRevision(a, b HotProviderRequest) bool {
++	return hotRevisionDigest(a) == hotRevisionDigest(b)
++}
++
++func hotRevisionDigest(req HotProviderRequest) string {
++	req = cloneHotRequest(req)
++	req.ExpectedGeneration = 0
++	for i := range req.Groups {
++		req.Groups[i].Selection = ""
++	}
++	raw, _ := json.Marshal(req)
++	defer clear(raw)
++	digest := sha256.Sum256(raw)
++	return hex.EncodeToString(digest[:])
++}
++
++func cloneHotRevisionHistory(history map[string]map[string]string) map[string]map[string]string {
++	result := make(map[string]map[string]string, len(history))
++	for provider, revisions := range history {
++		result[provider] = make(map[string]string, len(revisions))
++		for revision, digest := range revisions {
++			result[provider][revision] = digest
++		}
++	}
++	return result
++}
++
++func validateHotRevisionHistory(state hotDurableState) error {
++	if len(state.Revisions) != len(state.Providers) {
++		return errors.New("hot inventory revision history does not match provider state")
++	}
++	for id, provider := range state.Providers {
++		revisions := state.Revisions[id]
++		if len(revisions) == 0 || len(revisions) > hotMaxRevisions || revisions[provider.RevisionID] != hotRevisionDigest(provider) {
++			return errors.New("invalid hot inventory revision history")
++		}
++		for revision, digest := range revisions {
++			decoded, err := hex.DecodeString(digest)
++			if !hotToken(revision) || err != nil || len(decoded) != sha256.Size {
++				return errors.New("invalid hot inventory revision identity")
++			}
++		}
++	}
++	return nil
++}
++
++func syncHotSelections(providers map[string]HotProviderRequest, snapshot outbound.HotInventorySnapshot) {
++	choices := make(map[string]string, len(snapshot.Groups))
++	for _, group := range snapshot.Groups {
++		choices[group.Name] = group.Selection
++	}
++	for id, req := range providers {
++		for i := range req.Groups {
++			req.Groups[i].Selection = choices[req.Groups[i].Name]
++		}
++		providers[id] = req
++	}
++}
++func equalHotHandles(a, b map[string]uint8) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for name, handle := range a {
++		other, ok := b[name]
++		if !ok || other != handle {
++			return false
++		}
++	}
++	return true
++}
++
++func openHotStateDir(path string) (*os.File, error) {
++	if path == "" {
++		return nil, errors.New("hot inventory state directory is required")
++	}
++	absolute, err := filepath.Abs(path)
++	if err != nil {
++		return nil, err
++	}
++	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	for _, part := range strings.Split(strings.TrimPrefix(filepath.Clean(absolute), "/"), "/") {
++		if part == "" {
++			continue
++		}
++		next, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++		if errors.Is(e, unix.ENOENT) {
++			e = unix.Mkdirat(fd, part, 0700)
++			if e == nil {
++				e = unix.Fsync(fd)
++				if e == nil {
++					next, e = unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++				}
++			}
++		}
++		_ = unix.Close(fd)
++		if e != nil {
++			return nil, fmt.Errorf("open hot inventory state directory: %w", e)
++		}
++		fd = next
++	}
++	root := os.NewFile(uintptr(fd), absolute)
++	info, err := root.Stat()
++	if err != nil {
++		root.Close()
++		return nil, err
++	}
++	if info.Mode().Perm()&0077 != 0 {
++		root.Close()
++		return nil, errors.New("hot inventory state directory must have private permissions")
++	}
++	if err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		root.Close()
++		return nil, errors.New("hot inventory state directory is already in use or cannot be locked")
++	}
++	return root, nil
++}
++
++func (r *hotProviderRuntime) readState() (hotDurableState, bool, error) {
++	var state hotDurableState
++	fd, err := unix.Openat(int(r.stateDir.Fd()), hotStateFile, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++	if errors.Is(err, unix.ENOENT) {
++		return state, false, nil
++	}
++	if err != nil {
++		return state, false, errors.New("cannot open hot inventory state")
++	}
++	file := os.NewFile(uintptr(fd), hotStateFile)
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > hotMaxEnvelopeBytes {
++		return state, false, errors.New("invalid hot inventory state file")
++	}
++	raw, err := io.ReadAll(io.LimitReader(file, hotMaxEnvelopeBytes+1))
++	if err != nil || len(raw) > hotMaxEnvelopeBytes {
++		return state, false, errors.New("cannot read hot inventory state")
++	}
++	var envelope hotStateEnvelope
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.DisallowUnknownFields()
++	if err = decoder.Decode(&envelope); err != nil {
++		return state, false, errors.New("corrupt encrypted hot inventory state")
++	}
++	var extra any
++	if decoder.Decode(&extra) != io.EOF || envelope.Version != 1 || r.aead == nil || len(envelope.Nonce) != r.aead.NonceSize() || len(envelope.Ciphertext) > hotMaxStateBytes+r.aead.Overhead() {
++		return state, false, errors.New("invalid encrypted hot inventory state")
++	}
++	plaintext, err := r.aead.Open(nil, envelope.Nonce, envelope.Ciphertext, []byte(hotStateAAD))
++	if err != nil {
++		return state, false, errors.New("hot inventory state authentication failed")
++	}
++	defer clear(plaintext)
++	if len(plaintext) > hotMaxStateBytes {
++		return state, false, errors.New("hot inventory plaintext exceeds storage limit")
++	}
++	decoder = json.NewDecoder(bytes.NewReader(plaintext))
++	decoder.DisallowUnknownFields()
++	if err = decoder.Decode(&state); err != nil {
++		return state, false, errors.New("corrupt hot inventory state")
++	}
++	if decoder.Decode(&extra) != io.EOF {
++		return state, false, errors.New("trailing hot inventory state data")
++	}
++	return state, true, nil
++}
++
++func (r *hotProviderRuntime) syncDirectory() error {
++	if r.syncDir != nil {
++		return r.syncDir()
++	}
++	return r.stateDir.Sync()
++}
++
++func (r *hotProviderRuntime) writeState(ctx context.Context, state hotDurableState) error {
++	plaintext, err := json.Marshal(state)
++	if err != nil || len(plaintext) > hotMaxStateBytes {
++		return errors.New("hot inventory state exceeds storage limit")
++	}
++	defer clear(plaintext)
++	if r.aead == nil {
++		return errors.New("hot inventory state encryption is unavailable")
++	}
++	nonce := make([]byte, r.aead.NonceSize())
++	if _, err = rand.Read(nonce); err != nil {
++		return errors.New("cannot generate hot inventory state nonce")
++	}
++	envelope := hotStateEnvelope{Version: 1, Nonce: nonce, Ciphertext: r.aead.Seal(nil, nonce, plaintext, []byte(hotStateAAD))}
++	raw, err := json.Marshal(envelope)
++	if err != nil || len(raw) > hotMaxEnvelopeBytes {
++		return errors.New("encrypted hot inventory state exceeds storage limit")
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	dirfd := int(r.stateDir.Fd())
++	var stat unix.Stat_t
++	if err = unix.Fstatat(dirfd, hotStateFile, &stat, unix.AT_SYMLINK_NOFOLLOW); err == nil {
++		if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0077 != 0 {
++			return errors.New("invalid hot inventory state destination")
++		}
++	} else if !errors.Is(err, unix.ENOENT) {
++		return errors.New("cannot inspect hot inventory state destination")
++	}
++	token := make([]byte, 16)
++	if _, err = rand.Read(token); err != nil {
++		return err
++	}
++	name := ".inventory-" + hex.EncodeToString(token)
++	fd, err := unix.Openat(dirfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
++	if err != nil {
++		return errors.New("cannot create hot inventory state transaction")
++	}
++	file := os.NewFile(uintptr(fd), name)
++	defer func() { _ = file.Close(); _ = unix.Unlinkat(dirfd, name, 0) }()
++	if _, err = file.Write(raw); err != nil {
++		return errors.New("cannot write hot inventory state")
++	}
++	if err = file.Sync(); err != nil {
++		return errors.New("cannot sync hot inventory state")
++	}
++	if err = file.Close(); err != nil {
++		return errors.New("cannot close hot inventory state")
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	// Keep the old journal under a private backup name until replacement is
++	// durably acknowledged. This lets a failed directory sync restore the old
++	// authority; if the restore cannot be synced either, admission is fenced.
++	backup := name + ".previous"
++	hasPrevious := false
++	if err = unix.Linkat(dirfd, hotStateFile, dirfd, backup, 0); err == nil {
++		hasPrevious = true
++	} else if !errors.Is(err, unix.ENOENT) {
++		return errors.New("cannot preserve previous hot inventory state")
++	}
++	keepBackup := false
++	defer func() {
++		if !keepBackup {
++			_ = unix.Unlinkat(dirfd, backup, 0)
++		}
++	}()
++	if err = r.syncDirectory(); err != nil {
++		return errors.New("cannot sync hot inventory transaction directory")
++	}
++	if err = unix.Renameat(dirfd, name, dirfd, hotStateFile); err != nil {
++		return errors.New("cannot commit hot inventory state")
++	}
++	if err = r.syncDirectory(); err != nil {
++		var rollbackErr error
++		if hasPrevious {
++			rollbackErr = unix.Renameat(dirfd, backup, dirfd, hotStateFile)
++		} else {
++			rollbackErr = unix.Unlinkat(dirfd, hotStateFile, 0)
++		}
++		if rollbackErr == nil {
++			rollbackErr = r.syncDirectory()
++		}
++		if rollbackErr != nil {
++			keepBackup = true
++			return ErrHotInventoryStorageOutcomeUnknown
++		}
++		return errors.New("hot inventory directory sync failed; previous state restored")
++	}
++	return nil
++}
+diff --git a/control/hot_inventory_test.go b/control/hot_inventory_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..03f27eaac10febde4a8fefecb141b5473c7f976a
+--- /dev/null
++++ b/control/hot_inventory_test.go
+@@ -0,0 +1,631 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
++ */
++
++package control
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/daeuniverse/dae/common/consts"
++	"github.com/daeuniverse/dae/component/outbound"
++	"github.com/daeuniverse/dae/component/outbound/dialer"
++	"github.com/daeuniverse/outbound/netproxy"
++	"github.com/sirupsen/logrus"
++)
++
++func TestHotProviderRequestCloneAndRevisionIdentity(t *testing.T) {
++	request := HotProviderRequest{
++		ExpectedGeneration: 11,
++		ProviderID:         "provider",
++		RevisionID:         "revision",
++		Nodes:              []HotProviderNode{{ID: "node", Link: "socks5://127.0.0.1:1"}},
++		Groups:             []HotProviderGroup{{Name: "egress", CandidateIDs: []string{"node"}, Selection: "node"}},
++	}
++	clone := cloneHotRequest(request)
++	clone.Nodes[0].Link = "redacted://changed"
++	clone.Groups[0].CandidateIDs[0] = "other"
++	if request.Nodes[0].Link == clone.Nodes[0].Link || request.Groups[0].CandidateIDs[0] == clone.Groups[0].CandidateIDs[0] {
++		t.Fatal("hot request clone aliases mutable slices")
++	}
++	if !sameHotRevision(request, cloneHotRequest(request)) {
++		t.Fatal("identical hot revision was not stable")
++	}
++	selectionChange := cloneHotRequest(request)
++	selectionChange.ExpectedGeneration = 42
++	selectionChange.Groups[0].Selection = "other"
++	if !sameHotRevision(request, selectionChange) {
++		t.Fatal("selection/generation changes should not alter provider content identity")
++	}
++	if request.Groups[0].Selection != "node" || selectionChange.Groups[0].Selection != "other" {
++		t.Fatal("revision comparison mutated selection state")
++	}
++}
++
++func TestHotInventoryJournalRoundTrip(t *testing.T) {
++	t.Setenv("DAE_HOT_STATE_KEY", strings.Repeat("ab", 32))
++	aead, err := hotStateCipher()
++	if err != nil {
++		t.Fatal(err)
++	}
++	dir := t.TempDir()
++	root, err := openHotStateDir(filepath.Join(dir, "state"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtime := &hotProviderRuntime{stateDir: root, aead: aead}
++	state := hotDurableState{
++		Version: 1, Generation: 7,
++		Handles:   map[string]uint8{"egress": 2},
++		Providers: map[string]HotProviderRequest{"provider": {ProviderID: "provider", RevisionID: "revision"}},
++	}
++	if err := runtime.writeState(context.Background(), state); err != nil {
++		_ = root.Close()
++		t.Fatal(err)
++	}
++	read, exists, err := runtime.readState()
++	_ = root.Close()
++	if err != nil || !exists {
++		t.Fatalf("read journal: exists=%v err=%v", exists, err)
++	}
++	if read.Generation != state.Generation || read.Handles["egress"] != 2 || read.Providers["provider"].RevisionID != "revision" {
++		t.Fatalf("journal mismatch: %#v", read)
++	}
++	info, err := os.Stat(filepath.Join(dir, "state", hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0600 {
++		t.Fatalf("journal permissions = %o, want 600", info.Mode().Perm())
++	}
++}
++
++func TestOpenHotStateDirRejectsSymlink(t *testing.T) {
++	dir := t.TempDir()
++	target := filepath.Join(dir, "target")
++	if err := os.Mkdir(target, 0700); err != nil {
++		t.Fatal(err)
++	}
++	link := filepath.Join(dir, "link")
++	if err := os.Symlink(target, link); err != nil {
++		t.Fatal(err)
++	}
++	if root, err := openHotStateDir(link); err == nil {
++		_ = root.Close()
++		t.Fatal("symlink state directory was accepted")
++	}
++}
++
++func hotTestControlPlane(t *testing.T, stateDir string, names ...string) *ControlPlane {
++	t.Helper()
++	t.Setenv("DAE_HOT_STATE_KEY", strings.Repeat("ab", 32))
++	logger := logrus.New()
++	logger.SetOutput(io.Discard)
++	option := &dialer.GlobalOption{Log: logger, CheckInterval: time.Hour}
++	cp := &ControlPlane{log: logger, ctx: context.Background(), hotDialerOption: option}
++	cp.outbounds = make([]*outbound.DialerGroup, int(consts.OutboundUserDefinedMin))
++	for _, name := range names {
++		group := outbound.NewDialerGroup(option, name, nil, nil, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, func(bool, *dialer.NetworkType, bool) {})
++		cp.outbounds = append(cp.outbounds, group)
++	}
++	if err := cp.EnableHotInventory(stateDir); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = cp.closeHotInventory() })
++	return cp
++}
++
++func hotTestRequest(provider, revision, group string, generation uint64, link string) HotProviderRequest {
++	return HotProviderRequest{ExpectedGeneration: generation, ProviderID: provider, RevisionID: revision,
++		Nodes:  []HotProviderNode{{ID: provider + "-a", Link: link}, {ID: provider + "-b", Link: link}},
++		Groups: []HotProviderGroup{{Name: group, CandidateIDs: []string{provider + "-a", provider + "-b"}, Selection: provider + "-a"}}}
++}
++
++func hotTestAcquire(t *testing.T, c *ControlPlane, handle uint8) *outbound.HotInventoryLease {
++	t.Helper()
++	lease, managed, err := c.acquireHotOutbound(handle)
++	if err != nil || !managed || lease == nil {
++		t.Fatalf("acquire hot outbound: managed=%v err=%v", managed, err)
++	}
++	t.Cleanup(func() { _ = lease.Release() })
++	return lease
++}
++
++// The fixture speaks an actual SOCKS5 handshake and echoes the tunneled bytes.
++// No kernel programs, transparent interception or external service is involved.
++func hotTestSOCKS(t *testing.T) string {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var mu sync.Mutex
++	var connections []net.Conn
++	var workers sync.WaitGroup
++	workers.Add(1)
++	go func() {
++		defer workers.Done()
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			mu.Lock()
++			connections = append(connections, conn)
++			mu.Unlock()
++			workers.Add(1)
++			go func() {
++				defer workers.Done()
++				defer conn.Close()
++				_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
++				header := make([]byte, 2)
++				if _, err := io.ReadFull(conn, header); err != nil || header[0] != 5 {
++					return
++				}
++				methods := make([]byte, int(header[1]))
++				if _, err := io.ReadFull(conn, methods); err != nil {
++					return
++				}
++				if _, err := conn.Write([]byte{5, 0}); err != nil {
++					return
++				}
++				request := make([]byte, 4)
++				if _, err := io.ReadFull(conn, request); err != nil || request[0] != 5 || request[1] != 1 {
++					return
++				}
++				count := 0
++				switch request[3] {
++				case 1:
++					count = 4
++				case 4:
++					count = 16
++				case 3:
++					var length [1]byte
++					if _, err := io.ReadFull(conn, length[:]); err != nil {
++						return
++					}
++					count = int(length[0])
++				default:
++					return
++				}
++				target := make([]byte, count+2)
++				if _, err := io.ReadFull(conn, target); err != nil {
++					return
++				}
++				if _, err := conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); err != nil {
++					return
++				}
++				_, _ = io.Copy(conn, conn)
++			}()
++		}
++	}()
++	t.Cleanup(func() {
++		_ = listener.Close()
++		mu.Lock()
++		for _, conn := range connections {
++			_ = conn.Close()
++		}
++		mu.Unlock()
++		workers.Wait()
++	})
++	return "socks5://" + listener.Addr().String()
++}
++
++func hotTestEcho(t *testing.T, conn netproxy.Conn, message string) {
++	t.Helper()
++	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
++	if _, err := conn.Write([]byte(message)); err != nil {
++		t.Fatal(err)
++	}
++	got := make([]byte, len(message))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != message {
++		t.Fatalf("tunnel echo %q, want %q", got, message)
++	}
++}
++
++func TestHotProviderNativePublicationSelectionRestart(t *testing.T) {
++	link := hotTestSOCKS(t)
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first", "second")
++	for _, handle := range []uint8{0, 1, 2, 3} {
++		lease, managed, err := cp.acquireHotOutbound(handle)
++		if err != nil || managed || lease != nil {
++			t.Fatalf("baseline handle %d unexpectedly managed: %v", handle, err)
++		}
++	}
++	first := hotTestRequest("p", "one", "first", 1, link)
++	if publication, err := cp.PublishHotProvider(context.Background(), first); err != nil || publication.Snapshot.Generation != 2 {
++		t.Fatalf("initial publication: %#v %v", publication, err)
++	}
++	old := hotTestAcquire(t, cp, 2)
++	conn, err := old.Dialer.DialContext(context.Background(), "tcp", "example.com:443")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	hotTestEcho(t, conn, "before-provider-refresh")
++	second := hotTestRequest("q", "one", "second", 2, link)
++	if _, err := cp.PublishHotProvider(context.Background(), second); err != nil {
++		t.Fatal(err)
++	}
++	unrelated := hotTestAcquire(t, cp, 3)
++	if publication, err := cp.SetHotSelection(context.Background(), 3, 2, "p-b"); err != nil || publication.Snapshot.Generation != 4 {
++		t.Fatalf("selection: %#v %v", publication, err)
++	}
++	first.ExpectedGeneration = 4
++	first.RevisionID = "two"
++	first.Groups[0].CandidateIDs = []string{"p-b", "p-a"}
++	if publication, err := cp.PublishHotProvider(context.Background(), first); err != nil || publication.Snapshot.Generation != 5 {
++		t.Fatalf("replacement publication: %#v %v", publication, err)
++	}
++	current := hotTestAcquire(t, cp, 2)
++	if current.CandidateID != "p-b" || current.Handle != old.Handle || current.Group == old.Group {
++		t.Fatalf("replacement did not preserve stable selection and handle: %#v", current)
++	}
++	again := hotTestAcquire(t, cp, 3)
++	if again.Group != unrelated.Group || again.Dialer != unrelated.Dialer {
++		t.Fatal("unrelated provider resources replaced")
++	}
++	if current.Dialer.GlobalOption == old.Dialer.GlobalOption || current.Dialer.TransportCacheNamespace == old.Dialer.TransportCacheNamespace {
++		t.Fatal("replacement shared option/cache lifecycle")
++	}
++	hotTestEcho(t, conn, "after-provider-refresh")
++	durableBefore, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	first.ExpectedGeneration = 5
++	if publication, err := cp.PublishHotProvider(context.Background(), first); err != nil || publication.Snapshot.Generation != 5 || len(publication.Adopted) != 0 {
++		t.Fatalf("no-op publication: %#v %v", publication, err)
++	}
++	durableAfter, _ := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if !bytes.Equal(durableBefore, durableAfter) {
++		t.Fatal("no-op rewrote durable state")
++	}
++	first.ExpectedGeneration = 4
++	first.RevisionID = "three"
++	if _, err := cp.PublishHotProvider(context.Background(), first); !errors.Is(err, outbound.ErrHotInventoryConflict) {
++		t.Fatalf("stale CAS: %v", err)
++	}
++	durableAfter, _ = os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if !bytes.Equal(durableBefore, durableAfter) {
++		t.Fatal("stale publication changed durable state")
++	}
++	_ = conn.Close()
++	_ = old.Release()
++	_ = current.Release()
++	_ = unrelated.Release()
++	_ = again.Release()
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	restored := hotTestControlPlane(t, stateDir, "first", "second")
++	snapshot, err := restored.HotInventorySnapshot()
++	if err != nil || snapshot.Generation != 5 {
++		t.Fatalf("restart generation: %#v %v", snapshot, err)
++	}
++	restoredLease := hotTestAcquire(t, restored, 2)
++	if restoredLease.CandidateID != "p-b" || restoredLease.Handle != 2 {
++		t.Fatalf("restart selection: %q at %d", restoredLease.CandidateID, restoredLease.Handle)
++	}
++	restoredConn, err := restoredLease.Dialer.DialContext(context.Background(), "tcp", "example.com:443")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer restoredConn.Close()
++	hotTestEcho(t, restoredConn, "after-journal-restore")
++}
++
++func TestHotProviderFailedPreparationPreservesNativeAndDurableState(t *testing.T) {
++	link := hotTestSOCKS(t)
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first", "second")
++	req := hotTestRequest("p", "one", "first", 1, link)
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	old := hotTestAcquire(t, cp, 2)
++	before, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	bad := cloneHotRequest(req)
++	bad.ExpectedGeneration = 2
++	bad.RevisionID = "bad"
++	bad.Nodes[1].Link = "unknown://secret-value@127.0.0.1:7"
++	if _, err := cp.PublishHotProvider(context.Background(), bad); err == nil || strings.Contains(err.Error(), "secret-value") {
++		t.Fatalf("invalid connection did not fail with redacted error: %v", err)
++	}
++	removed := cloneHotRequest(req)
++	removed.ExpectedGeneration = 2
++	removed.RevisionID = "removed"
++	removed.Nodes = removed.Nodes[1:]
++	removed.Groups[0].CandidateIDs = []string{"p-b"}
++	removed.Groups[0].Selection = ""
++	if _, err := cp.PublishHotProvider(context.Background(), removed); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("removed selection without replacement: %v", err)
++	}
++	other := hotTestRequest("q", "one", "first", 2, link)
++	if _, err := cp.PublishHotProvider(context.Background(), other); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++		t.Fatalf("mixed provider group: %v", err)
++	}
++	now := hotTestAcquire(t, cp, 2)
++	if now.Dialer != old.Dialer || now.Group != old.Group || now.Generation != 2 {
++		t.Fatal("failed preparation changed active native resources")
++	}
++	after, _ := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if !bytes.Equal(before, after) {
++		t.Fatal("failed preparation changed durable state")
++	}
++	removed.Groups[0].Selection = "p-b"
++	if _, err := cp.PublishHotProvider(context.Background(), removed); err != nil {
++		t.Fatalf("explicit valid replacement: %v", err)
++	}
++	selected := hotTestAcquire(t, cp, 2)
++	if selected.CandidateID != "p-b" {
++		t.Fatal("explicit replacement not applied")
++	}
++}
++
++func TestHotInventoryJournalRejectsPathSubstitutionAndPolicyDrift(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first", "second")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	if root, err := openHotStateDir(stateDir); err == nil {
++		_ = root.Close()
++		t.Fatal("concurrent journal writer acquired exclusive directory")
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	logger := logrus.New()
++	logger.SetOutput(io.Discard)
++	option := &dialer.GlobalOption{Log: logger, CheckInterval: time.Hour}
++	drift := &ControlPlane{hotDialerOption: option}
++	drift.outbounds = make([]*outbound.DialerGroup, 4)
++	drift.outbounds[2] = outbound.NewDialerGroup(option, "second", nil, nil, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++	drift.outbounds[3] = outbound.NewDialerGroup(option, "first", nil, nil, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++	if err := drift.EnableHotInventory(stateDir); err == nil {
++		_ = drift.closeHotInventory()
++		t.Fatal("restart silently renumbered stable handles")
++	}
++	journal := filepath.Join(stateDir, hotStateFile)
++	saved := filepath.Join(stateDir, "saved.json")
++	if err := os.Rename(journal, saved); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(saved, journal); err != nil {
++		t.Fatal(err)
++	}
++	if err := drift.EnableHotInventory(stateDir); err == nil {
++		_ = drift.closeHotInventory()
++		t.Fatal("symlink journal accepted")
++	}
++}
++
++func TestHotProviderDurabilityFailureRollbackAndFence(t *testing.T) {
++	for _, unknown := range []bool{false, true} {
++		name := "verified_rollback"
++		if unknown {
++			name = "ambiguous_rollback"
++		}
++		t.Run(name, func(t *testing.T) {
++			stateDir := filepath.Join(t.TempDir(), "state")
++			cp := hotTestControlPlane(t, stateDir, "first")
++			req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++			if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++				t.Fatal(err)
++			}
++			before, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++			if err != nil {
++				t.Fatal(err)
++			}
++			old := hotTestAcquire(t, cp, 2)
++			runtime := cp.hotInventory.Load()
++			syncCalls := 0
++			runtime.syncDir = func() error {
++				syncCalls++
++				if syncCalls == 2 || unknown && syncCalls == 3 {
++					return errors.New("injected directory sync fault")
++				}
++				return runtime.stateDir.Sync()
++			}
++			req.ExpectedGeneration = 2
++			req.RevisionID = "two"
++			_, err = cp.PublishHotProvider(context.Background(), req)
++			if err == nil {
++				t.Fatal("directory fsync failure acknowledged success")
++			}
++			after, readErr := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++			if readErr != nil {
++				t.Fatal(readErr)
++			}
++			if !bytes.Equal(before, after) {
++				t.Fatal("rollback did not restore the old journal bytes")
++			}
++			if unknown {
++				if !errors.Is(err, ErrHotInventoryStorageOutcomeUnknown) || !cp.rejectNewConnections.Load() {
++					t.Fatalf("ambiguous fsync failed to fence: %v", err)
++				}
++				if lease, managed, err := cp.acquireHotOutbound(2); err == nil || lease != nil {
++					t.Fatalf("fenced hot inventory admitted: %v %v", managed, err)
++				}
++				if _, err := cp.HotInventorySnapshot(); !errors.Is(err, outbound.ErrHotInventoryClosed) {
++					t.Fatalf("fenced readback claimed current authoritative state: %v", err)
++				}
++			} else {
++				if errors.Is(err, ErrHotInventoryStorageOutcomeUnknown) || cp.rejectNewConnections.Load() {
++					t.Fatalf("verified rollback unexpectedly fenced: %v", err)
++				}
++				now := hotTestAcquire(t, cp, 2)
++				if now.Dialer != old.Dialer || now.Generation != 2 {
++					t.Fatal("failed durable commit changed native inventory")
++				}
++				runtime.syncDir = nil
++				if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++					t.Fatalf("retry after verified rollback: %v", err)
++				}
++			}
++		})
++	}
++}
++
++func TestHotInventoryRejectsInsecureRuntimeDefaults(t *testing.T) {
++	t.Setenv("DAE_HOT_STATE_KEY", strings.Repeat("ab", 32))
++	for _, groupOverride := range []bool{false, true} {
++		name := "global"
++		if groupOverride {
++			name = "group"
++		}
++		t.Run(name, func(t *testing.T) {
++			logger := logrus.New()
++			logger.SetOutput(io.Discard)
++			option := &dialer.GlobalOption{Log: logger, CheckInterval: time.Hour}
++			cp := &ControlPlane{hotDialerOption: option}
++			cp.outbounds = make([]*outbound.DialerGroup, 3)
++			var candidates []*dialer.Dialer
++			if groupOverride {
++				private := option.CloneForHot()
++				private.AllowInsecure = true
++				candidate, err := dialer.NewFromLinkContext(context.Background(), private, dialer.InstanceOption{DisableCheck: true}, "socks5://127.0.0.1:1", "baseline")
++				if err != nil {
++					t.Fatal(err)
++				}
++				t.Cleanup(func() { _ = candidate.Close(); dialer.CleanupTransportCacheNamespace(private.TransportCacheNamespace) })
++				candidates = []*dialer.Dialer{candidate}
++			} else {
++				option.AllowInsecure = true
++			}
++			cp.outbounds[2] = outbound.NewDialerGroup(option, "first", candidates, nil, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed}, nil)
++			t.Cleanup(func() { _ = cp.outbounds[2].Close() })
++			if err := cp.EnableHotInventory(filepath.Join(t.TempDir(), "state")); !errors.Is(err, outbound.ErrHotInventoryInvalid) {
++				_ = cp.closeHotInventory()
++				t.Fatalf("insecure native TLS defaults accepted: %v", err)
++			}
++			if cp.hotInventory.Load() != nil {
++				t.Fatal("failed enable exposed insecure hot runtime")
++			}
++		})
++	}
++}
++
++func TestHotInventoryEncryptedStateRequiresKeyAndRejectsSubstitution(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://secret-user:secret-password@127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	encoded, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, private := range []string{"secret-user", "secret-password", "socks5://", "provider_id", "candidate_ids"} {
++		if bytes.Contains(encoded, []byte(private)) {
++			t.Fatalf("encrypted journal exposed %q", private)
++		}
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	for _, key := range []string{"", strings.Repeat("cd", 32)} {
++		t.Setenv("DAE_HOT_STATE_KEY", key)
++		restored := &ControlPlane{hotDialerOption: cp.hotDialerOption, controlPlaneGenerationState: controlPlaneGenerationState{outbounds: cp.outbounds}}
++		if err := restored.EnableHotInventory(stateDir); err == nil {
++			_ = restored.closeHotInventory()
++			t.Fatal("missing or wrong external key accepted")
++		}
++	}
++	t.Setenv("DAE_HOT_STATE_KEY", strings.Repeat("ab", 32))
++	encoded[len(encoded)/2] ^= 1
++	if err := os.WriteFile(filepath.Join(stateDir, hotStateFile), encoded, 0600); err != nil {
++		t.Fatal(err)
++	}
++	restored := &ControlPlane{hotDialerOption: cp.hotDialerOption, controlPlaneGenerationState: controlPlaneGenerationState{outbounds: cp.outbounds}}
++	if err := restored.EnableHotInventory(stateDir); err == nil {
++		_ = restored.closeHotInventory()
++		t.Fatal("tampered encrypted journal accepted")
++	}
++}
++
++func TestHotProviderRevisionIdentityHistorySurvivesRestart(t *testing.T) {
++	stateDir := filepath.Join(t.TempDir(), "state")
++	cp := hotTestControlPlane(t, stateDir, "first")
++	original := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), original); err != nil {
++		t.Fatal(err)
++	}
++	second := cloneHotRequest(original)
++	second.ExpectedGeneration = 2
++	second.RevisionID = "two"
++	second.Nodes[0].Link = "socks5://127.0.0.1:2"
++	if _, err := cp.PublishHotProvider(context.Background(), second); err != nil {
++		t.Fatal(err)
++	}
++	if err := cp.closeHotInventory(); err != nil {
++		t.Fatal(err)
++	}
++	cp = hotTestControlPlane(t, stateDir, "first")
++	before, err := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	collision := cloneHotRequest(original)
++	collision.ExpectedGeneration = 3
++	collision.Nodes[0].Link = "socks5://127.0.0.1:3"
++	if _, err := cp.PublishHotProvider(context.Background(), collision); !errors.Is(err, outbound.ErrHotInventoryConflict) {
++		t.Fatalf("historical revision reused with different content: %v", err)
++	}
++	after, _ := os.ReadFile(filepath.Join(stateDir, hotStateFile))
++	if !bytes.Equal(before, after) {
++		t.Fatal("revision collision rewrote journal")
++	}
++	original.ExpectedGeneration = 3
++	if publication, err := cp.PublishHotProvider(context.Background(), original); err != nil || publication.Snapshot.Generation != 4 {
++		t.Fatalf("identical historical revision rollback failed: %#v %v", publication, err)
++	}
++	selected := hotTestAcquire(t, cp, 2)
++	if selected.Identity != "p/one" {
++		t.Fatalf("historical identity not restored: %q", selected.Identity)
++	}
++}
++
++func TestHotProviderRevisionHistoryLimitRejectsWithoutEviction(t *testing.T) {
++	cp := hotTestControlPlane(t, filepath.Join(t.TempDir(), "state"), "first")
++	req := hotTestRequest("p", "one", "first", 1, "socks5://127.0.0.1:1")
++	if _, err := cp.PublishHotProvider(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	runtime := cp.hotInventory.Load()
++	runtime.mu.Lock()
++	for i := 1; i < hotMaxRevisions; i++ {
++		runtime.revisions["p"][fmt.Sprintf("historical-%d", i)] = hotRevisionDigest(req)
++	}
++	runtime.mu.Unlock()
++	req.ExpectedGeneration = 2
++	req.RevisionID = "beyond-limit"
++	if _, err := cp.PublishHotProvider(context.Background(), req); !errors.Is(err, outbound.ErrHotInventoryBusy) {
++		t.Fatalf("full revision history allowed eviction/overflow: %v", err)
++	}
++	if len(runtime.revisions["p"]) != hotMaxRevisions || runtime.revisions["p"]["one"] == "" {
++		t.Fatal("history bound evicted a protected identity")
++	}
++}
+diff --git a/control/session_manager.go b/control/session_manager.go
+index ad793b193419eb3e1af040f16379fe4f64ea5593..d6d0a27be8e1aaee9b0d76a174f066d51c0734be 100644
+--- a/control/session_manager.go
++++ b/control/session_manager.go
+@@ -456,6 +456,12 @@ func (m *SessionManager) adoptTCP(
+ 	if ingress == nil {
+ 		return nil, fmt.Errorf("adopt TCP flow: ingress is required")
+ 	}
++	if connectionOwnsHotEgress(egress) {
++		// Hot connections carry their pre-dial inventory lease through Close.
++		// The baseline runtime deliberately never owns these private dialers.
++		runtime = nil
++		binding.Egress.Outbound = binding.Egress.Outbound.SnapshotForEstablishedFlow(binding.Egress.Dialer)
++	}
+ 	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+ 	if !ok {
+ 		return nil, fmt.Errorf("adopt TCP flow: egress runtime is retiring")
+@@ -642,6 +648,10 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
+ 	if binding.Egress.Outbound == nil {
+ 		binding.Egress.Outbound = endpoint.Outbound
+ 	}
++	if connectionOwnsHotEgress(endpoint.conn) {
++		runtime = nil
++		binding.Egress.Outbound = binding.Egress.Outbound.SnapshotForEstablishedFlow(binding.Egress.Dialer)
++	}
+ 	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+ 	if !ok {
+ 		return nil, fmt.Errorf("adopt UDP flow: egress runtime is retiring")
+diff --git a/control/udp.go b/control/udp.go
+index 2a19ff654a95e9d5f7554de36dc5376bd6613d15..680e7d0116d95a4dc77e5c91fdb3b1ce10d0c5e9 100644
+--- a/control/udp.go
++++ b/control/udp.go
+@@ -195,6 +195,7 @@ func (c *ControlPlane) allowConnectionErrorLog(now time.Time) bool {
+ }
+ 
+ type DialOption struct {
++	hotLease      *ob.HotInventoryLease
+ 	Target        string
+ 	Dialer        *dialer.Dialer
+ 	Outbound      *ob.DialerGroup
+@@ -1102,10 +1103,12 @@ getNew:
+ 							res.IsDialIp,
+ 						)
+ 					}
++					_ = res.hotLease.Release()
+ 					return nil, ob.ErrNoAliveDialer
+ 				}
+ 
+ 				option = &DialOption{
++					hotLease: res.hotLease,
+ 					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
+ 					Target:        dialTarget,
+ 					Dialer:        res.Dialer,
+diff --git a/control/udp_endpoint_pool.go b/control/udp_endpoint_pool.go
+index 1e0f347d8eb9e036be2ed39bb9cd2329fec83421..d8b192d0e0e04198ea88c3ced068b6906552d531 100644
+--- a/control/udp_endpoint_pool.go
++++ b/control/udp_endpoint_pool.go
+@@ -662,9 +662,15 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption
+ 		}
+ 		return nil, err
+ 	}
++	defer func(option *DialOption) { _ = option.hotLease.Release() }(dialOption)
+ 	udpConn, err := dialOption.Dialer.DialContext(ctx, dialOption.Network, dialOption.Target)
+ 	if err != nil {
++		if udpConn != nil {
++			_ = udpConn.Close()
++		}
+ 		reportUdpEndpointDialCreateFailure(key, dialOption, err)
++		_ = dialOption.hotLease.Release()
++		dialOption.hotLease = nil
+ 		if shouldForceMarkUnavailableOnProxyDialError(err) {
+ 			// Use a fresh timeout context for the retry to avoid inheriting a
+ 			// nearly-expired deadline from the first dial attempt. When the first
+@@ -676,11 +682,15 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption
+ 			retryOption, retryErr := createOption.GetDialOption(retryCtx)
+ 			if retryErr == nil {
+ 				dialOption = retryOption
++				defer func(option *DialOption) { _ = option.hotLease.Release() }(dialOption)
+ 				udpConn, err = dialOption.Dialer.DialContext(retryCtx, dialOption.Network, dialOption.Target)
+ 				retryCancel()
+ 				if err == nil {
+ 					goto dialSuccess
+ 				}
++				if udpConn != nil {
++					_ = udpConn.Close()
++				}
+ 				reportUdpEndpointDialCreateFailure(key, dialOption, err)
+ 			} else {
+ 				retryCancel()
+@@ -693,6 +703,8 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption
+ 		return nil, err
+ 	}
+ dialSuccess:
++	udpConn = retainHotConnection(udpConn, dialOption.hotLease)
++	dialOption.hotLease = nil // Endpoint connection owns the complete hot lease.
+ 	packetConn, ok := udpConn.(netproxy.PacketConn)
+ 	if !ok {
+ 		_ = udpConn.Close()

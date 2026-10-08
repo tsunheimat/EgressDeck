@@ -1,0 +1,14 @@
+# Optional stock validation executable. It must run with this image's ABI and
+# architecture. Process identity cannot see a host PID namespace in this file.
+services:
+  gateway-agent:
+    environment:
+      GATEWAY_AGENT_DAE_EXECUTABLE: /opt/dae/dae
+      GATEWAY_AGENT_DAE_SHA256: ${GATEWAY_AGENT_DAE_SHA256:-}
+    volumes:
+      - type: bind
+        source: ${DAE_EXECUTABLE_HOST:?set DAE_EXECUTABLE_HOST to the qualified binary}
+        target: /opt/dae/dae
+        read_only: true
+        bind:
+          create_host_path: false

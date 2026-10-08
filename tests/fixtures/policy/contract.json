@@ -1,0 +1,108 @@
+{
+  "gateway": {
+    "id": "gateway-home",
+    "name": "Home gateway",
+    "supported_transports": ["tcp", "udp"],
+    "supports_ipv6": false,
+    "distinguishes_networks": true
+  },
+  "devices": [
+    {
+      "id": "device-build",
+      "name": "Build runner",
+      "addresses": [
+        {"address": "192.0.2.21", "family": "ipv4", "provenance": "static"}
+      ],
+      "group_id": "group-development",
+      "enabled": true
+    },
+    {
+      "id": "device-laptop",
+      "name": "Developer laptop",
+      "addresses": [
+        {"address": "192.0.2.22", "family": "ipv4", "provenance": "dhcp-reservation"}
+      ],
+      "group_id": "group-development",
+      "enabled": true
+    }
+  ],
+  "device_groups": [
+    {
+      "id": "group-development",
+      "name": "Development",
+      "gateway_id": "gateway-home",
+      "policy_id": "policy-development",
+      "device_ids": ["device-build", "device-laptop"],
+      "enabled": true
+    }
+  ],
+  "policies": [
+    {
+      "id": "policy-development",
+      "name": "Development policy",
+      "mandatory_rules": [
+        {
+          "id": "rule-block-malware",
+          "name": "Block malware",
+          "match": {"domain_suffix": ["malware.example"], "transports": ["tcp", "udp"]},
+          "action": {"kind": "block"},
+          "enabled": true,
+          "order": 10
+        }
+      ],
+      "entries": [
+        {
+          "rule": {
+            "id": "rule-ai",
+            "name": "AI services through development exit",
+            "match": {
+              "domain_suffix": ["ai.example.com"],
+              "destination_ports": [{"from": 443, "to": 443}],
+              "transport": ["tcp"]
+            },
+            "action": {"kind": "outbound_group", "outbound_group_id": "outbound-development"},
+            "enabled": true,
+            "order": 20
+          }
+        },
+        {"rule_set_id": "ruleset-standard"}
+      ],
+      "default_action": {"kind": "direct"},
+      "unknown_domain_action": {"kind": "direct"},
+      "proxy_failure_action": {"kind": "block"},
+      "strict": false
+    }
+  ],
+  "rule_sets": [
+    {
+      "id": "ruleset-standard",
+      "name": "Standard restrictions",
+      "rules": [
+        {
+          "id": "rule-git",
+          "name": "Source control",
+          "match": {"domain_exact": ["git.example.com"]},
+          "action": {"kind": "outbound_group", "outbound_group_id": "outbound-development"},
+          "enabled": true,
+          "order": 10
+        }
+      ]
+    }
+  ],
+  "outbound_groups": [
+    {
+      "id": "outbound-development",
+      "name": "Development exits",
+      "node_ids": ["node-alpha", "node-beta"],
+      "allow_empty": false
+    }
+  ],
+  "options": {
+    "gateway_id": "gateway-home",
+    "supported_transports": {"tcp": true, "udp": true},
+    "supports_ipv6": false,
+    "distinguishes_networks": true,
+    "uncontrolled_ipv6": true,
+    "strict": true
+  }
+}

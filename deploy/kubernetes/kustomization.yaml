@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: egressdeck-system
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - controller-config.yaml
+  - controller-pvc.yaml
+  - controller-deployment.yaml
+  - controller-service.yaml
+  - networkpolicy.yaml
+
+# The gateway agent is deliberately not included in the default overlay. It
+# must be installed only after a target-specific data-plane qualification:
+#   kubectl apply -k deploy/kubernetes/agent

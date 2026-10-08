@@ -1,0 +1,37 @@
+//go:build egressdeck_hot_harness
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Test-only bridge to the real control-plane publication implementation.
+package control
+
+import (
+	"context"
+	"io"
+	"time"
+
+	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/outbound"
+	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
+)
+
+// NewEgressDeckHotHarness omits kernel attachment and ingress. Native dialer
+// construction, publication, selection, encryption and recovery remain real.
+func NewEgressDeckHotHarness(stateDir string, names ...string) (*ControlPlane, error) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	option := &dialer.GlobalOption{Log: logger, CheckInterval: time.Hour}
+	cp := &ControlPlane{log: logger, ctx: context.Background(), hotDialerOption: option}
+	cp.outbounds = make([]*outbound.DialerGroup, int(consts.OutboundUserDefinedMin))
+	for _, name := range names {
+		cp.outbounds = append(cp.outbounds, outbound.NewDialerGroup(option, name, nil, nil,
+			outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed},
+			func(bool, *dialer.NetworkType, bool) {}))
+	}
+	if err := cp.EnableHotInventory(stateDir); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
+func (c *ControlPlane) CloseEgressDeckHotHarness() error { return c.closeHotInventory() }

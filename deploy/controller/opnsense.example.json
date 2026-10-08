@@ -1,0 +1,9 @@
+{
+  "base_url": "https://firewall.example.invalid",
+  "api_key": "replace-with-restricted-api-key",
+  "api_secret": "replace-with-restricted-api-secret",
+  "release": "26.7",
+  "root_ca_file": "/run/egressdeck/operator/opnsense-ca.crt",
+  "timeout": "15s",
+  "managed_aliases": []
+}

@@ -1,0 +1,140 @@
+{
+  "upstream": "https://github.com/daeuniverse/dae",
+  "base_commit": "e3fee8fbc68a65167af13b685ab0b958757e20ee",
+  "upstream_license": "AGPL-3.0-only",
+  "patch_branch": "egressdeck/hot-inventory-primitives",
+  "patches": [
+    {
+      "path": "patches/0001-native-hot-provider-runtime.patch",
+      "sha256": "6dc2bbcb8270adfaac62eda4e33abab98eef9009bfa89e9f107d672cb904aa38",
+      "bytes": 186862
+    }
+  ],
+  "files": [
+    {
+      "path": "cmd/hot_control.go",
+      "sha256": "488eded1c5079355e675e167aa6253400406cc1c869e0cb28fa400b338f7bc8e",
+      "bytes": 13459
+    },
+    {
+      "path": "cmd/hot_control_test.go",
+      "sha256": "bb5671cd6bee632212b0cceb3577e891674f71e461a46d25faa46888aad9848b",
+      "bytes": 12847
+    },
+    {
+      "path": "cmd/run.go",
+      "sha256": "1abe59376184cbdd52129dafe004b4f7537a8d8f6e0d497f770f2d7c2b92a1cf",
+      "bytes": 34553
+    },
+    {
+      "path": "cmd/run_controlplane.go",
+      "sha256": "1a98f8ffc7f6c03806c7713c5265eebd0b56936b60094aaf8bc499bfbd1ae509",
+      "bytes": 14894
+    },
+    {
+      "path": "component/outbound/dialer/hot_option.go",
+      "sha256": "b1f283eda69c9deb3eed29a3dbad4f15869ff7a51444afa0a5982df8841daeca",
+      "bytes": 1957
+    },
+    {
+      "path": "component/outbound/hot_inventory.go",
+      "sha256": "0d0836a8b4f3c6fbb33c0e49db99780f2eb2d343efee866d9e1d8b418999bbcd",
+      "bytes": 24146
+    },
+    {
+      "path": "component/outbound/hot_inventory_test.go",
+      "sha256": "5fb013e5ac67cfb295b9312e7511418587815024e43b5bea1140a305593965c4",
+      "bytes": 23746
+    },
+    {
+      "path": "control/connectivity.go",
+      "sha256": "db86e9e4ae95d8d637ca06b4cc8f63e078acbca94fde73b176affa523641e51d",
+      "bytes": 8500
+    },
+    {
+      "path": "control/control_plane.go",
+      "sha256": "c13edda012284bb3fe6b5e0c06f1d025f34bb6b70e0cc44745273924f6575888",
+      "bytes": 109909
+    },
+    {
+      "path": "control/control_plane_core.go",
+      "sha256": "7bf5fa7adc3789a35f7e07a15bf053f6cda6f0bda7afa33158b169a9cc9fb894",
+      "bytes": 20873
+    },
+    {
+      "path": "control/dial.go",
+      "sha256": "708125c19928ac1607d5fbfc93ca123bdde94075fc5f5ef1ef590ad84287c6b5",
+      "bytes": 9310
+    },
+    {
+      "path": "control/dns_controller_forwarder.go",
+      "sha256": "e9958cba4c04a3a50d903b4113b3f5ad1b03c757b0b826a131dc5d631ba8603e",
+      "bytes": 18229
+    },
+    {
+      "path": "control/dns_controller_handle.go",
+      "sha256": "36cd494512f9627995509cd1b8152f4b37eacabd29a95fa11eaa3094db79c1e9",
+      "bytes": 26892
+    },
+    {
+      "path": "control/hot_connection.go",
+      "sha256": "55b2817289f519517c233d86167173ea077c01a399422f6d0838c43dc7978c21",
+      "bytes": 3047
+    },
+    {
+      "path": "control/hot_connection_test.go",
+      "sha256": "f240d457535eab000031918d649b1d8ac2d3e914a978b76d70685f65ef817366",
+      "bytes": 13867
+    },
+    {
+      "path": "control/hot_dns.go",
+      "sha256": "3e2101ced19b11708b37ebc8ccd8f73c43930b551497fddd4e72c96ad33c4553",
+      "bytes": 2274
+    },
+    {
+      "path": "control/hot_dns_test.go",
+      "sha256": "2817370ea81d03a0d715260b8fb5c81dc62c89e769c433cfc3780c04414466d4",
+      "bytes": 9061
+    },
+    {
+      "path": "control/hot_inventory.go",
+      "sha256": "18202ba23b14efcaec80d07f1a0e639db76ed6a405fe31f45553a22b9d978b81",
+      "bytes": 29909
+    },
+    {
+      "path": "control/hot_inventory_test.go",
+      "sha256": "683a3190dc8d51a2e345b4e6093f3a8880c19b947d724118771957f3f9b68dbb",
+      "bytes": 23179
+    },
+    {
+      "path": "control/session_manager.go",
+      "sha256": "d2e9c93e394725a724a5e2910b3e1f2c15c548d812bb57812aeee62f490ce5e8",
+      "bytes": 28032
+    },
+    {
+      "path": "control/udp.go",
+      "sha256": "ed0d26131684a3d3fca812ec3bac214dc7cf045bab5d583f9ed8bd1c283dd681",
+      "bytes": 43868
+    },
+    {
+      "path": "control/udp_endpoint_pool.go",
+      "sha256": "d17086de1ca96a872d36fa77ebf8eaad0771490fd94a79f940cfc0b28b4f8f3a",
+      "bytes": 32522
+    }
+  ],
+  "dependencies": {
+    "go": "1.26.0",
+    "bpf_headers": {
+      "url": "https://github.com/daeuniverse/dae_bpf_headers",
+      "commit": "56937c66784879fe5e2ff89db5bc05aa061d594c"
+    },
+    "outbound_module": "github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260918090140-cc86ced2e683"
+  },
+  "license_sha256": "4df3c306dddaaf4baffdff5ca820cc679ac8cd6dc263c6a74517783e42fa7a3b",
+  "qualification": "native component and real generated BPF compile; no live eBPF or OPNsense runtime acceptance",
+  "validation_artifacts": {
+    "test_binary_sha256": "1560c7c2b88f18a2632705a9cfb940df3d47e840889a9632a41512af86e75aeb",
+    "generated_bpf_object_sha256": "06ca4cddfb8eb8556f6cc151546cb876abdbc7783343336e591bea7a1e80b640",
+    "generated_bpf_go_sha256": "4ff8f22a878f42459b805f3d356269a80fc849a928c6ec08907822959bf19086"
+  }
+}

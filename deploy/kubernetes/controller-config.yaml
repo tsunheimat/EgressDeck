@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: controller-config
+  labels:
+    app.kubernetes.io/name: controller
+data:
+  LISTEN_ADDR: ":8080"
+  AUTH_MODE: session
+  COOKIE_SECURE: "true"
+  STORAGE_PATH: /var/lib/homelab-proxy-controller/store.json

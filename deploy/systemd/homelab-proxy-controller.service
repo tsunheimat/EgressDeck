@@ -1,0 +1,40 @@
+[Unit]
+Description=Homelab Proxy Controller API
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/homelab-proxy-controller
+
+[Service]
+Type=simple
+User=homelab-proxy
+Group=homelab-proxy
+EnvironmentFile=/etc/homelab-proxy-controller/controller.env
+ExecStart=/usr/local/bin/homelab-proxy-controller
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+UMask=0077
+
+# The controller is a management API. It must not gain packet-processing or
+# arbitrary helper privileges through this unit.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/homelab-proxy-controller
+StateDirectory=homelab-proxy-controller
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

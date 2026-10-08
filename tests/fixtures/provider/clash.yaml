@@ -1,0 +1,23 @@
+port: 7890
+allow-lan: false
+external-controller: 127.0.0.1:9090
+proxies:
+  - name: gamma
+    type: vmess
+    server: edge-c.example.net
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    tls: true
+    servername: edge-c.example.net
+  - name: delta
+    type: socks5
+    server: edge-d.example.net
+    port: 1080
+    username: user
+    password: delta-secret
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [gamma, delta]
+rules:
+  - MATCH,auto

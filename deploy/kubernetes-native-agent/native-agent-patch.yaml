@@ -1,0 +1,55 @@
+# Target template: place the pod only on the reviewed daemon host. The daemon
+# and agent must have the same UID (10002 here), or peer credential checks fail.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-agent
+spec:
+  template:
+    spec:
+      nodeSelector:
+        egressdeck.example/native-gateway: qualified
+      initContainers:
+        - name: initialize-private-journal
+          image: alpine:3.20
+          command: ["/bin/sh", "-ec"]
+          args: ["mkdir -p /state/journal; chown 10002:10002 /state/journal; chmod 0700 /state/journal"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, FOWNER, DAC_OVERRIDE]
+          volumeMounts:
+            - name: state
+              mountPath: /state
+      containers:
+        - name: gateway-agent
+          args: ["-engine=native"]
+          env:
+            - name: GATEWAY_AGENT_JOURNAL
+              value: /var/lib/homelab-proxy-gateway-agent/journal/native.jsonl
+            - name: GATEWAY_AGENT_NATIVE_SOCKET
+              value: /run/dae-hot/control.sock
+            - name: GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-agent-native-key
+                  key: encryption-key
+            - name: GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY_ID
+              value: native-primary
+          volumeMounts:
+            - name: native-socket
+              mountPath: /run/dae-hot
+              readOnly: true
+      volumes:
+        - name: state
+          emptyDir: null
+          persistentVolumeClaim:
+            claimName: gateway-native-state
+        - name: native-socket
+          hostPath:
+            path: /run/dae-hot
+            type: Directory

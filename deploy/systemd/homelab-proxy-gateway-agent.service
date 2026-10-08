@@ -1,0 +1,41 @@
+[Unit]
+Description=Homelab Proxy Gateway Agent
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/homelab-proxy-gateway-agent
+
+[Service]
+Type=simple
+User=homelab-proxy-agent
+Group=homelab-proxy-agent
+EnvironmentFile=/etc/homelab-proxy-gateway-agent/gateway-agent.env
+ExecStart=/usr/local/bin/homelab-proxy-gateway-agent -engine=stock
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+UMask=0077
+
+# This service exposes the authenticated management contract. It does not
+# receive packet-processing privileges until a target-specific qualification
+# supplies an explicit, reviewed capability boundary.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/homelab-proxy-gateway-agent
+StateDirectory=homelab-proxy-gateway-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

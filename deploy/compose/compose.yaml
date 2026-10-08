@@ -1,0 +1,117 @@
+name: homelab-proxy-controller
+
+services:
+  controller:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    image: ${CONTROLLER_IMAGE:-homelab-proxy-controller:dev}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      LISTEN_ADDR: ":8080"
+      AUTH_MODE: ${AUTH_MODE:-session}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET to a random value of at least 32 bytes}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?set APP_ENCRYPTION_KEY to base64 encoding of 32 random bytes}
+      APP_ENCRYPTION_KEY_ID: ${APP_ENCRYPTION_KEY_ID:-primary}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      STORAGE_PATH: /var/lib/homelab-proxy-controller/store.json
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL:-}
+      OIDC_GROUP_ROLES: ${OIDC_GROUP_ROLES:-}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_SCOPES: ${OIDC_SCOPES:-}
+      OIDC_SUCCESS_PATH: ${OIDC_SUCCESS_PATH:-/}
+      IDENTITY_HEADER_SECRET: ${IDENTITY_HEADER_SECRET:-}
+      PROVIDER_FETCH_CONFIG_FILE: ${PROVIDER_FETCH_CONFIG_FILE:-}
+      OPNSENSE_CONFIG_FILE: ${OPNSENSE_CONFIG_FILE:-}
+      CONTROLLER_GATEWAYS_FILE: ${CONTROLLER_GATEWAYS_FILE:-}
+    volumes:
+      - controller-state:/var/lib/homelab-proxy-controller
+    networks: [control, management-egress]
+    ports:
+      - "${CONTROLLER_BIND:-127.0.0.1}:${CONTROLLER_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -q -O - http://127.0.0.1:8080/healthz | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # Optional development proxy for frontend-only rebuilds. The default
+  # controller image already serves the compiled UI from its Go process.
+  web:
+    profiles: [ui]
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.web
+    image: ${WEB_IMAGE:-homelab-proxy-controller-web:dev}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=8m
+      - /var/run:rw,noexec,nosuid,size=1m,uid=101,gid=101,mode=700
+      - /tmp:rw,noexec,nosuid,size=8m,uid=101,gid=101,mode=700
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks: [control]
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  # The default image has no dae binary. Stock mode reports unavailable until
+  # an operator mounts a compatible executable; it never starts a data plane.
+  gateway-agent:
+    profiles: [agent]
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.gateway-agent
+    image: ${GATEWAY_AGENT_IMAGE:-homelab-proxy-gateway-agent:dev}
+    command: ["-engine=stock"]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      # The agent refuses to start when this is empty. It is optional for the
+      # controller-only compose invocation because this service is profiled.
+      GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:-}
+      GATEWAY_AGENT_TLS_CERT: /etc/egressdeck/agent/server.crt
+      GATEWAY_AGENT_TLS_KEY: /etc/egressdeck/agent/server.key
+      GATEWAY_AGENT_CLIENT_CA: /etc/egressdeck/agent/client-ca.crt
+    volumes:
+      - gateway-agent-state:/var/lib/homelab-proxy-gateway-agent
+      - ./agent-certs:/etc/egressdeck/agent:ro
+    networks: [control]
+    expose: ["9090"]
+
+networks:
+  control:
+    driver: bridge
+    internal: true
+  # OIDC, provider fetches and explicitly configured HTTPS adapters need egress.
+  # Restrict destinations with the management host firewall where required.
+  management-egress:
+    driver: bridge
+
+volumes:
+  controller-state:
+  gateway-agent-state:

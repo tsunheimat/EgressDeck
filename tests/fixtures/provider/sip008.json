@@ -1,0 +1,20 @@
+{
+  "servers": [
+    {
+      "name": "alpha",
+      "type": "ss",
+      "server": "edge-a.example.net",
+      "server_port": 443,
+      "cipher": "chacha20-ietf-poly1305",
+      "password": "alpha-secret"
+    },
+    {
+      "name": "beta",
+      "type": "trojan",
+      "server": "edge-b.example.net",
+      "server_port": 8443,
+      "password": "beta-secret",
+      "sni": "edge-b.example.net"
+    }
+  ]
+}

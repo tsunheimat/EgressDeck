@@ -1,0 +1,211 @@
+name: dae native source validation
+
+# This hosted job compiles BPF and tests native source components. It does not
+# attach BPF, start a traffic gateway, or qualify OPNsense/packet-path behavior.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/dae/**'
+      - 'internal/gateway/**'
+      - 'internal/secrets/**'
+      - 'cmd/gateway-agent/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/dae-native.yml'
+  pull_request:
+    paths:
+      - 'engine/dae/**'
+      - 'internal/gateway/**'
+      - 'internal/secrets/**'
+      - 'cmd/gateway-agent/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/dae-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dae-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Pinned native tests and BPF build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      BPF_CLANG: clang
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out controller source and engine patch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up the engine's exact Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+          cache: false
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential clang llvm libbpf-dev libelf-dev pkg-config shellcheck
+
+      - name: Verify export and toolchain pins
+        run: |
+          set -euo pipefail
+          shellcheck engine/dae/build-and-test.sh
+          test ! -e "$RUNNER_TEMP/dae-engine"
+          test ! -L "$RUNNER_TEMP/dae-engine"
+          mkdir -p "$RUNNER_TEMP/dae-evidence"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import subprocess
+
+          export = Path('engine/dae')
+          manifest = json.loads((export / 'source-manifest.json').read_text())
+          script = (export / 'build-and-test.sh').read_text()
+          version = subprocess.check_output(['go', 'env', 'GOVERSION'], text=True).strip()
+          assert version == 'go' + manifest['dependencies']['go'] == 'go1.26.0', version
+          assert manifest['upstream'] == 'https://github.com/daeuniverse/dae'
+          assert manifest['dependencies']['bpf_headers']['url'] == 'https://github.com/daeuniverse/dae_bpf_headers'
+          assert len(manifest['patches']) == 1, 'update workflow when patch series grows'
+          patch = manifest['patches'][0]
+          for name, expected in (
+              ('base_commit', manifest['base_commit']),
+              ('headers_commit', manifest['dependencies']['bpf_headers']['commit']),
+              ('patch_sha', patch['sha256']),
+          ):
+              actual = re.search(r'^' + name + r'=([0-9a-f]+)$', script, re.MULTILINE)
+              assert actual and actual.group(1) == expected, name + ' differs from manifest'
+          patch_path = export / patch['path']
+          assert patch_path.resolve().is_relative_to(export.resolve()), 'patch path escapes export'
+          content = patch_path.read_bytes()
+          assert len(content) == patch['bytes'], 'patch size mismatch'
+          assert hashlib.sha256(content).hexdigest() == patch['sha256'], 'patch hash mismatch'
+          assert hashlib.sha256((export / 'LICENSE.dae').read_bytes()).hexdigest() == manifest['license_sha256']
+          print('Verified exact Go, upstream, BPF header, patch, and license pins.')
+          PY
+
+      - name: Generate real BPF and run native source tests
+        run: |
+          set -euo pipefail
+          bash engine/dae/build-and-test.sh "$RUNNER_TEMP/dae-engine" \
+            2>&1 | tee "$RUNNER_TEMP/dae-evidence/build-and-test.log"
+
+      - name: Verify resulting source manifest and dependency versions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          manifest = json.loads(Path('engine/dae/source-manifest.json').read_text())
+          source = Path(os.environ['RUNNER_TEMP']) / 'dae-engine'
+          def git(*args):
+              return subprocess.check_output(['git', '-C', str(source), *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == manifest['base_commit']
+          assert git('remote', 'get-url', 'origin').removesuffix('.git') == manifest['upstream']
+          for submodule in ('control/kern/headers', 'trace/kern/headers'):
+              commit = subprocess.check_output(['git', '-C', str(source / submodule), 'rev-parse', 'HEAD'], text=True).strip()
+              assert commit == manifest['dependencies']['bpf_headers']['commit'], submodule
+          for entry in manifest['files']:
+              path = source / entry['path']
+              assert path.resolve().is_relative_to(source.resolve()), 'source path escapes checkout'
+              content = path.read_bytes()
+              assert len(content) == entry['bytes'], entry['path'] + ': size mismatch'
+              assert hashlib.sha256(content).hexdigest() == entry['sha256'], entry['path'] + ': hash mismatch'
+          modules = json.loads(subprocess.check_output(['go', 'mod', 'edit', '-json'], cwd=source, text=True))
+          assert modules['Go'] == manifest['dependencies']['go']
+          replacement = next(item['New'] for item in modules['Replace'] if item['Old']['Path'] == 'github.com/daeuniverse/outbound')
+          assert replacement['Path'] + ' ' + replacement['Version'] == manifest['dependencies']['outbound_module']
+          print('Verified patched source bytes, upstream commit, submodules, and outbound dependency.')
+          PY
+
+      - name: Test native adapter and source API across process restart
+        run: |
+          set -euo pipefail
+          python3 engine/dae/fixtures/run_native_source.py \
+            --dae-source "$RUNNER_TEMP/dae-engine" \
+            --go "$(command -v go)" \
+            --receipt "$RUNNER_TEMP/dae-evidence/native-source-receipt.json" \
+            2>&1 | tee "$RUNNER_TEMP/dae-evidence/native-source.log"
+
+      - name: Collect native source build evidence
+        if: always()
+        env:
+          SOURCE_VALIDATION_OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import subprocess
+
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'dae-evidence'
+          source = Path(os.environ['RUNNER_TEMP']) / 'dae-engine'
+          evidence.mkdir(parents=True, exist_ok=True)
+          shutil.copytree('engine/dae', evidence / 'engine-export', dirs_exist_ok=True)
+          for name in ('dae-r05', 'go.mod', 'go.sum', 'control/bpf_bpfel.go', 'control/bpf_bpfel.o'):
+              candidate = source / name
+              if candidate.is_file():
+                  destination = evidence / 'native' / name
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(candidate, destination)
+          def capture(command):
+              try:
+                  result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+                  return {'command': command, 'exit_code': result.returncode, 'output': result.stdout}
+              except OSError as error:
+                  return {'command': command, 'error': str(error)}
+          receipt = {
+              'scope': 'native source tests and generated BPF compile; no kernel attachment or OPNsense/network qualification',
+              'source_validation_outcome': os.environ['SOURCE_VALIDATION_OUTCOME'],
+              'repository_commit': os.environ['GITHUB_SHA'],
+              'run_url': os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+              'host': platform.platform(),
+              'tools': [capture(command) for command in (
+                  ['go', 'version'], ['clang', '--version'], ['llvm-strip', '--version'],
+                  ['dpkg-query', '--show', 'build-essential', 'clang', 'llvm', 'libbpf-dev', 'libelf-dev', 'pkg-config', 'shellcheck'],
+              )],
+              'source': [capture(command) for command in (
+                  ['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                  ['git', '-C', str(source), 'submodule', 'status', '--recursive'],
+              )],
+          }
+          (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          entries = []
+          for path in sorted(evidence.rglob('*')):
+              if path.is_file() and path.name != 'SHA256SUMS':
+                  entries.append(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(evidence)))
+          (evidence / 'SHA256SUMS').write_text('\n'.join(entries) + '\n')
+          PY
+
+      - name: Upload patch, manifest, native binary, and generated BPF evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dae-native-source-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dae-evidence/
+          if-no-files-found: error
+          retention-days: 30

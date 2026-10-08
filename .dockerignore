@@ -1,0 +1,10 @@
+.git
+.github
+.codex
+node_modules
+**/node_modules
+dist
+coverage
+tmp
+*.log
+*.swp

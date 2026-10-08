@@ -1,0 +1,55 @@
+//go:build egressdeck_hot_harness
+
+// SPDX-License-Identifier: AGPL-3.0-only
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/daeuniverse/dae/control"
+)
+
+func TestEgressDeckNativeSourceHarness(t *testing.T) {
+	dir := os.Getenv("EGRESSDECK_NATIVE_HARNESS_DIR")
+	if dir == "" {
+		t.Skip("source integration runner supplies the private harness directory")
+	}
+	cp, err := control.NewEgressDeckHotHarness(filepath.Join(dir, "state"), "egress-a", "egress-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cp.CloseEgressDeckHotHarness(); err != nil {
+			t.Error(err)
+		}
+	}()
+	server, err := startHotControl(cp, filepath.Join(dir, "control.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := os.WriteFile(filepath.Join(dir, "ready"), []byte("ready\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(2 * time.Minute)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if _, err := os.Stat(filepath.Join(dir, "stop")); err == nil {
+				return
+			}
+		case <-timeout.C:
+			t.Fatal("native source harness timed out")
+		}
+	}
+}

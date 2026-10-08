@@ -1,0 +1,74 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'tests/**'
+      - '.github/workflows/go.yml'
+  pull_request:
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'tests/**'
+      - '.github/workflows/go.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, vet, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(git ls-files '*.go')"
+          test -n "$files"
+          # gofmt -l exits zero even when it reports files, so check the output.
+          formatted="$(gofmt -l $files)"
+          test -z "$formatted" || { printf 'Unformatted Go files:\n%s\n' "$formatted"; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Fuzz subscription parsing
+        run: go test ./internal/providers -run '^$' -fuzz FuzzParseSubscription -fuzztime 20s -parallel 4
+
+      - name: Build all commands
+        run: go build ./cmd/...
+
+      - name: Upload Go coverage
+        if: always() && hashFiles('coverage.out') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-${{ github.sha }}
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14

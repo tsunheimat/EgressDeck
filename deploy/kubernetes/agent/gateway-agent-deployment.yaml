@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-agent
+  labels:
+    app.kubernetes.io/name: gateway-agent
+    app.kubernetes.io/part-of: egressdeck
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway-agent
+        app.kubernetes.io/part-of: egressdeck
+    spec:
+      serviceAccountName: gateway-agent
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway-agent
+          image: homelab-proxy-gateway-agent:dev
+          args: ["-engine=stock"]
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: GATEWAY_AGENT_LISTEN
+              value: ":9090"
+            - name: GATEWAY_AGENT_JOURNAL
+              value: /var/lib/homelab-proxy-gateway-agent/journal.ndjson
+            - name: GATEWAY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-agent-secret
+                  key: token
+            - name: GATEWAY_AGENT_TLS_CERT
+              value: /etc/egressdeck/tls/tls.crt
+            - name: GATEWAY_AGENT_TLS_KEY
+              value: /etc/egressdeck/tls/tls.key
+            - name: GATEWAY_AGENT_CLIENT_CA
+              value: /etc/egressdeck/tls/ca.crt
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          # mTLS requires a client certificate, so kubelet HTTP probes cannot
+          # authenticate. A TCP check covers process availability only; the
+          # controller reads authenticated engine health separately.
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/egressdeck/tls
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/homelab-proxy-gateway-agent
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls
+          secret:
+            secretName: gateway-agent-tls
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

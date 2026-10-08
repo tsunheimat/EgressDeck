@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controller-ingress-egress
+  labels:
+    app.kubernetes.io/part-of: egressdeck
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: controller
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: web
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway-agent
+      ports:
+        - protocol: TCP
+          port: 9090
+    # OIDC, OPNsense, and future provider fetches must use TLS. Narrow this
+    # destination with an egress gateway/CIDR in the target cluster.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 5432

@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+spec:
+  template:
+    spec:
+      # Kubernetes projected Secrets use symlinks. Copy to a private regular
+      # file layout because the controller rejects symlinked operator JSON.
+      initContainers:
+        - name: copy-operator-configuration
+          image: alpine:3.20
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              mkdir -p /private/operator
+              for source in /source/*; do
+                [ -f "$source" ] || continue
+                cp -L "$source" "/private/operator/${source##*/}"
+              done
+              chmod 0700 /private/operator
+              chmod 0600 /private/operator/*
+              chown -R 10001:10001 /private/operator
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, FOWNER, DAC_OVERRIDE]
+          volumeMounts:
+            - name: operator-source
+              mountPath: /source
+              readOnly: true
+            - name: operator-private
+              mountPath: /private
+      containers:
+        - name: controller
+          # Optional config paths are set in controller-secret. JSON should
+          # refer to certificates under /run/egressdeck/operator as well.
+          volumeMounts:
+            - name: operator-private
+              mountPath: /run/egressdeck
+              readOnly: true
+      volumes:
+        - name: operator-source
+          secret:
+            secretName: controller-operator-files
+            defaultMode: 0400
+        - name: operator-private
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi

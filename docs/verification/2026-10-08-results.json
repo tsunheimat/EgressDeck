@@ -1,0 +1,84 @@
+{
+  "baseline_commit": "71550c9",
+  "contracts": "controller 47 paths/76 operations/121 schemas; agent 24 paths; route/JSON-field/ref checks and Redocly lint passed",
+  "date": "2026-10-08",
+  "delivery": "implementation files are present in the working tree; no aggregate commit, push or deployment performed",
+  "go": {
+    "checks_passed": 1124,
+    "command": "go test -race ./... -count=1 -timeout 120s",
+    "exit": 0,
+    "host": "agnet-test",
+    "job": "rt-20261008-061842-rk815qb9",
+    "limits": "Conditional PostgreSQL, pinned native parser and actual native daemon harness tests require their separate explicit environments; see separate receipts.",
+    "packages": 20
+  },
+  "images": {
+    "agent": "sha256:cdd241448c5e2bf5a959fb2fa7e69c3532bf6a33c205f855867a581589aa6880",
+    "controller": "sha256:394fa74a92623394254e886b2b5060553c6d2b8e08f0a4b0cf0b19ef83adda3b",
+    "controller_smoke": "passed static UI, signed login, RBAC, encrypted staging, CRUD, immutable plan, resumable events, encrypted journal, metrics, unsupported refusal, restart"
+  },
+  "native_source": {
+    "actual_adapter_source_receipt": "../../engine/dae/evidence/native-source-receipt.json",
+    "base": "e3fee8fbc68a65167af13b685ab0b958757e20ee",
+    "broader_stub_race_checks": 1055,
+    "native_build": "passed with generated BPF objects",
+    "native_hot_race_checks": 60,
+    "native_vet": "passed",
+    "patch_sha256": "6dc2bbcb8270adfaac62eda4e33abab98eef9009bfa89e9f107d672cb904aa38",
+    "receipt": "../../engine/dae/VALIDATION.md",
+    "receipt_readback": "adapter hashes and source manifest independently matched by root"
+  },
+  "not_run": [
+    "hosted GitHub Actions",
+    "live OPNsense appliance calls",
+    "eBPF/tc attachment and packet-path qualification",
+    "strict guard/enrollment acceptance",
+    "OpenWrt runtime qualification",
+    "performance baseline"
+  ],
+  "parser_fuzz": {
+    "command": "go test ./internal/providers -run '^$' -fuzz FuzzParseSubscription -fuzztime 20s -parallel 4",
+    "exit": 0,
+    "host": "agnet-test",
+    "job": "rt-20261008-060200-qxlzqpk0"
+  },
+  "postgres": {
+    "boundary": "real PostgreSQL, HTTP API, encrypted restart, exact CAS rejection resource checks; external selection/provider fixtures",
+    "command": "go test -race -count=1 -v ./tests/integration ./internal/store -run '^(TestPostgresAPILifecycle|TestPostgresIntegration)$'",
+    "exit": 0,
+    "go": "1.23.12",
+    "host": "u25-code1",
+    "postgres": "16.15",
+    "snapshot_manifest_sha256": "b8dadd4399255d893f7723ab3bb805e5ddb9eb16e4946a07de6c0ca1a141d877"
+  },
+  "remaining_implementation": [
+    "complete native policy assembly and coordinated policy application while hot mode is active",
+    "qualified independent guard, firewall session handling and client probe for enrollment",
+    "native health probing/connection and traffic observation capabilities"
+  ],
+  "screenshots": {
+    "apps/web/e2e/artifacts/proxy-selection-desktop.png": "399a7b130ba38e0e0c67e7376a4c265a86aadd4bef2973812e0ab11f26d54f8e",
+    "apps/web/e2e/artifacts/proxy-selection-mobile.png": "cd71360a31da648a460b6879d4b7a71ceb7962bbf4c7cce38aee03e67b57fd16",
+    "apps/web/e2e/artifacts/rule-set-editor-desktop.png": "a4a77ab86cdfc1e2cf5684b7473f47da085ffd34f04e673e2cb31a759673da7c"
+  },
+  "source_files": 341,
+  "source_manifest": "2026-10-08-source-manifest.json",
+  "source_manifest_sha256": "c24968e5961eeb5efc8aa7646b29e8b67e5b159073c12e042379a02259a2daad",
+  "vet": {
+    "command": "go vet ./...",
+    "exit": 0,
+    "host": "agnet-test",
+    "job": "rt-20261008-061842-97rw5cm0"
+  },
+  "web": {
+    "boundary": "real Go HTTP controller/session/RBAC/CSRF; explicit external provider and gateway fixtures",
+    "browser": "local Chrome",
+    "browser_duration_seconds": 16.3,
+    "browser_host": "u25-code1",
+    "browser_tests": 14,
+    "production_build": "passed",
+    "typecheck": "passed",
+    "unit_component_checks": 73
+  },
+  "workspace_head": "ce9a07a75e157e7aacf96cf7499342e5d5c7d60d"
+}

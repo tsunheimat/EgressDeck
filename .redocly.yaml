@@ -1,0 +1,11 @@
+extends:
+  - recommended
+
+# The API contract is intentionally compact and uses operationId only where a
+# generated client needs one. Keep structural validation strict while allowing
+# the document to omit prose-only lint conventions from the first release.
+rules:
+  operation-summary: off
+  operation-operationId: off
+  operation-4xx-response: off
+  tag-description: off

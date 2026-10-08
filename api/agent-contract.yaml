@@ -1,0 +1,1855 @@
+openapi: 3.1.0
+info:
+  title: EgressDeck Gateway Agent Contract
+  version: 1.0.0
+  summary: Implemented controller-to-gateway-agent HTTP protocol
+  description: |-
+    Describes the HTTP handlers in cmd/gateway-agent and the stock, native, and fake backends in internal/gateway. The default stock backend exposes executable/process health and optionally native policy validation. Its managed inventory, publication, selection, application, probes, connections, counters, and events remain unsupported. Explicit native mode connects to the patched daemon through a protected Unix socket and enables the five capabilities listed under x-native-capabilities when inventory is reachable. Fake-engine success represents simulation only.
+
+    On remote listeners, TLS 1.3 with verified client certificates and a bearer token are required together. Literal-loopback listeners may use plaintext; explicit development mode may disable the bearer token. Native HTTP routes start at /v1 with no /agent prefix.
+
+    Mutation responses are synchronous. Idempotency-Key is not processed and HTTP replay safety is not promised. No asynchronous 202 receipt or operation-resource endpoint exists. A lost mutation acknowledgement requires readback before retry. Native mutations retain unresolved intent and return outcome_unknown when authoritative readback cannot establish the result; stock readback remains unsupported.
+
+    Private staging requests may carry credential-bearing node connections. Public Node JSON excludes connection; native snapshot construction also clears identity and definition_hash. Native encrypted recovery state is removed from /v1/journal output.
+
+    Most request decoders reject unknown fields. Staging uses a separate flat-or-nested decoder that ignores unknown fields. Omitted integer fences default to zero. Errors contain an error field holding either a string or a typed object. Generation and revision conflicts return HTTP 409; native outcome_unknown returns HTTP 503.
+servers:
+  - url: https://{gateway}
+    description: Native remote agent listener; mTLS and bearer authentication are both required.
+    variables:
+      gateway:
+        default: gateway.example.invalid:9090
+security:
+  - mutualTLS: []
+    bearerAuth: []
+tags:
+  - name: discovery
+    description: Agent liveness, health, and engine capabilities.
+  - name: providers
+    description: Staging and publication of provider revisions.
+  - name: selection
+    description: Runtime and durable selection.
+  - name: policy
+    description: Policy validation and application.
+  - name: probes
+    description: Engine node and group probes.
+  - name: readback
+    description: Inventory, journal, connections, counters, and events.
+x-stock-capabilities:
+  description: All fourteen capability entries are returned. Only policy.validate can become supported,
+    after executable availability and version readback succeed. All other entries remain false.
+  conditionally-supported:
+    - policy.validate
+  always-unsupported:
+    - inventory.read
+    - provider.stage
+    - provider.publish_hot
+    - selection.set_runtime
+    - selection.persist_restart
+    - policy.apply_generation
+    - probe.node
+    - probe.group
+    - connections.observe
+    - connections.close_filtered
+    - traffic.proxy_counters
+    - traffic.direct_counters
+    - events.resume
+x-planned-operations:
+  - method: GET
+    path: /v1/operations/{operationId}
+    status: planned-only
+    description: Not registered. Current operation history is the bare journal array at /v1/journal.
+paths:
+  /healthz:
+    get:
+      tags:
+        - discovery
+      operationId: readLiveness
+      summary: Read process liveness
+      description: No bearer token is required. On a TLS listener, client certificate verification still
+        occurs during the TLS handshake before this route can be reached.
+      security: []
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Liveness'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/health:
+    get:
+      tags:
+        - discovery
+      operationId: readHealth
+      summary: Read engine executable and process health
+      responses:
+        '200':
+          description: Health including unavailable or degraded status is returned with HTTP 200.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/capabilities:
+    get:
+      tags:
+        - discovery
+      operationId: discoverCapabilities
+      summary: Read all known engine capabilities
+      description: Returns every known capability. Stock supports only policy.validate conditionally.
+        Native supports inventory.read, provider.stage, provider.publish_hot, selection.set_runtime, and
+        selection.persist_restart only while daemon inventory is reachable. Fake entries describe simulation
+        and include restrictions.
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/inventory:
+    get:
+      tags:
+        - readback
+      operationId: readInventory
+      summary: Read the current engine snapshot
+      x-required-capability: inventory.read
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/readback:
+    get:
+      tags:
+        - readback
+      operationId: readGeneration
+      summary: Read the current raw engine snapshot
+      description: Exact handler alias of /v1/inventory. Query parameters, including generation, are ignored;
+        historical generation selection is not implemented. Stock returns 501 with operation inventory.read.
+      x-required-capability: inventory.read
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/journal:
+    get:
+      tags:
+        - readback
+      operationId: readJournal
+      summary: Read operation journal entries
+      description: Returns a bare JSON array. With no journal configured the result is []; an empty or
+        missing ordinary file journal may produce null. Native mode requires its durable journal. Public
+        output strips state from native.state entries, including encrypted recovery material; status and
+        lifecycle metadata remain visible. No operation-resource polling endpoint exists.
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                type:
+                  - array
+                  - 'null'
+                items:
+                  $ref: '#/components/schemas/JournalEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/providers/stage:
+    post:
+      tags:
+        - providers
+      operationId: stageProviderRevision
+      summary: Stage an immutable provider revision
+      description: |-
+        Both flat and nested private revision forms are accepted, including nodes[].connection and groups[]. Staging retains active state and returns a synchronous receipt with an opaque stage_id.
+
+        Fake staging checks expected_generation, normalizes missing node provider IDs and content hash, and accepts empty nodes only with allow_empty. Native staging requires a nonnegative expected generation matching daemon inventory, nonempty nodes with private connection links, exactly one predeclared group, distinct group candidates belonging to those nodes, and a selected candidate. The provider ID cannot contain a slash. Native revisions must advance active state and must not regress or change an already-staged immutable revision; total retained staging is bounded at 64 and the encoded native publication at 1 MiB.
+
+        Native private requests are retained in encrypted recovery state. Public stage receipts contain no node links. Empty native provider revisions still return HTTP 500. Idempotency-Key is not used; native exact same-revision staging can reuse its receipt independently of that header.
+      x-required-capability: provider.stage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StageProviderRequest'
+      responses:
+        '201':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StagedProvider'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/providers/publish:
+    post:
+      tags:
+        - providers
+      operationId: publishProviderRevision
+      summary: Publish a staged provider revision
+      description: |-
+        Nonnegative expected_generation performs inventory preflight. Stock therefore normally rejects with 501 operation inventory.read before publication. Negative values skip only the HTTP preflight; engine staging-generation rules still apply.
+
+        Native publication persists pending intent, submits a conditional daemon mutation, and requires fresh daemon identity/generation readback. Unresolved acknowledgement or readback returns 503 with error.code outcome_unknown, and the pending intent prevents replay until reconciled. Typed rejection can return 400 invalid_request, 409 conflict, or 429 busy. Successful response always says published, including fake no-ops. Probe/drain options are not accepted. The providerId path alias is ignored by the handler; stage_id selects the revision.
+      x-required-capability: provider.publish_hot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishProviderRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+  /v1/providers/{providerId}/publish:
+    post:
+      tags:
+        - providers
+      operationId: publishProviderRevisionAlias
+      summary: Publish a staged provider revision
+      description: |-
+        Nonnegative expected_generation performs inventory preflight. Stock therefore normally rejects with 501 operation inventory.read before publication. Negative values skip only the HTTP preflight; engine staging-generation rules still apply.
+
+        Native publication persists pending intent, submits a conditional daemon mutation, and requires fresh daemon identity/generation readback. Unresolved acknowledgement or readback returns 503 with error.code outcome_unknown, and the pending intent prevents replay until reconciled. Typed rejection can return 400 invalid_request, 409 conflict, or 429 busy. Successful response always says published, including fake no-ops. Probe/drain options are not accepted. The providerId path alias is ignored by the handler; stage_id selects the revision.
+      x-required-capability: provider.publish_hot
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Identifier'
+          description: Routing parameter ignored by the handler; stage_id selects the revision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishProviderRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+  /v1/selections:
+    put:
+      tags:
+        - selection
+      operationId: setSelection
+      summary: Set runtime or durable outbound selection
+      description: 'persist_restart false calls SetRuntimeSelection; true calls PersistSelection. Fake
+        checks the selected capability independently. Native supports both through its durable daemon
+        mutation, with a shared TCP/UDP selection: transport must be both or empty. Native unknown outcomes
+        return 503 and retain pending intent. Revision conflicts return 409 and missing/invalid candidates
+        return 400. Existing sessions are not explicitly closed.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectionRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Selection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+  /v1/selections/runtime:
+    post:
+      tags:
+        - selection
+      operationId: setRuntimeSelectionPost
+      summary: Set runtime selection through the node_id alias
+      description: This alias accepts node_id instead of desired_node_id. Both POST and PUT invoke the
+        same handler. Native mode accepts transport both or empty and shares the selection between TCP
+        and UDP; unresolved outcomes return 503 and retain pending intent.
+      x-required-capability: selection.set_runtime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasSelectionRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Selection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+    put:
+      tags:
+        - selection
+      operationId: setRuntimeSelectionPut
+      summary: Set runtime selection through the node_id alias
+      description: This alias accepts node_id instead of desired_node_id. Both POST and PUT invoke the
+        same handler. Native mode accepts transport both or empty and shares the selection between TCP
+        and UDP; unresolved outcomes return 503 and retain pending intent.
+      x-required-capability: selection.set_runtime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasSelectionRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Selection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+  /v1/selections/persist:
+    post:
+      tags:
+        - selection
+      operationId: setPersistSelectionPost
+      summary: Set persist selection through the node_id alias
+      description: This alias accepts node_id instead of desired_node_id. Both POST and PUT invoke the
+        same handler. Native mode accepts transport both or empty and shares the selection between TCP
+        and UDP; unresolved outcomes return 503 and retain pending intent.
+      x-required-capability: selection.persist_restart
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasSelectionRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Selection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+    put:
+      tags:
+        - selection
+      operationId: setPersistSelectionPut
+      summary: Set persist selection through the node_id alias
+      description: This alias accepts node_id instead of desired_node_id. Both POST and PUT invoke the
+        same handler. Native mode accepts transport both or empty and shares the selection between TCP
+        and UDP; unresolved outcomes return 503 and retain pending intent.
+      x-required-capability: selection.persist_restart
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AliasSelectionRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Selection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '429':
+          $ref: '#/components/responses/Busy'
+  /v1/policies/validate:
+    post:
+      tags:
+        - policy
+      operationId: validatePolicy
+      summary: Validate a policy without applying it
+      description: Success is only {valid:true}. Stock accepts standalone payload.native_config and invokes
+        dae validate --config; invalid native input returns 422. Fake missing ID or negative generation
+        currently returns 500. Native backend policy validation is unsupported. No daemon mutation occurs.
+      x-required-capability: policy.validate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Policy'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/policies/apply:
+    post:
+      tags:
+        - policy
+      operationId: applyPolicyGeneration
+      summary: Apply a policy generation
+      description: Returns the raw EngineSnapshot synchronously. Fake application checks expected_generation
+        against the gateway counter, increments that counter, and stores the independent submitted policy.generation.
+        Stock and native policy application are unsupported.
+      x-required-capability: policy.apply_generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyPolicyRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineSnapshot'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/policy/validate:
+    post:
+      tags:
+        - policy
+      operationId: validatePolicyAlias
+      summary: Validate a policy without applying it
+      description: Success is only {valid:true}. Stock accepts standalone payload.native_config and invokes
+        dae validate --config; invalid native input returns 422. Fake missing ID or negative generation
+        currently returns 500. Native backend policy validation is unsupported. No daemon mutation occurs.
+      x-required-capability: policy.validate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Policy'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/policy/apply:
+    post:
+      tags:
+        - policy
+      operationId: applyPolicyGenerationAlias
+      summary: Apply a policy generation
+      description: Returns the raw EngineSnapshot synchronously. Fake application checks expected_generation
+        against the gateway counter, increments that counter, and stores the independent submitted policy.generation.
+        Stock and native policy application are unsupported.
+      x-required-capability: policy.apply_generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyPolicyRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineSnapshot'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/probes/node:
+    post:
+      tags:
+        - probes
+      operationId: probeNode
+      summary: Probe a node from its body ID
+      description: Missing fake target returns 400. Fake probes are simulation only. Stock and native
+        probes are unsupported.
+      x-required-capability: probe.node
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeProbeRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/probes/node/{nodeId}:
+    post:
+      tags:
+        - probes
+      operationId: probeNodeAlias
+      summary: Probe a node from its path ID
+      description: Request bodies are ignored by this alias. URL, timeout, and transport probe options
+        are not implemented. Missing target returns 400.
+      x-required-capability: probe.node
+      parameters:
+        - name: nodeId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Identifier'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/probes/group:
+    post:
+      tags:
+        - probes
+      operationId: probeGroup
+      summary: Probe a group from its body ID
+      description: Missing fake target returns 400. Fake probes are simulation only. Stock and native
+        probes are unsupported.
+      x-required-capability: probe.group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupProbeRequest'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/probes/group/{groupId}:
+    post:
+      tags:
+        - probes
+      operationId: probeGroupAlias
+      summary: Probe a group from its path ID
+      description: Request bodies are ignored by this alias. URL, timeout, and transport probe options
+        are not implemented. Missing target returns 400.
+      x-required-capability: probe.group
+      parameters:
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Identifier'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/connections:
+    get:
+      tags:
+        - readback
+      operationId: observeConnections
+      summary: Read active connections
+      description: Returns a bare array with no items or observed_at wrapper.
+      x-required-capability: connections.observe
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/connections/close:
+    post:
+      tags:
+        - readback
+      operationId: closeFilteredConnections
+      summary: Close connections matching a flat filter
+      description: Send the flat Go field names GroupID, ProviderID, NodeID, and Transport. A nested filter
+        property and snake_case ID fields are rejected. An empty object matches all connections. Response
+        contains only closed.
+      x-required-capability: connections.close_filtered
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionFilter'
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionCloseResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+  /v1/counters:
+    get:
+      tags:
+        - readback
+      operationId: readTrafficCounters
+      summary: Read proxy and direct traffic counters
+      description: Both traffic.proxy_counters and traffic.direct_counters must be supported. Unsupported
+        replies identify operation traffic.counters. No observation timestamp is emitted.
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Counters'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+      x-required-capabilities:
+        - traffic.proxy_counters
+        - traffic.direct_counters
+  /v1/events:
+    get:
+      tags:
+        - readback
+      operationId: resumeEvents
+      summary: Read events after an event ID
+      description: Returns a bare array of events whose IDs exceed after. Missing or malformed after values
+        become zero; negative values are accepted. There is no next cursor wrapper, expiration, or HTTP
+        410 response.
+      x-required-capability: events.resume
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 0
+      responses:
+        '200':
+          description: Synchronous result.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/Unsupported'
+components:
+  securitySchemes:
+    mutualTLS:
+      type: mutualTLS
+      description: TLS 1.3 with a verified controller client certificate.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The configured agent token. Authorization uses the literal Bearer scheme.
+  responses:
+    BadRequest:
+      description: Malformed JSON, unknown request field, invalid provider revision, or invalid/missing
+        selection or probe target.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: Missing or invalid Bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: Staged revision not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MethodNotAllowed:
+      description: Method is unsupported by this registered route.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: Gateway generation, stage base generation, or selection revision conflicts with current
+        state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ValidationFailed:
+      description: Stock native policy validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Busy:
+      description: Retained staging or native daemon inventory capacity is exhausted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    InternalError:
+      description: Untyped engine or journal error. Current fake-engine empty-provider and policy-validation
+        failures also map to 500.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unsupported:
+      description: Engine operation is unsupported. Body includes error.code unsupported and error.operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unavailable:
+      description: Native daemon/socket or stock validation dependency is unavailable. Native error.code
+        outcome_unknown also uses 503 and requires authoritative readback before further mutation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    Identifier:
+      type: string
+      description: Opaque string. The agent does not enforce a character pattern or maximum length.
+    Liveness:
+      type: object
+      required:
+        - status
+        - observed_at
+      properties:
+        status:
+          type: string
+          const: alive
+        observed_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+    Health:
+      type: object
+      description: Stock and native health report degraded when their observation succeeds, not traffic-ready.
+        Native uses implementation dae-native-unix and reports unavailable when the protected daemon inventory
+        cannot be read. Fake uses simulation. Concrete Health structs emit executable_available and process_observed
+        (false for native/fake); the generic engine fallback may omit them.
+      required:
+        - status
+        - implementation
+        - observed_at
+      properties:
+        status:
+          type: string
+          enum:
+            - unavailable
+            - degraded
+            - simulation
+        implementation:
+          type: string
+        executable_available:
+          type: boolean
+        executable_sha256:
+          type: string
+        engine_version:
+          type: string
+        engine_pid:
+          type: integer
+          format: int64
+        process_observed:
+          type: boolean
+        observed_at:
+          type: string
+          format: date-time
+        details:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+      x-go-type: gateway.Health
+      x-source: internal/gateway/stock.go
+    CapabilityName:
+      type: string
+      enum:
+        - inventory.read
+        - provider.stage
+        - provider.publish_hot
+        - selection.set_runtime
+        - selection.persist_restart
+        - policy.validate
+        - policy.apply_generation
+        - probe.node
+        - probe.group
+        - connections.observe
+        - connections.close_filtered
+        - traffic.proxy_counters
+        - traffic.direct_counters
+        - events.resume
+    Capability:
+      type: object
+      required:
+        - name
+        - supported
+      properties:
+        name:
+          $ref: '#/components/schemas/CapabilityName'
+        supported:
+          type: boolean
+        implementation:
+          type: string
+        restrictions:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+      x-go-type: gateway.Capability
+      x-source: internal/gateway/engine.go
+    Capabilities:
+      type: object
+      required:
+        - implementation
+        - version
+        - capabilities
+      properties:
+        implementation:
+          type: string
+        version:
+          type: string
+          description: Native protocol version is v1. Fake uses its simulation version. Stock version
+            is empty when executable version readback is unavailable.
+        capabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/Capability'
+      additionalProperties: false
+      x-go-type: gateway.Capabilities
+      x-source: internal/gateway/engine.go
+    NodeInput:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        provider_id:
+          type: string
+          description: May be omitted in staging input; normalized to the enclosing provider ID.
+        name:
+          type: string
+        identity:
+          type: string
+        definition_hash:
+          type: string
+        handle:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit runtime handle. Assigned on fake-engine publication.
+        connection:
+          type: string
+          writeOnly: true
+          description: Private native connection link, potentially containing credentials. Required and
+            nonempty for each node in native staging. Accepted in flat and nested stage requests; never
+            emitted in public snapshots or stage receipts.
+      additionalProperties: true
+      description: Private staging node. Input identity and definition_hash remain optional, while connection
+        is a write-only native link.
+      x-go-type: gateway.ProviderStageNode
+      x-source: internal/gateway/wire.go
+    Node:
+      type: object
+      required:
+        - id
+        - provider_id
+        - name
+        - handle
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        provider_id:
+          type: string
+          description: May be omitted in staging input; normalized to the enclosing provider ID.
+        name:
+          type: string
+        identity:
+          type: string
+        definition_hash:
+          type: string
+        handle:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit runtime handle. Assigned on fake-engine publication.
+      additionalProperties: false
+      description: Public node JSON. connection is never serialized. Native snapshots also omit identity
+        and definition_hash after clearing them in memory; fake snapshots may retain those optional fields.
+      x-go-type: gateway.Node
+      x-source: internal/gateway/engine.go
+      x-public-filter: 'internal/gateway/native.go: snapshot clears Connection, Identity, DefinitionHash;
+        Connection is always json:-'
+    ProviderRevisionInput:
+      type: object
+      description: Nested private staging input. Omitted revision is zero. Fake staging allows an empty
+        node list only with allow_empty true; native staging always requires nodes and exactly one publication
+        group.
+      required:
+        - provider_id
+      properties:
+        provider_id:
+          $ref: '#/components/schemas/Identifier'
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        content_hash:
+          type: string
+          description: An absent or empty staging hash is calculated from normalized nodes.
+        nodes:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/NodeInput'
+        allow_empty:
+          type: boolean
+          default: false
+        groups:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/PublicationGroupInput'
+      additionalProperties: true
+    ProviderRevision:
+      type: object
+      required:
+        - provider_id
+        - revision
+        - content_hash
+        - nodes
+      properties:
+        provider_id:
+          $ref: '#/components/schemas/Identifier'
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        content_hash:
+          type: string
+          description: An absent or empty staging hash is calculated from normalized nodes.
+        nodes:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/Node'
+        allow_empty:
+          type: boolean
+          default: false
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicationGroup'
+      additionalProperties: false
+      description: Public provider revision. Native snapshots include a revision only when the daemon
+        group identities match the retained provider and revision. Its content_hash is the supplied opaque
+        receipt identity; the controller bridge sends providerID:revision instead of a credential-derived
+        digest.
+      x-go-type: gateway.ProviderRevision
+      x-source: internal/gateway/engine.go
+    StageProviderFlatRequest:
+      type: object
+      description: Flat private staging form. Omitted revision and expected_generation default to zero.
+        Unknown fields are ignored; known flat fields must have their declared JSON types.
+      required:
+        - provider_id
+      properties:
+        provider_id:
+          $ref: '#/components/schemas/Identifier'
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        content_hash:
+          type: string
+          description: An absent or empty staging hash is calculated from normalized nodes.
+        nodes:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/NodeInput'
+        allow_empty:
+          type: boolean
+          default: false
+        expected_generation:
+          type: integer
+          format: int64
+          default: 0
+        groups:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/PublicationGroupInput'
+      additionalProperties: true
+      x-go-type: gateway.ProviderStageRequest
+      x-source: internal/gateway/wire.go
+    StageProviderNestedRequest:
+      type: object
+      required:
+        - revision
+      properties:
+        revision:
+          $ref: '#/components/schemas/ProviderRevisionInput'
+        expected_generation:
+          type: integer
+          format: int64
+          default: 0
+      additionalProperties: true
+      description: Nested private revision, with expected_generation read from the outer object. Connection
+        and groups are supported inside revision just as in the flat form.
+    StageProviderRequest:
+      oneOf:
+        - $ref: '#/components/schemas/StageProviderFlatRequest'
+        - $ref: '#/components/schemas/StageProviderNestedRequest'
+    StagedProvider:
+      type: object
+      required:
+        - stage_id
+        - provider_id
+        - revision
+        - content_hash
+        - base_generation
+        - status
+      properties:
+        stage_id:
+          $ref: '#/components/schemas/Identifier'
+        provider_id:
+          $ref: '#/components/schemas/Identifier'
+        revision:
+          type: integer
+          format: int64
+        content_hash:
+          type: string
+        base_generation:
+          type: integer
+          format: int64
+        status:
+          type: string
+          const: staged
+      additionalProperties: false
+    PublishProviderRequest:
+      type: object
+      required:
+        - stage_id
+      properties:
+        stage_id:
+          $ref: '#/components/schemas/Identifier'
+        expected_generation:
+          type: integer
+          format: int64
+          description: Defaults to zero. Nonnegative values cause inventory preflight equality checking.
+            Negative values skip that HTTP preflight; the fake engine still checks the stage base generation.
+          default: 0
+      additionalProperties: false
+    PublicationResult:
+      type: object
+      description: The handler emits published even when the fake engine performs a no-op. No provider_id
+        field is emitted.
+      required:
+        - status
+        - snapshot
+      properties:
+        status:
+          type: string
+          const: published
+        snapshot:
+          $ref: '#/components/schemas/EngineSnapshot'
+      additionalProperties: false
+    SelectionScope:
+      type: object
+      required:
+        - gateway_id
+        - group_id
+      properties:
+        gateway_id:
+          $ref: '#/components/schemas/Identifier'
+          description: Emitted as a string, which may be empty for native inventory-created selections.
+            Fake mutation requires a nonempty gateway ID; native mutation scopes by managed group.
+        group_id:
+          $ref: '#/components/schemas/Identifier'
+        transport:
+          type: string
+          description: Native mutation accepts only both or empty because TCP and UDP share selection.
+            Native inventory-created selections use both. The fake backend retains the exact supplied
+            transport; empty and literal all remain distinct keys.
+      additionalProperties: false
+      x-go-type: gateway.SelectionScope
+      x-source: internal/gateway/engine.go
+    SelectionRequest:
+      type: object
+      required:
+        - scope
+        - desired_node_id
+      properties:
+        scope:
+          $ref: '#/components/schemas/SelectionScopeInput'
+        desired_node_id:
+          $ref: '#/components/schemas/Identifier'
+        expected_revision:
+          type: integer
+          format: int64
+          default: 0
+        persist_restart:
+          type: boolean
+          default: false
+      additionalProperties: false
+    AliasSelectionRequest:
+      type: object
+      required:
+        - scope
+        - node_id
+      properties:
+        scope:
+          $ref: '#/components/schemas/SelectionScopeInput'
+        node_id:
+          $ref: '#/components/schemas/Identifier'
+        expected_revision:
+          type: integer
+          format: int64
+          default: 0
+      additionalProperties: false
+    Selection:
+      type: object
+      required:
+        - scope
+        - desired_node_id
+        - observed_node_id
+        - revision
+        - updated_at
+      properties:
+        scope:
+          $ref: '#/components/schemas/SelectionScope'
+        desired_node_id:
+          type: string
+        observed_node_id:
+          type: string
+          description: Empty when a previously selected node disappears from publication.
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      x-go-type: gateway.Selection
+      x-source: internal/gateway/engine.go
+    Policy:
+      type: object
+      required:
+        - id
+        - generation
+      properties:
+        id:
+          type: string
+          description: Empty in an initial snapshot before any policy is applied.
+        generation:
+          type: integer
+          format: int64
+        payload:
+          description: Raw JSON. Stock validation requires an object containing only native_config, a
+            nonempty standalone dae configuration string at most 1 MiB; include directives are rejected.
+            Fake validation only checks ID and nonnegative generation.
+      additionalProperties: false
+      x-go-type: gateway.Policy
+      x-source: internal/gateway/engine.go
+    ApplyPolicyRequest:
+      type: object
+      required:
+        - policy
+      properties:
+        policy:
+          $ref: '#/components/schemas/Policy'
+        expected_generation:
+          type: integer
+          format: int64
+          default: 0
+      additionalProperties: false
+    ValidationResult:
+      type: object
+      required:
+        - valid
+      properties:
+        valid:
+          type: boolean
+          const: true
+      additionalProperties: false
+    NodeProbeRequest:
+      type: object
+      required:
+        - node_id
+      properties:
+        node_id:
+          $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+    GroupProbeRequest:
+      type: object
+      required:
+        - group_id
+      properties:
+        group_id:
+          $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+    ProbeResult:
+      type: object
+      description: Fake probes do not perform a network operation. Missing targets return an error response
+        instead of this result.
+      required:
+        - target
+        - ok
+        - latency
+        - observed_at
+      properties:
+        target:
+          type: string
+        ok:
+          type: boolean
+        latency:
+          type: integer
+          format: int64
+          description: Go time.Duration encoded as integer nanoseconds.
+          minimum: 0
+        error:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      x-go-type: gateway.ProbeResult
+      x-source: internal/gateway/engine.go
+    Connection:
+      type: object
+      required:
+        - id
+        - opened_at
+      properties:
+        id:
+          type: string
+        group_id:
+          type: string
+        provider_id:
+          type: string
+        node_id:
+          type: string
+        transport:
+          type: string
+        state:
+          type: string
+        opened_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      x-go-type: gateway.Connection
+      x-source: internal/gateway/engine.go
+    ConnectionFilter:
+      type: object
+      description: Flat Go field names are used because the struct has no JSON tags. Go decoding also
+        accepts case-insensitive spellings such as groupid, but not group_id. All specified nonempty fields
+        must match. Empty or absent fields are unrestricted; an empty filter matches every connection.
+      properties:
+        GroupID:
+          type: string
+        ProviderID:
+          type: string
+        NodeID:
+          type: string
+        Transport:
+          type: string
+      additionalProperties: false
+      x-go-type: gateway.ConnectionFilter
+      x-source: internal/gateway/engine.go
+    ConnectionCloseResult:
+      type: object
+      required:
+        - closed
+      properties:
+        closed:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+    Counters:
+      type: object
+      required:
+        - proxy_bytes
+        - direct_bytes
+        - proxy_packets
+        - direct_packets
+      properties:
+        proxy_bytes:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit counter.
+        direct_bytes:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit counter.
+        proxy_packets:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit counter.
+        direct_packets:
+          type: integer
+          minimum: 0
+          description: Unsigned 64-bit counter.
+      additionalProperties: false
+      x-go-type: gateway.Counters
+      x-source: internal/gateway/engine.go
+    OutboundGroup:
+      type: object
+      required:
+        - id
+        - node_ids
+        - revision
+      properties:
+        id:
+          type: string
+        provider_ids:
+          type: array
+          items:
+            type: string
+        node_ids:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        selection_mode:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        name:
+          type: string
+          description: Native daemon group name, when available.
+      additionalProperties: false
+      description: Public group view. Unknown daemon-owned groups expose their name without invented provider/candidate
+        membership or controller revision; node_ids can be null.
+      x-go-type: gateway.OutboundGroup
+      x-source: internal/gateway/engine.go
+    Event:
+      type: object
+      required:
+        - id
+        - type
+        - generation
+        - at
+      properties:
+        id:
+          type: integer
+          format: int64
+        type:
+          type: string
+        generation:
+          type: integer
+          format: int64
+        target:
+          type: string
+        at:
+          type: string
+          format: date-time
+        detail:
+          type: string
+      additionalProperties: false
+      x-go-type: gateway.Event
+      x-source: internal/gateway/engine.go
+    EngineSnapshot:
+      type: object
+      description: 'Raw inventory/readback/policy-apply snapshot with no observed_at or snapshot wrapper.
+        Empty connections may be null. Native snapshots include only managed provider revisions whose
+        daemon group identity matches retained state; unknown daemon groups expose name only. Unsupported
+        native connections/counters/policy are not measurements: connections is null, counters are zero,
+        and policy is initially {id:"",generation:0}. Consult capabilities before interpreting those fields.'
+      required:
+        - generation
+        - providers
+        - groups
+        - selections
+        - connections
+        - counters
+        - policy
+      properties:
+        generation:
+          type: integer
+          format: int64
+        providers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ProviderRevision'
+        groups:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/OutboundGroup'
+        selections:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/Selection'
+          description: Keys combine gateway ID, group ID, and transport with NUL separators.
+        connections:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/Connection'
+        counters:
+          $ref: '#/components/schemas/Counters'
+        policy:
+          $ref: '#/components/schemas/Policy'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+      additionalProperties: false
+      x-go-type: gateway.Snapshot
+      x-source: internal/gateway/engine.go
+    JournalEntry:
+      type: object
+      required:
+        - id
+        - operation
+        - status
+        - started_at
+        - finished_at
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+        target:
+          type: string
+        status:
+          type: string
+        generation:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        error:
+          type: string
+        state:
+          description: Optional raw JSON state for non-native records, such as fake-engine durable snapshots.
+            The /v1/journal handler removes state entirely from every native.state record, including its
+            encrypted recovery envelope.
+      additionalProperties: false
+      description: Public journal view. Native recovery records retain id, operation, status, started_at,
+        and finished_at while excluding state.
+      x-go-type: gateway.JournalEntry
+      x-source: internal/gateway/engine.go
+      x-public-filter: 'cmd/gateway-agent/main.go: journalEntries removes state from native.state records'
+    TypedError:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: Engine code. Current typed errors include unsupported, conflict, busy, unavailable,
+            invalid_request, and outcome_unknown. Unknown native mutation outcomes use HTTP 503.
+        operation:
+          type: string
+        detail:
+          type: string
+      additionalProperties: false
+      x-go-type: gateway.Error
+      x-source: internal/gateway/engine.go
+    ErrorEnvelope:
+      type: object
+      description: Typed engine errors are nested under error. Decoder, authentication, method, and untyped
+        engine failures use a string in the same envelope.
+      required:
+        - error
+      properties:
+        error:
+          oneOf:
+            - type: string
+            - $ref: '#/components/schemas/TypedError'
+      additionalProperties: false
+    PublicationGroup:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: Predeclared native daemon group name.
+        revision:
+          type: integer
+          format: int64
+        candidate_ids:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        selected_node_id:
+          type: string
+          description: Native staging requires this to identify one candidate.
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - revision
+        - candidate_ids
+      description: Provider publication group metadata, also included in public provider revisions when
+        present.
+      x-go-type: gateway.PublicationGroup
+      x-source: internal/gateway/engine.go
+    PublicationGroupInput:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: Predeclared native daemon group name.
+        revision:
+          type: integer
+          format: int64
+          default: 0
+        candidate_ids:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        selected_node_id:
+          type: string
+          description: Native staging requires this to identify one candidate.
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - candidate_ids
+      description: Native staging requires exactly one group, a nonempty candidate list containing distinct
+        submitted node IDs, and a selected_node_id that belongs to that list. Omitted revision defaults
+        to zero; negative revisions are rejected. The group name must already exist in daemon inventory.
+    SelectionScopeInput:
+      type: object
+      required:
+        - group_id
+      properties:
+        gateway_id:
+          $ref: '#/components/schemas/Identifier'
+          description: Emitted as a string, which may be empty for native inventory-created selections.
+            Fake mutation requires a nonempty gateway ID; native mutation scopes by managed group.
+        group_id:
+          $ref: '#/components/schemas/Identifier'
+        transport:
+          type: string
+          description: Native mutation accepts only both or empty because TCP and UDP share selection.
+            Native inventory-created selections use both. The fake backend retains the exact supplied
+            transport; empty and literal all remain distinct keys.
+      additionalProperties: false
+      description: Native mutation requires group_id; gateway_id may be omitted. Fake mutation additionally
+        requires a nonempty gateway_id.
+x-native-capabilities:
+  implementation: dae-native-unix
+  version: v1
+  conditionally-supported:
+    - inventory.read
+    - provider.stage
+    - provider.publish_hot
+    - selection.set_runtime
+    - selection.persist_restart
+  always-unsupported:
+    - policy.validate
+    - policy.apply_generation
+    - probe.node
+    - probe.group
+    - connections.observe
+    - connections.close_filtered
+    - traffic.proxy_counters
+    - traffic.direct_counters
+    - events.resume
+  description: All five supported flags depend on successful native inventory readback. Publication requires
+    exactly one predeclared group per staged provider, private native node links, and the encrypted agent
+    journal. Runtime selection is shared by TCP and UDP; transport must be both or empty. Persistence
+    requires retained daemon and agent encryption keys and unchanged predeclared group layout. Capability
+    discovery and degraded health do not establish privileged packet-path or eBPF acceptance.

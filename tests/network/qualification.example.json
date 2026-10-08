@@ -1,0 +1,23 @@
+{
+  "source_commit": "replace-with-the-40-character-git-sha",
+  "run_id": "replace-with-a-fresh-isolated-run-id",
+  "started_at": "2026-10-08T00:00:00Z",
+  "engine_artifact_sha256": "replace-with-64-lowercase-hex-characters",
+  "topology_sha256": "replace-with-64-lowercase-hex-characters",
+  "checks": {
+    "source_identity": "BLOCKED",
+    "direct_tcp_udp": "BLOCKED",
+    "proxy_tcp_udp": "BLOCKED",
+    "blocked_traffic": "BLOCKED",
+    "deny_preservation": "BLOCKED",
+    "hot_provider_publication": "BLOCKED",
+    "unrelated_tcp_udp_survival": "BLOCKED",
+    "selection_restart": "BLOCKED",
+    "dns": "BLOCKED",
+    "ipv6_coverage": "BLOCKED",
+    "failure_guard": "BLOCKED",
+    "restore": "BLOCKED",
+    "bounded_retained_resources": "BLOCKED"
+  },
+  "artifacts": []
+}

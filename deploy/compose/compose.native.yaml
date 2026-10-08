@@ -1,0 +1,18 @@
+# Explicit opt-in to the patched daemon's Unix API. This does not start dae,
+# attach eBPF, assemble a full policy, or qualify the traffic path.
+services:
+  gateway-agent:
+    command: ["-engine=native"]
+    user: "${GATEWAY_AGENT_UID:-10002}:${GATEWAY_AGENT_UID:-10002}"
+    environment:
+      GATEWAY_AGENT_JOURNAL: /var/lib/homelab-proxy-gateway-agent/native-journal.jsonl
+      GATEWAY_AGENT_NATIVE_SOCKET: /run/dae-hot/control.sock
+      GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY: ${GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY:?set a base64-encoded 32-byte native journal key}
+      GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY_ID: ${GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY_ID:-native-primary}
+    volumes:
+      - type: bind
+        source: ${DAE_HOT_RUNTIME_DIR:?set DAE_HOT_RUNTIME_DIR to the patched daemon socket directory}
+        target: /run/dae-hot
+        read_only: true
+        bind:
+          create_host_path: false

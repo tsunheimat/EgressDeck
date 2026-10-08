@@ -1,0 +1,34 @@
+{
+  "generation": 3,
+  "providers": {
+    "provider-primary": {
+      "provider_id": "provider-primary",
+      "revision": 2,
+      "content_hash": "sha256-primary-v2",
+      "nodes": [
+        {"id": "node-alpha", "provider_id": "provider-primary", "name": "Alpha renamed", "handle": 1},
+        {"id": "node-gamma", "provider_id": "provider-primary", "name": "Gamma", "handle": 4}
+      ]
+    },
+    "provider-unrelated": {
+      "provider_id": "provider-unrelated",
+      "revision": 1,
+      "content_hash": "sha256-unrelated-v1",
+      "nodes": [
+        {"id": "node-unrelated", "provider_id": "provider-unrelated", "name": "Unrelated", "handle": 3}
+      ]
+    }
+  },
+  "groups": {
+    "outbound-primary": {"id": "outbound-primary", "provider_ids": ["provider-primary"], "node_ids": ["node-alpha", "node-gamma"]},
+    "outbound-unrelated": {"id": "outbound-unrelated", "provider_ids": ["provider-unrelated"], "node_ids": ["node-unrelated"]}
+  },
+  "selections": {
+    "gateway-home\u0000outbound-primary\u0000": {"scope": {"gateway_id": "gateway-home", "group_id": "outbound-primary"}, "desired_node_id": "node-alpha", "observed_node_id": "node-alpha", "revision": 1},
+    "gateway-home\u0000outbound-unrelated\u0000": {"scope": {"gateway_id": "gateway-home", "group_id": "outbound-unrelated"}, "desired_node_id": "node-unrelated", "observed_node_id": "node-unrelated", "revision": 1}
+  },
+  "connections": [
+    {"id": "connection-unrelated", "group_id": "outbound-unrelated", "provider_id": "provider-unrelated", "node_id": "node-unrelated", "transport": "tcp", "state": "open"}
+  ],
+  "counters": {"proxy_bytes": 1000, "direct_bytes": 2000, "proxy_packets": 10, "direct_packets": 20}
+}

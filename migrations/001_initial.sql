@@ -1,0 +1,3 @@
+-- The canonical bootstrap is migrations/schema.sql.
+-- This marker is intentionally empty so migration runners that enumerate
+-- *.sql files do not apply a divergent early schema before schema.sql.

@@ -1,0 +1,7 @@
+# Optional template. Install as native.conf only after configuring the patched
+# daemon, its same-UID socket boundary, and the agent's separate encryption key.
+# GATEWAY_AGENT_NATIVE_SOCKET and GATEWAY_AGENT_NATIVE_ENCRYPTION_KEY are read
+# from /etc/homelab-proxy-gateway-agent/gateway-agent.env.
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/homelab-proxy-gateway-agent -engine=native

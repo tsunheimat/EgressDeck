@@ -1,0 +1,3 @@
+# Native link list; comments and blank lines are intentionally accepted.
+trojan://link-secret@edge-e.example.net:443?sni=edge-e.example.net#epsilon
+socks5://user:link-secret@edge-f.example.net:1080#zeta

@@ -1,0 +1,6505 @@
+openapi: 3.0.3
+info:
+  title: EgressDeck Controller HTTP API
+  version: 0.1.0
+  description: Current Go HTTP contract. Snake_case wire values are mapped by the Vue client into UI summaries.
+    Collection pages use items, limit, total and optional next_cursor; the durable event feed uses its own resume
+    cursor. Conditional remote adapter routes return typed HTTP 501 when unavailable. A 202 identifies an existing
+    controller journal entry and is separate from applied, observed and traffic-verified state. Roadmap-only operations
+    are outside paths under x-planned-operations; OIDC callback registration follows exact OIDC_REDIRECT_URL under
+    x-oidc-callback.
+servers:
+- url: /
+security:
+- sessionCookie: []
+tags:
+- name: health
+  description: Process checks
+- name: auth
+  description: OIDC and application sessions
+- name: inventory
+  description: Device and group intent
+- name: providers
+  description: Provider and node lifecycle
+- name: policy
+  description: Typed policy and outbound groups
+- name: gateways
+  description: Gateway and firewall observation
+- name: operations
+  description: Durable operations and diagnostics
+x-planned-operations:
+- path: /api/v1/deployments
+  method: POST
+  reason: Use /api/v1/operations or /api/v1/deployments/enrollment for registered handlers.
+  x-implementation-status: planned-only
+- path: /api/v1/nodes/{id}
+  method: GET
+  reason: Only the collection route is registered.
+  x-implementation-status: planned-only
+- path: /api/v1/gateways/{id}
+  method: PATCH
+  reason: Current member route is GET only.
+  x-implementation-status: planned-only
+- path: /api/v1/firewall-bindings/{id}
+  method: PATCH
+  reason: Current member route is GET only.
+  x-implementation-status: planned-only
+- path: /api/v1/policies/{id}/explain
+  method: POST
+  x-implementation-status: planned-only
+  reason: Implemented explain uses /api/v1/policies/explain with manifest and packet.
+paths:
+  /healthz:
+    get:
+      tags:
+      - health
+      summary: Read process liveness
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+      x-implementation-status: implemented
+  /readyz:
+    get:
+      tags:
+      - health
+      summary: Read store readiness
+      operationId: getReadiness
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          $ref: '#/components/responses/Error503'
+      x-implementation-status: implemented
+  /api/v1/auth/oidc/login:
+    get:
+      tags:
+      - auth
+      summary: Start configured OIDC login
+      operationId: startOIDCLogin
+      security: []
+      x-implementation-status: configured-auth-mode
+      responses:
+        '302':
+          description: Identity provider redirect
+        '404':
+          description: Route is not registered outside AUTH_MODE=session
+  /api/v1/auth/login:
+    post:
+      tags:
+      - auth
+      summary: Create a session from signed identity headers
+      operationId: loginSignedHeaders
+      description: AUTH_MODE=header only. Subject and role come from HMAC-authenticated X-Auth-Request-* headers;
+        JSON subject/role is not accepted as authority.
+      security: []
+      x-implementation-status: configured-auth-mode
+      parameters:
+      - name: X-Auth-Request-User
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: X-Auth-Request-Role
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Signed role claim. viewer/operator/admin are canonical; administrator is accepted as admin.
+          An unknown authenticated role falls back to viewer.
+      - name: X-Auth-Request-Signature
+        in: header
+        required: true
+        schema:
+          type: string
+      responses:
+        '201':
+          description: Session created
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+  /api/v1/auth/session:
+    get:
+      tags:
+      - auth
+      summary: Read current application session
+      operationId: getSession
+      responses:
+        '200':
+          description: Session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+  /api/v1/auth/logout:
+    post:
+      tags:
+      - auth
+      summary: Clear the session
+      operationId: logout
+      responses:
+        '204':
+          description: Session cleared
+        '403':
+          $ref: '#/components/responses/Error403'
+        '401':
+          $ref: '#/components/responses/Error401'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: viewer
+  /api/v1/capabilities:
+    get:
+      tags:
+      - gateways
+      summary: Read configured controller capabilities
+      operationId: getCapabilities
+      responses:
+        '200':
+          description: Capability flags
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllerCapabilities'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      description: Controller flags describe configured service availability. events.resume=true reflects the local
+        persisted polling feed. Diagnostics still read live gateway capabilities on each request. policy.apply_generation
+        is an explicit qualification flag; the presence of an executor alone does not enable it. Provider/selection
+        flags do not establish real-network acceptance.
+      x-required-role: viewer
+  /api/v1/overview:
+    get:
+      tags:
+      - inventory
+      summary: Read controller overview
+      operationId: getOverview
+      responses:
+        '200':
+          description: Overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Overview'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      description: Returns provider lifecycle and cached firewall projections. Missing firewall counts/drift mean
+        unknown; observed_at and observation_status distinguish fresh, stale, error or never_read. coverage is null
+        with coverage_status=unavailable.
+      x-required-role: viewer
+  /api/v1/devices:
+    get:
+      tags:
+      - inventory
+      summary: List devices
+      operationId: listDevices
+      responses:
+        '200':
+          description: Collection in items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - inventory
+      summary: Create unmanaged device intent
+      operationId: createDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceCreate'
+      responses:
+        '201':
+          description: Device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/devices/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - inventory
+      summary: Read a device
+      operationId: getDevice
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - inventory
+      summary: Replace device intent
+      operationId: replaceDevice
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceCreate'
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    patch:
+      tags:
+      - inventory
+      summary: Patch device intent
+      operationId: patchDevice
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceCreate'
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    delete:
+      tags:
+      - inventory
+      summary: Delete an unenrolled device
+      operationId: deleteDevice
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '204':
+          description: Deleted
+        '409':
+          $ref: '#/components/responses/Error409'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: admin
+  /api/v1/device-groups:
+    get:
+      tags:
+      - inventory
+      summary: List device groups
+      operationId: listDeviceGroups
+      responses:
+        '200':
+          description: Collection in items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceGroupList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - inventory
+      summary: Create a device group
+      operationId: createDeviceGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceGroupCreate'
+      responses:
+        '201':
+          description: Device group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceGroup'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/device-groups/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - inventory
+      summary: Read a device group
+      operationId: getDeviceGroup
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceGroup'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - inventory
+      summary: Replace a device-group intent
+      operationId: replaceDeviceGroup
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceGroupCreate'
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceGroup'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    patch:
+      tags:
+      - inventory
+      summary: Patch a device-group intent
+      operationId: patchDeviceGroup
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceGroupCreate'
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceGroup'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+  /api/v1/policies:
+    get:
+      tags:
+      - policy
+      summary: List typed policies
+      operationId: listPolicies
+      responses:
+        '200':
+          description: Policies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - policy
+      summary: Create a typed policy
+      operationId: createPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyWrite'
+      responses:
+        '201':
+          description: Policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/policies/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - policy
+      summary: Read a typed policy
+      operationId: getPolicy
+      responses:
+        '200':
+          description: Policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - policy
+      summary: Replace a typed policy
+      operationId: replacePolicy
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyWrite'
+      responses:
+        '200':
+          description: Policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    patch:
+      tags:
+      - policy
+      summary: Patch a typed policy
+      operationId: patchPolicy
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyWrite'
+      responses:
+        '200':
+          description: Policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    delete:
+      tags:
+      - policy
+      summary: Delete an unreferenced policy
+      operationId: deletePolicy
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '204':
+          description: Deleted
+        '409':
+          $ref: '#/components/responses/Error409'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: admin
+  /api/v1/policies/explain:
+    post:
+      tags:
+      - policy
+      summary: Explain a predicted policy match
+      operationId: explainPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExplainRequest'
+      responses:
+        '200':
+          description: Predicted explanation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Explanation'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: operator
+  /api/v1/rule-sets:
+    get:
+      tags:
+      - policy
+      summary: List reusable rule sets
+      operationId: listRuleSets
+      responses:
+        '200':
+          description: Rule sets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSetList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - policy
+      summary: Create a reusable rule set
+      operationId: createRuleSet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleSetWrite'
+      responses:
+        '201':
+          description: Rule set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/rule-sets/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - policy
+      summary: Read a reusable rule set
+      operationId: getRuleSet
+      responses:
+        '200':
+          description: Rule set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - policy
+      summary: Replace a reusable rule set
+      operationId: replaceRuleSet
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleSetWrite'
+      responses:
+        '200':
+          description: Rule set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    patch:
+      tags:
+      - policy
+      summary: Patch a reusable rule set
+      operationId: patchRuleSet
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleSetWrite'
+      responses:
+        '200':
+          description: Rule set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    delete:
+      tags:
+      - policy
+      summary: Delete an unreferenced rule set
+      operationId: deleteRuleSet
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '204':
+          description: Deleted
+        '409':
+          $ref: '#/components/responses/Error409'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: admin
+  /api/v1/providers:
+    get:
+      tags:
+      - providers
+      summary: List providers with redacted sources
+      operationId: listProviders
+      responses:
+        '200':
+          description: Providers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - providers
+      summary: Create a provider
+      operationId: createProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderCreate'
+      responses:
+        '201':
+          description: Provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Provider'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/providers/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - providers
+      summary: Read a provider with redacted source
+      operationId: getProvider
+      responses:
+        '200':
+          description: Provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Provider'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      operationId: putProvider
+      summary: Edit provider metadata and future fetch source
+      tags:
+      - providers
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '400':
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Role or CSRF failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: provider_in_use; active/staged/group/selection or pending references prevent removal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: revision_conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: validation_error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: revision_required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: provider_storage_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '200':
+          description: Updated redacted provider lifecycle view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEdit'
+      x-required-role: admin
+    patch:
+      operationId: patchProvider
+      summary: Edit provider metadata and future fetch source
+      tags:
+      - providers
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '400':
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Role or CSRF failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: provider_in_use; active/staged/group/selection or pending references prevent removal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: revision_conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: validation_error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: revision_required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: provider_storage_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '200':
+          description: Updated redacted provider lifecycle view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEdit'
+      x-required-role: admin
+    delete:
+      operationId: deleteProvider
+      summary: Delete unreferenced provider
+      tags:
+      - providers
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/Revision'
+      responses:
+        '400':
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Role or CSRF failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: provider_in_use; active/staged/group/selection or pending references prevent removal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: revision_conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: validation_error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: revision_required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: provider_storage_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '204':
+          description: Provider removed after reference checks
+      x-required-role: admin
+  /api/v1/providers/{id}/stage:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    post:
+      tags:
+      - providers
+      summary: Stage supplied provider content
+      operationId: stageProvider
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StageProviderRequest'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationAccepted'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Local parse/stage only; does not publish to gateway. Records a durable operation when service
+        persistence is configured.
+      x-required-role: admin
+  /api/v1/providers/{id}/refresh:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    post:
+      tags:
+      - providers
+      summary: Fetch and stage one provider
+      operationId: refreshProvider
+      x-required-capability: provider.stage
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationAccepted'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: 'invalid_request: request body unreadable or exceeds 2 MiB'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '408':
+          description: request_cancelled while awaiting coalesced refresh
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 'refresh_busy: refresh admission capacity reached'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: admin
+      description: Fetches only the selected provider, stages its revision and records a durable operation. Concurrent
+        identical unkeyed refreshes from the same actor/provider configuration and revision coalesce to one operation.
+        Idempotency-Key replays require the same action/request. Submitted request bodies are ignored but bounded
+        to 2 MiB.
+  /api/v1/providers/{id}/revisions:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - providers
+      summary: List provider revisions
+      operationId: listProviderRevisions
+      responses:
+        '200':
+          description: Revisions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderRevisionList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      x-required-role: viewer
+  /api/v1/providers/{id}/revisions/{revision}/apply:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    - name: revision
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    post:
+      tags:
+      - providers
+      summary: Publish and read back a provider revision
+      operationId: applyProviderRevision
+      x-required-capability: provider.publish_hot
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/RuntimeIfMatch'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationAccepted'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '412':
+          description: Expected selection/provider revision differs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: If-Match is required; use zero for the first mutation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid selection scope or other typed input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: operator
+  /api/v1/nodes:
+    get:
+      tags:
+      - providers
+      summary: List public normalized nodes
+      operationId: listNodes
+      responses:
+        '200':
+          description: Nodes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+  /api/v1/outbound-groups:
+    get:
+      tags:
+      - policy
+      summary: List outbound groups
+      operationId: listOutboundGroups
+      responses:
+        '200':
+          description: Groups
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundGroupList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - policy
+      summary: Create outbound group
+      operationId: createOutboundGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutboundGroupCreate'
+      responses:
+        '201':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundGroup'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/outbound-groups/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - policy
+      summary: Read outbound group
+      operationId: getOutboundGroup
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundGroup'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - policy
+      summary: Replace outbound group
+      operationId: replaceOutboundGroup
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutboundGroupCreate'
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundGroup'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+    patch:
+      tags:
+      - policy
+      summary: Patch outbound group
+      operationId: patchOutboundGroup
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/Revision'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutboundGroupCreate'
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundGroup'
+        '412':
+          $ref: '#/components/responses/Error412'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '428':
+          description: Expected revision header/query required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Replaces the entire resource; PATCH is not JSON merge patch. Supply If-Match or revision query.
+        Omitted mutable fields use zero values.
+      x-required-role: admin
+  /api/v1/outbound-groups/{id}/selection:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - policy
+      summary: Read gateway and transport selections
+      operationId: listSelections
+      responses:
+        '200':
+          description: Selection items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelectionList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    put:
+      tags:
+      - policy
+      summary: Apply selection and read it back
+      operationId: setSelection
+      x-required-capability: selection.set_runtime
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/RuntimeIfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectionRequest'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelectionAccepted'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: Expected selection/provider revision differs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: If-Match is required; use zero for the first mutation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid selection scope or other typed input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: operator
+    post:
+      tags:
+      - policy
+      summary: Compatibility selection method
+      operationId: postSelection
+      x-implementation-status: implemented-compatibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectionRequest'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelectionAccepted'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: Expected selection/provider revision differs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: If-Match is required; use zero for the first mutation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid selection scope or other typed input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - $ref: '#/components/parameters/RuntimeIfMatch'
+      x-required-role: operator
+  /api/v1/gateways:
+    get:
+      tags:
+      - gateways
+      summary: List gateways
+      operationId: listGateways
+      responses:
+        '200':
+          description: Gateways
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - gateways
+      summary: Register a gateway
+      operationId: registerGateway
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GatewayCreate'
+      responses:
+        '201':
+          description: Gateway
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayRecord'
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/gateways/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - gateways
+      summary: Read a gateway
+      operationId: getGateway
+      responses:
+        '200':
+          description: Gateway
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gateway'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+  /api/v1/gateways/{id}/capabilities:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - gateways
+      summary: Observe gateway health and capabilities
+      operationId: getGatewayCapabilities
+      responses:
+        '200':
+          description: Gateway view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gateway'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+  /api/v1/firewall-bindings:
+    get:
+      tags:
+      - gateways
+      summary: List OPNsense bindings
+      operationId: listFirewallBindings
+      responses:
+        '200':
+          description: Bindings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FirewallBindingList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - gateways
+      summary: Attach an existing alias
+      operationId: attachFirewallBinding
+      x-required-capability: firewall.attach
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FirewallAttachRequest'
+      responses:
+        '201':
+          description: Binding and readback
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FirewallAttachResult'
+        '501':
+          description: No adapter (unsupported_capability) or firewall_unsupported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: firewall_object_not_found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: firewall_drift or firewall_binding_exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: invalid_firewall_binding or firewall_scope_invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: firewall_authentication_failed or firewall_readback_failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/firewall-bindings/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - gateways
+      summary: Read firewall binding
+      operationId: getFirewallBinding
+      responses:
+        '200':
+          description: Binding
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FirewallBindingView'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+  /api/v1/firewall-bindings/{id}/readback:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - gateways
+      summary: Read persisted and active alias state
+      operationId: readFirewallBinding
+      responses:
+        '200':
+          description: Readback
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FirewallReadbackResult'
+        '404':
+          description: firewall_object_not_found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No adapter (unsupported_capability) or firewall_unsupported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '409':
+          description: firewall_drift or firewall_binding_exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: invalid_firewall_binding or firewall_scope_invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: firewall_authentication_failed or firewall_readback_failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      x-required-role: viewer
+    post:
+      tags:
+      - gateways
+      summary: Read persisted and active alias state
+      operationId: postFirewallReadback
+      responses:
+        '200':
+          description: Readback
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FirewallReadbackResult'
+        '404':
+          description: firewall_object_not_found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No adapter (unsupported_capability) or firewall_unsupported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '409':
+          description: firewall_drift or firewall_binding_exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: invalid_firewall_binding or firewall_scope_invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: firewall_authentication_failed or firewall_readback_failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      x-required-role: admin
+  /api/v1/deployments/preview:
+    post:
+      tags:
+      - policy
+      summary: Compile and validate policy input
+      operationId: previewDeployment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompileInput'
+      responses:
+        '200':
+          description: Compilation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompileResult'
+          headers:
+            X-EgressDeck-Preview-Scope:
+              description: This compile result comes from caller-supplied input.
+              schema:
+                type: string
+                enum:
+                - caller-supplied-draft
+        '422':
+          $ref: '#/components/responses/Error422'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      description: Draft-only compiler preview from supplied input. It is not bound to stored inventory and cannot
+        authorize deployment. Use /deployments/plan for a revision-bound server inventory plan.
+      x-required-role: operator
+  /api/v1/deployments/enrollment:
+    post:
+      tags:
+      - operations
+      summary: Submit an enrollment manifest to a qualified executor
+      operationId: submitEnrollment
+      x-required-capability: policy.apply_generation
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentManifest'
+      responses:
+        '202':
+          description: Journal operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationAccepted'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Requires explicit EnrollmentEnabled and a qualified composite executor; default setup returns
+        501. Guard, policy, firewall and traffic evidence remain separate in the resulting operation views.
+      x-required-role: admin
+  /api/v1/operations:
+    get:
+      tags:
+      - operations
+      summary: List durable operations
+      operationId: listOperations
+      responses:
+        '200':
+          description: Operations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationList'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      x-required-role: viewer
+    post:
+      tags:
+      - operations
+      summary: Submit durable deployment operation
+      operationId: submitOperation
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentRequest'
+      responses:
+        '202':
+          description: Full operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '409':
+          $ref: '#/components/responses/Error409'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: Invalid JSON, unknown fields or request validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      description: Accepts deployment.Request. Body idempotency_key takes precedence over the header. A configured
+        executor is required. Returns a full Operation with id, not an operation_id wrapper.
+      x-required-capability: policy.apply_generation
+      x-required-role: operator
+  /api/v1/operations/{id}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags:
+      - operations
+      summary: Read a durable operation
+      operationId: getOperation
+      responses:
+        '200':
+          description: Operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      x-required-role: viewer
+  /api/v1/events:
+    get:
+      tags:
+      - operations
+      summary: Poll resumable management events
+      operationId: getEvents
+      description: Returns a bounded projection of the latest polled operation/audit state, not every transient
+        transition. Contains no raw adapter payloads, actors or secrets. Retains up to 5000 projected events; durable
+        indicates configured persistence. This JSON polling feed does not use SSE or Last-Event-ID. A 410 means
+        reload current state and resume without the stale cursor.
+      responses:
+        '200':
+          description: Projected event page, including a next_cursor even at an empty tail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllerEvents'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '400':
+          description: invalid_query, invalid_limit or invalid_cursor (including a cursor ahead of the stream)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: cursor_expired or cursor_stream_changed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 'events_unavailable: event source or persistence unavailable'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-implementation-status: implemented
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          maxLength: 256
+        description: Opaque next_cursor from a prior response; absent reads retained history.
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+      x-required-role: viewer
+  /api/v1/audit-events:
+    get:
+      tags:
+      - operations
+      summary: List redacted audit events
+      operationId: listAuditEvents
+      responses:
+        '200':
+          description: Audit events in items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventList'
+        '400':
+          description: invalid_cursor or invalid query/limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'stale_cursor: snapshot changed or cursor expired'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: collection_item_too_large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: collection_capacity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      parameters:
+      - $ref: '#/components/parameters/CollectionLimit'
+      - $ref: '#/components/parameters/CollectionCursor'
+      description: Returns a bounded items page with limit, total and optional next_cursor. Default limit 100, maximum
+        500. Follow next_cursor using the same query and limit. Snapshot change or expiry returns 409; restart invalidates
+        the cursor. Responses are bounded to 4 MiB, scan to 100000 items/64 MiB; live observation values can refresh
+        between pages.
+      x-required-role: viewer
+  /api/v1/metrics:
+    get:
+      tags:
+      - operations
+      summary: Read authenticated Prometheus metrics
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-implementation-status: implemented
+      description: Metrics contain only bounded method, route-template and status-class labels; no user, target,
+        address, domain or raw error labels are emitted.
+      x-required-role: viewer
+  /api/v1/deployments/plan:
+    post:
+      operationId: planStoredInventory
+      summary: Create an immutable plan from stored gateway inventory
+      tags:
+      - operations
+      x-implementation-status: implemented
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanRequest'
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      responses:
+        '200':
+          description: Result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryPlan'
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Quoted SHA-256 plan checksum
+        '400':
+          description: Invalid JSON or unknown fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stored gateway or explicit previous operation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: snapshot_changed; inventory changed during planning
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: gateway_required or invalid previous applied operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Immutable plan storage is unavailable or corrupt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      description: Captures all stored devices/groups/policies/outbounds for one gateway and rechecks their revisions.
+        Compilation errors are returned as HTTP 200 with valid=false and diagnostics. deployable=false explicitly
+        blocks unqualified network application. ETag is the immutable plan checksum. Persistence uses atomic immutable
+        create-if-absent storage. Native artifact and coverage blockers keep deployable false even when valid is
+        true.
+      x-required-role: operator
+  /api/v1/deployments/plans/{id}:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: ^[a-f0-9]{64}$
+    get:
+      operationId: getImmutablePlan
+      summary: Read a stored plan by checksum
+      tags:
+      - operations
+      x-implementation-status: implemented
+      responses:
+        '200':
+          description: Result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryPlan'
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Quoted SHA-256 plan checksum
+        '400':
+          description: invalid_plan_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Plan not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: plan_storage_unavailable or plan_corrupt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-required-role: viewer
+  /api/v1/providers/{id}/schedule:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      operationId: getProviderSchedule
+      summary: Read provider refresh schedule
+      tags:
+      - providers
+      x-implementation-status: implemented
+      responses:
+        '200':
+          description: Schedule; default is disabled revision zero
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderSchedule'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-required-role: viewer
+    put:
+      operationId: updateProviderSchedule
+      summary: Update a stage-only refresh schedule
+      tags:
+      - providers
+      x-implementation-status: implemented
+      description: Defaults are disabled, one-hour interval and auto_apply=false. Settings revisions do not advance
+        for timer progress. Enabling requires a remote source and provider staging support. auto_apply=true returns
+        typed 501 provider.schedule_auto_apply. Missed intervals are coalesced; source URLs remain private.
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected nonnegative schedule revision, optionally quoted; use 0 before the first save. No
+          revision query fallback.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderScheduleRequest'
+      responses:
+        '200':
+          description: Saved schedule
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderSchedule'
+        '400':
+          description: Invalid JSON or interval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'schedule_unavailable: source is not eligible or staging is disabled'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: Expected schedule revision differs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '428':
+          description: If-Match missing or invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Automatic schedule publication is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsupportedResponse'
+        '503':
+          description: Schedule persistence failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-required-role: admin
+  /api/v1/gateways/{id}/probes/nodes/{nodeId}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    - name: nodeId
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      summary: probeGatewayNode
+      operationId: probeGatewayNode
+      tags:
+      - gateways
+      x-implementation-status: implemented
+      x-required-capability: probe.node
+      description: Checks live gateway capabilities on every request. Query parameters and browser-selected probe
+        URLs are rejected. Results are gateway-origin observations, not client traffic verification.
+      responses:
+        '200':
+          description: Gateway diagnostic observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayProbeResponse'
+        '400':
+          description: Query parameters or nonempty probe body rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Gateway or scoped target not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Gateway diagnostic capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsupportedResponse'
+        '502':
+          description: invalid_gateway_response or gateway_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties: {}
+      x-required-role: operator
+  /api/v1/gateways/{id}/probes/groups/{groupId}:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    - name: groupId
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      summary: probeGatewayGroup
+      operationId: probeGatewayGroup
+      tags:
+      - gateways
+      x-implementation-status: implemented
+      x-required-capability: probe.group
+      description: Checks live gateway capabilities on every request. Query parameters and browser-selected probe
+        URLs are rejected. Results are gateway-origin observations, not client traffic verification.
+      responses:
+        '200':
+          description: Gateway diagnostic observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayProbeResponse'
+        '400':
+          description: Query parameters or nonempty probe body rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Gateway or scoped target not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Gateway diagnostic capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsupportedResponse'
+        '502':
+          description: invalid_gateway_response or gateway_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      parameters:
+      - $ref: '#/components/parameters/CSRF'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties: {}
+      x-required-role: operator
+  /api/v1/gateways/{id}/connections:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      summary: getGatewayConnections
+      operationId: getGatewayConnections
+      tags:
+      - gateways
+      x-implementation-status: implemented
+      x-required-capability: connections.observe
+      description: Checks live gateway capabilities on every request. Query parameters and browser-selected probe
+        URLs are rejected. Results are gateway-origin observations, not client traffic verification.
+      responses:
+        '200':
+          description: Gateway diagnostic observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayConnectionsResponse'
+        '400':
+          description: Query parameters or nonempty probe body rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Gateway or scoped target not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Gateway diagnostic capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsupportedResponse'
+        '502':
+          description: invalid_gateway_response or gateway_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-required-role: viewer
+  /api/v1/gateways/{id}/counters:
+    parameters:
+    - $ref: '#/components/parameters/ResourceID'
+    get:
+      summary: getGatewayCounters
+      operationId: getGatewayCounters
+      tags:
+      - gateways
+      x-implementation-status: implemented
+      description: Checks live gateway capabilities on every request. Query parameters and browser-selected probe
+        URLs are rejected. Results are gateway-origin observations, not client traffic verification. At least one
+        of traffic.proxy_counters/traffic.direct_counters must be available. Each class has its own availability;
+        provider_quota is always unavailable.
+      responses:
+        '200':
+          description: Gateway diagnostic observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayCountersResponse'
+        '400':
+          description: Query parameters or nonempty probe body rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Gateway or scoped target not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Gateway diagnostic capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsupportedResponse'
+        '502':
+          description: invalid_gateway_response or gateway_unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+      x-required-any-capabilities:
+      - traffic.proxy_counters
+      - traffic.direct_counters
+      x-required-role: viewer
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: egressdeck_session
+      description: HTTP-only session; mutations also require X-CSRF-Token matching egressdeck_csrf.
+  headers:
+    SetCookie:
+      description: Session and CSRF cookies
+      schema:
+        type: string
+  parameters:
+    ResourceID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Expected positive resource revision, optionally quoted. Current mutating handlers require this
+        header or the revision query; missing or invalid input returns 428.
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Optional controller journal key. Reuse only for the same action/payload. No HTTP-layer replay
+        guarantee is provided by the gateway agent.
+    Revision:
+      name: revision
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      description: Alternative to If-Match; one positive expected revision is required.
+    CSRF:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Required with a session in session/header mode. Must match egressdeck_csrf cookie and session
+        token.
+    RuntimeIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Expected nonnegative selection/active-provider revision, optionally quoted. Use 0 for first selection/publication.
+        Missing or invalid header returns 428; no query fallback.
+    CollectionLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+    CollectionCursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+        maxLength: 2048
+      description: Opaque next_cursor from prior page. Bound to route, query, limit and stable snapshot. Restart
+        invalidates cursors; expiry is 15 minutes.
+  responses:
+    NotImplemented:
+      description: Adapter capability is unavailable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UnsupportedResponse'
+    Error401:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error403:
+      description: Forbidden or CSRF failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error404:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error409:
+      description: Conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error412:
+      description: Revision conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error422:
+      description: Semantic validation failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Error503:
+      description: Dependency unavailable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+    ReadyResponse:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+    Role:
+      type: string
+      enum:
+      - viewer
+      - operator
+      - admin
+    LoginResponse:
+      type: object
+      required:
+      - subject
+      - roles
+      - expires_at
+      properties:
+        subject:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+        expires_at:
+          type: string
+          format: date-time
+    Session:
+      type: object
+      required:
+      - subject
+      - roles
+      properties:
+        subject:
+          type: string
+        email:
+          type: string
+        name:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+        expires_at:
+          type: string
+          format: date-time
+        auth_mode:
+          type: string
+        authentication_disabled:
+          type: boolean
+    ErrorDetail:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        capability:
+          type: string
+    ErrorResponse:
+      oneOf:
+      - type: object
+        required:
+        - error
+        properties:
+          error:
+            $ref: '#/components/schemas/ErrorDetail'
+      - type: object
+        required:
+        - error
+        - message
+        properties:
+          error:
+            type: string
+          message:
+            type: string
+    UnsupportedResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum:
+              - unsupported_capability
+            message:
+              type: string
+            capability:
+              type: string
+          additionalProperties: false
+          required:
+          - code
+          - message
+          - capability
+      additionalProperties: false
+      required:
+      - error
+    ControllerCapabilities:
+      type: object
+      required:
+      - api_version
+      - capabilities
+      properties:
+        api_version:
+          type: string
+        capabilities:
+          type: object
+          additionalProperties:
+            type: boolean
+    DeviceAddress:
+      type: object
+      properties:
+        address:
+          type: string
+        family:
+          type: string
+        provenance:
+          type: string
+        verified_at:
+          nullable: true
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - address
+      - family
+      x-go-type: domain.DeviceAddress
+      x-source: internal/domain/types.go
+    DeviceCreate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        primary_group_id:
+          type: string
+        addresses:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceAddressInput'
+          nullable: true
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+          description: Typed device exception rules. The API rejects unknown fields and applies compiler semantic
+            validation; mandatory restrictions remain ahead of exceptions.
+      additionalProperties: false
+      required:
+      - name
+      description: Inventory intent only. Enrolled/pending/blocked state and verified_at timestamps are rejected
+        with 422; enrollment requires a qualified deployment operation. Updates replace the complete record.
+    Device:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        primary_group_id:
+          type: string
+        addresses:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceAddress'
+          nullable: true
+        enrollment_state:
+          type: string
+          enum:
+          - unenrolled
+          - pending
+          - enrolled
+          - blocked
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+          description: Typed device exception rules. The API rejects unknown fields and applies compiler semantic
+            validation; mandatory restrictions remain ahead of exceptions.
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - addresses
+      - enrollment_state
+      - revision
+      - created_at
+      - updated_at
+      x-go-type: domain.Device
+      x-source: internal/domain/types.go
+    DeviceGroupCreate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        gateway_id:
+          type: string
+        policy_id:
+          type: string
+        enabled:
+          type: boolean
+      additionalProperties: false
+      required:
+      - name
+      - gateway_id
+      - policy_id
+    DeviceGroup:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        gateway_id:
+          type: string
+        policy_id:
+          type: string
+        enabled:
+          type: boolean
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - gateway_id
+      - policy_id
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      x-go-type: domain.DeviceGroup
+      x-source: internal/domain/types.go
+    Action:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - direct
+          - proxy
+          - block
+          - outbound_group
+        outbound_group_id:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.Action
+      x-source: internal/policy/types.go
+      required:
+      - kind
+    PortRange:
+      type: object
+      properties:
+        from:
+          type: integer
+          format: int64
+        to:
+          type: integer
+          format: int64
+      additionalProperties: false
+      x-go-type: policy.PortRange
+      x-source: internal/policy/types.go
+      required:
+      - from
+      - to
+    Match:
+      type: object
+      properties:
+        domain_exact:
+          type: array
+          items:
+            type: string
+          nullable: true
+        domain_suffix:
+          type: array
+          items:
+            type: string
+          nullable: true
+        domain_sets:
+          type: array
+          items:
+            type: string
+          nullable: true
+        destination_cidrs:
+          type: array
+          items:
+            type: string
+          nullable: true
+        destination_ip:
+          type: array
+          items:
+            type: string
+          nullable: true
+        destination_ports:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortRange'
+          nullable: true
+        ports:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortRange'
+          nullable: true
+        transport:
+          type: array
+          items:
+            type: string
+          nullable: true
+        transports:
+          type: array
+          items:
+            type: string
+          nullable: true
+        address_families:
+          type: array
+          items:
+            type: string
+          nullable: true
+        families:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      x-go-type: policy.Match
+      x-source: internal/policy/types.go
+    Rule:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        match:
+          $ref: '#/components/schemas/Match'
+        action:
+          $ref: '#/components/schemas/Action'
+        enabled:
+          type: boolean
+        order:
+          type: integer
+          format: int64
+      additionalProperties: false
+      x-go-type: policy.Rule
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - match
+      - action
+      - enabled
+    PolicyEntry:
+      type: object
+      properties:
+        rule:
+          $ref: '#/components/schemas/Rule'
+        rule_set_id:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.PolicyEntry
+      x-source: internal/policy/types.go
+    PolicyWrite:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        mandatory_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        mandatory:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyEntry'
+          nullable: true
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        rule_set_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        default_action:
+          $ref: '#/components/schemas/Action'
+        unknown_domain_action:
+          $ref: '#/components/schemas/Action'
+        proxy_failure_action:
+          $ref: '#/components/schemas/Action'
+        strict:
+          type: boolean
+        strict_mode:
+          type: boolean
+        raw_config_override:
+          type: string
+      additionalProperties: false
+      description: Optional ID is assigned on create and taken from URL on update. PUT/PATCH replace the full document,
+        and semantic validation uses the policy compiler. Revision is assigned by the server.
+    Policy:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        mandatory_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        mandatory:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyEntry'
+          nullable: true
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        rule_set_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        default_action:
+          $ref: '#/components/schemas/Action'
+        unknown_domain_action:
+          $ref: '#/components/schemas/Action'
+        proxy_failure_action:
+          $ref: '#/components/schemas/Action'
+        strict:
+          type: boolean
+        strict_mode:
+          type: boolean
+        raw_config_override:
+          type: string
+        revision:
+          type: integer
+          format: int64
+      additionalProperties: false
+      x-go-type: policy.Policy
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - default_action
+      - unknown_domain_action
+      - proxy_failure_action
+    RuleSetWrite:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+      additionalProperties: false
+      description: Optional ID is assigned on create and taken from URL on update. PUT/PATCH replace the full document,
+        and semantic validation uses the policy compiler. Revision is assigned by the server.
+    RuleSet:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        revision:
+          type: integer
+          format: int64
+      additionalProperties: false
+      x-go-type: policy.RuleSet
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - rules
+    ProviderCreate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        source:
+          type: string
+          description: Write-only provider URL or local content. Durable creation encrypts it and replaces it with
+            a private reference. A caller-supplied secret reference is rejected.
+        format:
+          type: string
+        fetch_route:
+          type: string
+      additionalProperties: false
+      required:
+      - name
+      - source
+    Provider:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        source:
+          type: string
+          enum:
+          - '[redacted]'
+          description: The source URL/content and private reference are always redacted.
+        format:
+          type: string
+        fetch_route:
+          type: string
+        active_revision:
+          type: integer
+          format: int64
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        source_kind:
+          type: string
+          enum:
+          - url
+          - manual
+          - unknown
+        refreshable:
+          type: boolean
+        staged_revision:
+          type: integer
+          format: int64
+        last_attempt_at:
+          type: string
+          format: date-time
+        last_success_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+      additionalProperties: false
+      x-go-type: api.ProviderView
+      x-source: internal/api/provider_sources.go
+      required:
+      - id
+      - name
+      - source
+      - format
+      - fetch_route
+      - active_revision
+      - revision
+      - created_at
+      - updated_at
+      - source_kind
+      - refreshable
+      - staged_revision
+    ProviderRevision:
+      type: object
+      properties:
+        provider_id:
+          type: string
+        number:
+          type: integer
+          format: int64
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+          nullable: true
+        parse_report:
+          $ref: '#/components/schemas/ParseReport'
+        changes:
+          $ref: '#/components/schemas/ChangeReport'
+        state:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        published_at:
+          nullable: true
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - provider_id
+      - number
+      - nodes
+      - parse_report
+      - changes
+      - state
+      - created_at
+      x-go-type: providers.Revision
+      x-source: internal/providers/lifecycle.go
+      description: Public revision JSON deliberately excludes private provider content hashes. Nodes exclude identity/credential
+        hashes and credentials.
+    StageProviderRequest:
+      type: object
+      required:
+      - content
+      properties:
+        content:
+          type: string
+        format:
+          type: string
+    NodeDefinition:
+      type: object
+      properties:
+        protocol:
+          type: string
+        host:
+          type: string
+        port:
+          type: integer
+          format: int64
+        tls:
+          type: boolean
+        sni:
+          type: string
+        alpn:
+          type: array
+          items:
+            type: string
+          nullable: true
+        network:
+          type: string
+        path:
+          type: string
+        service:
+          type: string
+        method:
+          type: string
+        fingerprint:
+          type: string
+      additionalProperties: false
+      required:
+      - protocol
+      - host
+      - port
+      x-go-type: nodes.Definition
+      x-source: internal/nodes/nodes.go
+    Node:
+      type: object
+      properties:
+        id:
+          type: string
+        provider_id:
+          type: string
+        name:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        definition:
+          $ref: '#/components/schemas/NodeDefinition'
+        supported:
+          type: boolean
+        unsupported_reason:
+          type: string
+      additionalProperties: false
+      required:
+      - id
+      - provider_id
+      - name
+      - revision
+      - definition
+      - supported
+      x-go-type: nodes.Node
+      x-source: internal/nodes/nodes.go
+      description: 'Public inventory view: identity, content_hash and credential fields are private and not serialized.'
+    OutboundGroupCreate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        gateway_id:
+          type: string
+        node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+          minItems: 1
+        mode:
+          type: string
+          enum:
+          - manual
+        replacement_policy:
+          type: string
+          enum:
+          - block
+          - none
+        source_filters:
+          $ref: '#/components/schemas/SourceFilters'
+      additionalProperties: false
+      required:
+      - name
+      - gateway_id
+      - node_ids
+      description: gateway_id must exist and node_ids must name at least one supported staged/active node. Automatic
+        selection currently returns 422 until a qualified chooser exists.
+    OutboundGroup:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        gateway_id:
+          type: string
+        node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        mode:
+          type: string
+          enum:
+          - manual
+          - automatic
+        replacement_policy:
+          type: string
+          enum:
+          - block
+          - none
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        source_filters:
+          $ref: '#/components/schemas/SourceFilters'
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - gateway_id
+      - node_ids
+      - mode
+      - replacement_policy
+      - revision
+      - created_at
+      - updated_at
+      x-go-type: outbounds.Group
+      x-source: internal/outbounds/outbounds.go
+    SelectionRequest:
+      type: object
+      properties:
+        node_id:
+          type: string
+        gateway_id:
+          type: string
+        transport:
+          type: string
+        transport_scopes:
+          type: array
+          items:
+            type: string
+          nullable: true
+        expected_revision:
+          type: integer
+          format: int64
+          description: Accepted by decoder but overwritten from required If-Match; it is not the precondition authority.
+      additionalProperties: false
+      required:
+      - node_id
+      x-go-type: api.selectionRequest
+      x-source: internal/api/services.go
+      description: gateway_id defaults to the group gateway. transport_scopes overrides transport; omitted transport
+        becomes tcp. Gateways advertising shared mode require explicit tcp and udp scopes. If-Match must contain
+        the nonnegative selection revision.
+    Selection:
+      type: object
+      properties:
+        group_id:
+          type: string
+        scope:
+          $ref: '#/components/schemas/OutboundsScope'
+        desired_node_id:
+          type: string
+        applied_node_id:
+          type: string
+        observed_node_id:
+          type: string
+        generation:
+          type: integer
+          format: int64
+        applied_generation:
+          type: integer
+          format: int64
+        observed_generation:
+          type: integer
+          format: int64
+        unavailable:
+          type: boolean
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - group_id
+      - scope
+      - generation
+      - applied_generation
+      - observed_generation
+      - unavailable
+      - revision
+      - updated_at
+      x-go-type: outbounds.Selection
+      x-source: internal/outbounds/outbounds.go
+    SelectionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Selection'
+          nullable: true
+      additionalProperties: false
+      required:
+      - items
+    SelectionAccepted:
+      $ref: '#/components/schemas/OperationAccepted'
+    GatewayCreate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        endpoint:
+          type: string
+        adapter:
+          type: string
+      additionalProperties: false
+      required:
+      - name
+      - endpoint
+    Gateway:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        endpoint:
+          type: string
+        adapter:
+          type: string
+        observed_generation:
+          type: integer
+          format: int64
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        health:
+          type: string
+        version:
+          type: string
+        observation_status:
+          type: string
+          enum:
+          - unavailable
+          - failed
+          - observed
+        capabilities:
+          type: object
+          properties:
+            supported:
+              type: array
+              items:
+                type: string
+              nullable: true
+            restrictions:
+              type: object
+              additionalProperties:
+                type: string
+          additionalProperties: false
+          required:
+          - supported
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - endpoint
+      - adapter
+      - observed_generation
+      - revision
+      - created_at
+      - updated_at
+      - health
+      - capabilities
+      - observation_status
+      x-go-type: api.GatewayView
+      x-source: internal/api/gateways.go
+    FirewallAttachRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        gateway_id:
+          type: string
+        alias:
+          type: string
+        alias_uuid:
+          type: string
+        alias_type:
+          type: string
+        alias_description:
+          type: string
+        owner_tag:
+          type: string
+        family:
+          type: string
+        interface_scope:
+          type: string
+        rule_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        enforcement:
+          type: string
+        expected_addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      required:
+      - gateway_id
+      - alias
+      - family
+      - interface_scope
+      x-go-type: opnsense.AttachRequest
+      x-source: internal/opnsense/opnsense.go
+    FirewallBinding:
+      type: object
+      properties:
+        id:
+          type: string
+        gateway_id:
+          type: string
+        alias:
+          $ref: '#/components/schemas/OpnsenseAliasShape'
+        family:
+          type: string
+        interface_scope:
+          type: string
+        rule_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        enforcement:
+          type: string
+        managed_addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+        revision:
+          type: integer
+          format: int64
+      additionalProperties: false
+      required:
+      - id
+      - gateway_id
+      - alias
+      - family
+      - interface_scope
+      - managed_addresses
+      x-go-type: opnsense.Binding
+      x-source: internal/opnsense/opnsense.go
+    FirewallReadback:
+      type: object
+      properties:
+        persisted:
+          $ref: '#/components/schemas/OpnsenseAliasRecord'
+        active:
+          $ref: '#/components/schemas/OpnsenseAliasRecord'
+        drift:
+          $ref: '#/components/schemas/OpnsenseDriftReport'
+        read_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - persisted
+      - active
+      - drift
+      - read_at
+      x-go-type: opnsense.Readback
+      x-source: internal/opnsense/opnsense.go
+    FirewallAttachResult:
+      type: object
+      required:
+      - binding
+      - observed
+      - verified
+      - view
+      properties:
+        binding:
+          $ref: '#/components/schemas/FirewallBinding'
+        observed:
+          $ref: '#/components/schemas/FirewallReadback'
+        verified:
+          type: boolean
+          enum:
+          - false
+        view:
+          $ref: '#/components/schemas/FirewallBindingView'
+    FirewallReadbackResult:
+      type: object
+      required:
+      - desired
+      - observed
+      - verified
+      - view
+      properties:
+        desired:
+          $ref: '#/components/schemas/FirewallBinding'
+        observed:
+          $ref: '#/components/schemas/FirewallReadback'
+        verified:
+          type: boolean
+          enum:
+          - false
+        view:
+          $ref: '#/components/schemas/FirewallBindingView'
+    CompileInput:
+      type: object
+      properties:
+        gateway:
+          $ref: '#/components/schemas/PolicyGateway'
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDevice'
+          nullable: true
+        device_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDeviceGroup'
+          nullable: true
+        policies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Policy'
+          nullable: true
+        rule_sets:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleSet'
+          nullable: true
+        domain_sets:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDomainSet'
+          nullable: true
+        outbound_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyOutboundGroup'
+          nullable: true
+        options:
+          $ref: '#/components/schemas/PolicyCompileOptions'
+        previous:
+          $ref: '#/components/schemas/Manifest'
+      additionalProperties: false
+      x-go-type: policy.CompileInput
+      x-source: internal/policy/types.go
+      required:
+      - gateway
+      - devices
+      - device_groups
+      - policies
+    CompileResult:
+      type: object
+      properties:
+        manifest:
+          $ref: '#/components/schemas/Manifest'
+        normalized:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyCompiledGroup'
+          nullable: true
+        source_map:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicySourceMapEntry'
+          nullable: true
+        impact:
+          $ref: '#/components/schemas/PolicyImpactReport'
+        diagnostics:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDiagnostic'
+          nullable: true
+      additionalProperties: false
+      x-go-type: policy.CompileResult
+      x-source: internal/policy/types.go
+      required:
+      - manifest
+      - normalized
+      - source_map
+      - impact
+    Manifest:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int64
+        gateway_id:
+          type: string
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyCompiledGroup'
+          nullable: true
+        enrollments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyEnrollmentSet'
+          nullable: true
+        source_map:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicySourceMapEntry'
+          nullable: true
+        domain_sets:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDomainSet'
+          nullable: true
+        content_hash:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.Manifest
+      x-source: internal/policy/types.go
+      required:
+      - version
+      - gateway_id
+      - groups
+      - enrollments
+      - source_map
+      - content_hash
+    Packet:
+      type: object
+      properties:
+        source_ip:
+          type: string
+        destination_ip:
+          type: string
+        destination_port:
+          type: integer
+          format: int64
+        transport:
+          type: string
+        family:
+          type: string
+        domain:
+          type: string
+      additionalProperties: false
+      required:
+      - source_ip
+      - destination_ip
+      - destination_port
+      - transport
+      x-go-type: policy.Packet
+      x-source: internal/policy/types.go
+    ExplainRequest:
+      type: object
+      required:
+      - manifest
+      - packet
+      properties:
+        manifest:
+          $ref: '#/components/schemas/Manifest'
+        packet:
+          $ref: '#/components/schemas/Packet'
+    Explanation:
+      type: object
+      properties:
+        predicted:
+          type: boolean
+        action:
+          $ref: '#/components/schemas/Action'
+        device_group_id:
+          type: string
+        matched_rule_id:
+          type: string
+        matched_rule_name:
+          type: string
+        source:
+          $ref: '#/components/schemas/PolicySourceRef'
+        reason:
+          type: string
+        candidates:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      required:
+      - predicted
+      - action
+      - reason
+      x-go-type: policy.Explanation
+      x-source: internal/policy/types.go
+    EnrollmentManifest:
+      type: object
+      properties:
+        mode:
+          type: string
+        gateway_id:
+          type: string
+        previous_gateway_id:
+          type: string
+        firewall_id:
+          type: string
+        binding_id:
+          type: string
+        expected_firewall_shape_hash:
+          type: string
+        expected_generation:
+          type: integer
+          format: int64
+          minimum: 0
+        expected_policy_hash:
+          type: string
+        generation:
+          type: integer
+          format: int64
+          minimum: 0
+        policy_hash:
+          type: string
+        policy: {}
+        sources:
+          type: array
+          items:
+            type: string
+          nullable: true
+        previous_addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+        addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+        strict:
+          type: boolean
+        disposition:
+          type: string
+        sessions:
+          type: string
+        probe_required:
+          type: boolean
+      additionalProperties: false
+      required:
+      - mode
+      - gateway_id
+      - firewall_id
+      - binding_id
+      - expected_firewall_shape_hash
+      - expected_generation
+      - expected_policy_hash
+      - generation
+      - policy_hash
+      - sources
+      - previous_addresses
+      - addresses
+      - strict
+      - sessions
+      - probe_required
+      x-go-type: deployment.EnrollmentManifest
+      x-source: internal/deployment/cross_system.go
+    DeploymentRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        idempotency_key:
+          type: string
+        target:
+          $ref: '#/components/schemas/OperationTarget'
+        action:
+          type: string
+        requested_generation:
+          type: integer
+          format: int64
+          minimum: 0
+        desired:
+          allOf:
+          - $ref: '#/components/schemas/StateRecord'
+      additionalProperties: false
+      required:
+      - target
+      - action
+      x-go-type: deployment.Request
+      x-source: internal/deployment/types.go
+    OperationAccepted:
+      type: object
+      properties:
+        operation_id:
+          type: string
+        status:
+          type: string
+          enum:
+          - draft
+          - validated
+          - staged
+          - applying
+          - verifying
+          - applied
+          - partially_applied
+          - failed
+          - outcome_unknown
+        revision:
+          $ref: '#/components/schemas/ProviderRevision'
+        changes:
+          $ref: '#/components/schemas/ChangeReport'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Selection'
+          nullable: true
+      additionalProperties: false
+      required:
+      - operation_id
+      - status
+      description: References an existing journal entry at /api/v1/operations/{id}. Optional provider/selection
+        payloads may be omitted on replay. HTTP 202 can contain a settled status; read the operation instead of
+        assuming asynchronous execution or traffic success.
+    StateRecord:
+      type: object
+      properties:
+        generation:
+          type: integer
+          format: int64
+          minimum: 0
+        revision:
+          type: string
+        hash:
+          type: string
+        status:
+          type: string
+        data: {}
+        at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - generation
+      - at
+      x-go-type: deployment.StateRecord
+      x-source: internal/deployment/types.go
+    Operation:
+      type: object
+      properties:
+        id:
+          type: string
+        idempotency_key:
+          type: string
+        target:
+          $ref: '#/components/schemas/OperationTarget'
+        action:
+          type: string
+        requested_generation:
+          type: integer
+          format: int64
+          minimum: 0
+        fence_token:
+          type: integer
+          format: int64
+          minimum: 0
+        status:
+          type: string
+          enum:
+          - draft
+          - validated
+          - staged
+          - applying
+          - verifying
+          - applied
+          - partially_applied
+          - failed
+          - outcome_unknown
+        rollback:
+          type: string
+          enum:
+          - none
+          - pending
+          - running
+          - succeeded
+          - failed
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeploymentStep'
+          nullable: true
+        views:
+          $ref: '#/components/schemas/PublicStateViews'
+        error:
+          type: string
+        original_error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          nullable: true
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - id
+      - target
+      - action
+      - requested_generation
+      - fence_token
+      - status
+      - rollback
+      - views
+      - created_at
+      - updated_at
+      x-go-type: deployment.Operation
+      x-source: internal/deployment/types.go
+      x-public-redacted-fields:
+      - request_hash
+      description: Public journal view excludes request_hash, and nested views exclude private hash/data payloads.
+        View presence is evidence of that state only; applied does not imply traffic verified.
+    AuditEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        actor:
+          type: string
+        object_type:
+          type: string
+        object_id:
+          type: string
+        action:
+          type: string
+        outcome:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - id
+      - actor
+      - object_type
+      - object_id
+      - action
+      - outcome
+      - created_at
+      x-go-type: api.AuditEvent
+      x-source: internal/api/services.go
+    ControllerEvents:
+      type: object
+      additionalProperties: false
+      required:
+      - items
+      - next_cursor
+      - has_more
+      - resumable
+      - durable
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ManagementEvent'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+        resumable:
+          type: boolean
+          enum:
+          - true
+        durable:
+          type: boolean
+      x-go-type: api.eventPage
+      x-source: internal/api/events.go
+    Overview:
+      type: object
+      required:
+      - gateways
+      - bindings
+      - providers
+      - device_groups
+      - operations
+      - coverage
+      - coverage_status
+      properties:
+        gateways:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gateway'
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/FirewallBindingView'
+          nullable: true
+        providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Provider'
+        device_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceGroup'
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Operation'
+        coverage:
+          nullable: true
+          description: Currently null; no coverage measurement is available.
+          type: object
+        coverage_status:
+          type: string
+          enum:
+          - unavailable
+    DeviceList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    DeviceGroupList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceGroup'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    PolicyList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Policy'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    RuleSetList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleSet'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    ProviderList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Provider'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    ProviderRevisionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderRevision'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    NodeList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    OutboundGroupList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutboundGroup'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    GatewayList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gateway'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    FirewallBindingList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FirewallBindingView'
+        adapter_configured:
+          type: boolean
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - adapter_configured
+      - limit
+      - total
+    OperationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Operation'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    AuditEventList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: string
+      additionalProperties: false
+      required:
+      - items
+      - limit
+      - total
+    GatewayRecord:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        endpoint:
+          type: string
+        adapter:
+          type: string
+        observed_generation:
+          type: integer
+          format: int64
+        revision:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - endpoint
+      - adapter
+      - observed_generation
+      - revision
+      - created_at
+      - updated_at
+      x-go-type: domain.Gateway
+      x-source: internal/domain/types.go
+    PolicyGateway:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        supported_transports:
+          type: array
+          items:
+            type: string
+          nullable: true
+        supports_ipv6:
+          type: boolean
+        distinguishes_networks:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.Gateway
+      x-source: internal/policy/types.go
+      required:
+      - id
+    PolicyDeviceAddress:
+      type: object
+      properties:
+        address:
+          type: string
+        family:
+          type: string
+        provenance:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.DeviceAddress
+      x-source: internal/policy/types.go
+      required:
+      - address
+    PolicyDevice:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        addresses:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDeviceAddress'
+          nullable: true
+        group_id:
+          type: string
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+          nullable: true
+        enabled:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.Device
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - addresses
+      - enabled
+    PolicyDeviceGroup:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        gateway_id:
+          type: string
+        policy_id:
+          type: string
+        device_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        members:
+          type: array
+          items:
+            type: string
+          nullable: true
+        enabled:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.DeviceGroup
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - gateway_id
+      - policy_id
+      - enabled
+    PolicyDomainSet:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        domains:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      x-go-type: policy.DomainSet
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - domains
+    PolicyOutboundGroup:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        candidate_node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        allow_empty:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.OutboundGroup
+      x-source: internal/policy/types.go
+      required:
+      - id
+    PolicyCompileOptions:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+        supported_transports:
+          type: object
+          additionalProperties:
+            type: boolean
+          nullable: true
+        supports_ipv6:
+          type: boolean
+        distinguishes_networks:
+          type: boolean
+        uncontrolled_ipv6:
+          type: boolean
+        allow_unsafe_raw_config:
+          type: boolean
+        strict:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.CompileOptions
+      x-source: internal/policy/types.go
+    PolicySourceRef:
+      type: object
+      properties:
+        policy_id:
+          type: string
+        rule_set_id:
+          type: string
+        rule_id:
+          type: string
+        device_group_id:
+          type: string
+        device_id:
+          type: string
+        phase:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.SourceRef
+      x-source: internal/policy/types.go
+      required:
+      - phase
+    PolicyEngineRule:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        source_selector:
+          type: array
+          items:
+            type: string
+          nullable: true
+        match:
+          $ref: '#/components/schemas/Match'
+        action:
+          $ref: '#/components/schemas/Action'
+        expression:
+          type: string
+        source:
+          $ref: '#/components/schemas/PolicySourceRef'
+      additionalProperties: false
+      x-go-type: policy.EngineRule
+      x-source: internal/policy/types.go
+      required:
+      - id
+      - source_selector
+      - match
+      - action
+      - expression
+      - source
+    PolicyCompiledGroup:
+      type: object
+      properties:
+        device_group_id:
+          type: string
+        gateway_id:
+          type: string
+        source_selector:
+          type: array
+          items:
+            type: string
+          nullable: true
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyEngineRule'
+          nullable: true
+        default_action:
+          $ref: '#/components/schemas/Action'
+        unknown_domain_action:
+          $ref: '#/components/schemas/Action'
+        proxy_failure_action:
+          $ref: '#/components/schemas/Action'
+      additionalProperties: false
+      x-go-type: policy.CompiledGroup
+      x-source: internal/policy/types.go
+      required:
+      - device_group_id
+      - gateway_id
+      - source_selector
+      - rules
+      - default_action
+      - unknown_domain_action
+      - proxy_failure_action
+    PolicyEnrollmentSet:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+        group_id:
+          type: string
+        addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      x-go-type: policy.EnrollmentSet
+      x-source: internal/policy/types.go
+      required:
+      - gateway_id
+      - group_id
+      - addresses
+    PolicySourceMapEntry:
+      type: object
+      properties:
+        generated_id:
+          type: string
+        source:
+          $ref: '#/components/schemas/PolicySourceRef'
+      additionalProperties: false
+      x-go-type: policy.SourceMapEntry
+      x-source: internal/policy/types.go
+      required:
+      - generated_id
+      - source
+    PolicyImpactReport:
+      type: object
+      properties:
+        changed_groups:
+          type: array
+          items:
+            type: string
+          nullable: true
+        unchanged_groups:
+          type: array
+          items:
+            type: string
+          nullable: true
+        enrollment_changed:
+          type: boolean
+        requires_policy_apply:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.ImpactReport
+      x-source: internal/policy/types.go
+      required:
+      - enrollment_changed
+      - requires_policy_apply
+    PolicyDiagnostic:
+      type: object
+      properties:
+        severity:
+          type: string
+        code:
+          type: string
+        path:
+          type: string
+        message:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.Diagnostic
+      x-source: internal/policy/types.go
+      required:
+      - severity
+      - code
+      - message
+    ProvidersUnsupported:
+      type: object
+      properties:
+        index:
+          type: integer
+          format: int64
+        name:
+          type: string
+        reason:
+          type: string
+      additionalProperties: false
+      required:
+      - index
+      - reason
+      x-go-type: providers.Unsupported
+      x-source: internal/providers/parser.go
+    ParseReport:
+      type: object
+      properties:
+        format:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+          nullable: true
+        errors:
+          type: array
+          items:
+            type: string
+          nullable: true
+        unsupported:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersUnsupported'
+          nullable: true
+        skipped:
+          type: integer
+          format: int64
+      additionalProperties: false
+      required:
+      - format
+      - skipped
+      x-go-type: providers.ParseReport
+      x-source: internal/providers/parser.go
+    ProvidersNodeChange:
+      type: object
+      properties:
+        node_id:
+          type: string
+        before:
+          type: string
+        after:
+          type: string
+      additionalProperties: false
+      required:
+      - node_id
+      x-go-type: providers.NodeChange
+      x-source: internal/providers/lifecycle.go
+    ProvidersIdentityAmbiguity:
+      type: object
+      properties:
+        previous_node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        new_node_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        reason:
+          type: string
+      additionalProperties: false
+      required:
+      - previous_node_ids
+      - new_node_ids
+      - reason
+      x-go-type: providers.IdentityAmbiguity
+      x-source: internal/providers/lifecycle.go
+    ChangeReport:
+      type: object
+      properties:
+        added:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersNodeChange'
+          nullable: true
+        removed:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersNodeChange'
+          nullable: true
+        changed:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersNodeChange'
+          nullable: true
+        renamed:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersNodeChange'
+          nullable: true
+        ambiguous:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvidersIdentityAmbiguity'
+          nullable: true
+        unchanged:
+          type: integer
+          format: int64
+        noop:
+          type: boolean
+      additionalProperties: false
+      required:
+      - unchanged
+      - noop
+      x-go-type: providers.ChangeReport
+      x-source: internal/providers/lifecycle.go
+    OutboundsScope:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+        transport:
+          type: string
+      additionalProperties: false
+      required:
+      - gateway_id
+      - transport
+      x-go-type: outbounds.Scope
+      x-source: internal/outbounds/outbounds.go
+    OperationTarget:
+      type: object
+      properties:
+        kind:
+          type: string
+        id:
+          type: string
+      additionalProperties: false
+      required:
+      - kind
+      - id
+      x-go-type: deployment.Target
+      x-source: internal/deployment/types.go
+    DeploymentStep:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+        started_at:
+          nullable: true
+          type: string
+          format: date-time
+        ended_at:
+          nullable: true
+          type: string
+          format: date-time
+        error:
+          type: string
+        message:
+          type: string
+      additionalProperties: false
+      required:
+      - name
+      - status
+      x-go-type: deployment.Step
+      x-source: internal/deployment/types.go
+    OpnsenseAliasShape:
+      type: object
+      properties:
+        name:
+          type: string
+        uuid:
+          type: string
+        type:
+          type: string
+        description:
+          type: string
+        owner_tag:
+          type: string
+        disabled:
+          type: boolean
+      additionalProperties: false
+      required:
+      - name
+      - type
+      x-go-type: opnsense.AliasShape
+      x-source: internal/opnsense/opnsense.go
+    OpnsenseAliasRecord:
+      type: object
+      properties:
+        name:
+          type: string
+        uuid:
+          type: string
+        type:
+          type: string
+        description:
+          type: string
+        owner_tag:
+          type: string
+        disabled:
+          type: boolean
+        addresses:
+          type: array
+          items:
+            type: string
+          nullable: true
+        revision:
+          type: integer
+          format: int64
+        observed_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - addresses
+      x-go-type: opnsense.AliasRecord
+      x-source: internal/opnsense/opnsense.go
+    OpnsenseDriftItem:
+      type: object
+      properties:
+        kind:
+          type: string
+        expected:
+          type: array
+          items:
+            type: string
+          nullable: true
+        observed:
+          type: array
+          items:
+            type: string
+          nullable: true
+        message:
+          type: string
+      additionalProperties: false
+      required:
+      - kind
+      - message
+      x-go-type: opnsense.DriftItem
+      x-source: internal/opnsense/opnsense.go
+    OpnsenseDriftReport:
+      type: object
+      properties:
+        drifted:
+          type: boolean
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpnsenseDriftItem'
+          nullable: true
+      additionalProperties: false
+      required:
+      - drifted
+      x-go-type: opnsense.DriftReport
+      x-source: internal/opnsense/opnsense.go
+    DeviceAddressInput:
+      type: object
+      properties:
+        address:
+          type: string
+        family:
+          type: string
+        provenance:
+          type: string
+      additionalProperties: false
+      required:
+      - address
+    ManagementEvent:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - sequence
+      - type
+      - resource_type
+      - resource_id
+      - action
+      - status
+      - occurred_at
+      properties:
+        id:
+          type: string
+          description: Opaque resume cursor for this item.
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        type:
+          type: string
+          enum:
+          - operation.changed
+          - audit.recorded
+        resource_type:
+          type: string
+        resource_id:
+          type: string
+        action:
+          type: string
+        status:
+          type: string
+        operation_id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+      x-go-type: api.ManagementEvent
+      x-source: internal/api/events.go
+    FirewallBindingView:
+      type: object
+      properties:
+        id:
+          type: string
+        gateway_id:
+          type: string
+        alias:
+          type: string
+        alias_uuid:
+          type: string
+        address_family:
+          type: string
+        interface_scope:
+          type: string
+        rule_ids:
+          type: array
+          items:
+            type: string
+          nullable: true
+        desired_count:
+          type: integer
+          format: int64
+        persisted_count:
+          type: integer
+          format: int64
+        active_count:
+          type: integer
+          format: int64
+        drift:
+          type: boolean
+        state:
+          type: string
+        observation_status:
+          type: string
+        observation_error:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+        verified:
+          type: boolean
+      additionalProperties: false
+      x-go-type: api.FirewallBindingView
+      x-source: internal/api/firewall.go
+      required:
+      - id
+      - gateway_id
+      - alias
+      - address_family
+      - interface_scope
+      - rule_ids
+      - desired_count
+      - state
+      - observation_status
+      - verified
+    PlanRequest:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+        previous_operation_id:
+          type: string
+      additionalProperties: false
+      x-go-type: api.PlanRequest
+      x-source: internal/api/planner.go
+      required:
+      - gateway_id
+    ApiResourceRevision:
+      type: object
+      properties:
+        kind:
+          type: string
+        id:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+      additionalProperties: false
+      x-go-type: api.ResourceRevision
+      x-source: internal/api/planner.go
+      required:
+      - kind
+      - id
+      - revision
+      - sha256
+    PolicyDAEOutboundBinding:
+      type: object
+      properties:
+        outbound_group_id:
+          type: string
+        engine_name:
+          type: string
+      additionalProperties: false
+      x-go-type: policy.DAEOutboundBinding
+      x-source: internal/policy/dae.go
+      required:
+      - outbound_group_id
+      - engine_name
+    PolicyDAESourceMapEntry:
+      type: object
+      properties:
+        line:
+          type: integer
+          format: int64
+        generated_id:
+          type: string
+        source_selector:
+          type: string
+        source:
+          $ref: '#/components/schemas/PolicySourceRef'
+      additionalProperties: false
+      x-go-type: policy.DAESourceMapEntry
+      x-source: internal/policy/dae.go
+      required:
+      - line
+      - source_selector
+      - source
+    PolicyDAERequiredGlobals:
+      type: object
+      properties:
+        dial_mode:
+          type: string
+        auto_sniff_punt:
+          type: boolean
+      additionalProperties: false
+      x-go-type: policy.DAERequiredGlobals
+      x-source: internal/policy/dae.go
+      required:
+      - dial_mode
+      - auto_sniff_punt
+    DAEArtifact:
+      type: object
+      properties:
+        format:
+          type: string
+        dae_base:
+          type: string
+        gateway_id:
+          type: string
+        manifest:
+          $ref: '#/components/schemas/Manifest'
+        routing_config:
+          type: string
+        routing_sha256:
+          type: string
+        content_hash:
+          type: string
+        requires_guard:
+          type: boolean
+        outbound_bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDAEOutboundBinding'
+          nullable: true
+        source_map:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDAESourceMapEntry'
+          nullable: true
+        required_globals:
+          $ref: '#/components/schemas/PolicyDAERequiredGlobals'
+      additionalProperties: false
+      x-go-type: policy.DAEArtifact
+      x-source: internal/policy/dae.go
+      required:
+      - format
+      - dae_base
+      - gateway_id
+      - manifest
+      - routing_config
+      - routing_sha256
+      - content_hash
+      - requires_guard
+      - outbound_bindings
+      - source_map
+      - required_globals
+    GatewayCapability:
+      type: object
+      properties:
+        name:
+          type: string
+        supported:
+          type: boolean
+        implementation:
+          type: string
+        restrictions:
+          type: array
+          items:
+            type: string
+          nullable: true
+      additionalProperties: false
+      x-go-type: gateway.Capability
+      x-source: internal/gateway/engine.go
+      required:
+      - name
+      - supported
+    GatewayCapabilities:
+      type: object
+      properties:
+        implementation:
+          type: string
+        version:
+          type: string
+        capabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/GatewayCapability'
+          nullable: true
+      additionalProperties: false
+      x-go-type: gateway.Capabilities
+      x-source: internal/gateway/engine.go
+      required:
+      - implementation
+      - version
+      - capabilities
+    ApiPlanTarget:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+        observation_status:
+          type: string
+        capabilities:
+          $ref: '#/components/schemas/GatewayCapabilities'
+      additionalProperties: false
+      x-go-type: api.PlanTarget
+      x-source: internal/api/planner.go
+      required:
+      - gateway_id
+      - observation_status
+      - capabilities
+    ApiPlanPrevious:
+      type: object
+      properties:
+        status:
+          type: string
+        operation_id:
+          type: string
+        manifest_hash:
+          type: string
+      additionalProperties: false
+      x-go-type: api.PlanPrevious
+      x-source: internal/api/planner.go
+      required:
+      - status
+    InventoryPlan:
+      type: object
+      properties:
+        version:
+          type: integer
+          format: int64
+        checksum:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        created_at:
+          type: string
+          format: date-time
+        scope:
+          type: string
+        consistency:
+          type: string
+        resource_revisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiResourceRevision'
+          nullable: true
+        input:
+          $ref: '#/components/schemas/CompileInput'
+        compilation:
+          $ref: '#/components/schemas/CompileResult'
+        native_artifact:
+          $ref: '#/components/schemas/DAEArtifact'
+        valid:
+          type: boolean
+        deployable:
+          type: boolean
+          enum:
+          - false
+        diagnostics:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDiagnostic'
+          nullable: true
+        blockers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyDiagnostic'
+          nullable: true
+        target:
+          $ref: '#/components/schemas/ApiPlanTarget'
+        previous:
+          $ref: '#/components/schemas/ApiPlanPrevious'
+      additionalProperties: false
+      x-go-type: api.InventoryPlan
+      x-source: internal/api/planner.go
+      required:
+      - version
+      - checksum
+      - created_at
+      - scope
+      - consistency
+      - resource_revisions
+      - input
+      - valid
+      - deployable
+      - blockers
+      - target
+      - previous
+      description: Immutable snapshot of the complete stored gateway scope, bound to source revisions and a checksum.
+        valid means compiler validity. deployable remains false until full artifact, coverage and independent guards
+        qualify. Input is captured server-side; supplied client policy/member/capability claims are not accepted.
+        input.gateway transport/IPv6 flags represent compiler syntax context only. Observed target capabilities
+        are reported separately, coverage remains unqualified, and input.options.uncontrolled_ipv6=true rejects
+        unsupported strict intent.
+    ProviderSchedule:
+      type: object
+      properties:
+        provider_id:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        enabled:
+          type: boolean
+        interval_seconds:
+          type: integer
+          format: int64
+          minimum: 300
+          maximum: 604800
+        auto_apply:
+          type: boolean
+          enum:
+          - false
+        eligible:
+          type: boolean
+        next_due_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+        last_success_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+        last_operation_id:
+          type: string
+        running:
+          type: boolean
+      additionalProperties: false
+      x-go-type: api.ProviderSchedule
+      x-source: internal/api/provider_schedule.go
+      required:
+      - provider_id
+      - revision
+      - enabled
+      - interval_seconds
+      - auto_apply
+      - eligible
+      - running
+      description: Disabled by default with revision=0 and interval_seconds=3600. Scheduled fetches only stage revisions
+        for review. Observations are independent of setting revision; auto_apply is unsupported.
+    PublicStateRecord:
+      type: object
+      properties:
+        generation:
+          type: integer
+          format: int64
+          minimum: 0
+        revision:
+          type: string
+        status:
+          type: string
+        at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - generation
+      - at
+      x-go-type: deployment.StateRecord
+      x-source: internal/deployment/types.go
+      x-public-redacted-fields:
+      - hash
+      - data
+    PublicStateViews:
+      type: object
+      properties:
+        desired:
+          $ref: '#/components/schemas/PublicStateRecord'
+        applied:
+          $ref: '#/components/schemas/PublicStateRecord'
+        observed:
+          $ref: '#/components/schemas/PublicStateRecord'
+        verified:
+          $ref: '#/components/schemas/PublicStateRecord'
+      additionalProperties: false
+      x-go-type: deployment.StateViews
+      x-source: internal/deployment/types.go
+    ProviderScheduleRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+        interval_seconds:
+          type: integer
+          minimum: 300
+          maximum: 604800
+        auto_apply:
+          type: boolean
+          default: false
+      required:
+      - interval_seconds
+    DiagnosticProbe:
+      type: object
+      additionalProperties: false
+      properties:
+        target:
+          type: string
+        ok:
+          type: boolean
+        latency_ms:
+          type: number
+          minimum: 0
+        observed_at:
+          type: string
+          format: date-time
+        error:
+          type: string
+          description: Sanitized fixed probe failure message.
+      required:
+      - target
+      - ok
+      - latency_ms
+      - observed_at
+    GatewayProbeResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        gateway_id:
+          type: string
+        gateway_name:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+          description: Controller receipt time.
+        target_kind:
+          type: string
+          enum:
+          - node
+          - group
+        target_id:
+          type: string
+        probe:
+          $ref: '#/components/schemas/DiagnosticProbe'
+      required:
+      - gateway_id
+      - gateway_name
+      - observed_at
+      - target_kind
+      - target_id
+      - probe
+    DiagnosticConnection:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        group_id:
+          type: string
+        provider_id:
+          type: string
+        node_id:
+          type: string
+        transport:
+          type: string
+        state:
+          type: string
+        opened_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - opened_at
+    GatewayConnectionsResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        gateway_id:
+          type: string
+        gateway_name:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+          description: Controller receipt time.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DiagnosticConnection'
+      required:
+      - gateway_id
+      - gateway_name
+      - observed_at
+      - items
+    DiagnosticCounter:
+      type: object
+      additionalProperties: false
+      properties:
+        available:
+          type: boolean
+        bytes:
+          type: string
+          pattern: ^[0-9]+$
+        packets:
+          type: string
+          pattern: ^[0-9]+$
+      required:
+      - available
+      description: Unsigned 64-bit counts are decimal strings to preserve browser precision. Absent fields mean
+        unavailable; the string 0 is an observed zero.
+    GatewayCountersResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        gateway_id:
+          type: string
+        gateway_name:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+          description: Controller receipt time.
+        proxy:
+          $ref: '#/components/schemas/DiagnosticCounter'
+        direct:
+          $ref: '#/components/schemas/DiagnosticCounter'
+        provider_quota:
+          $ref: '#/components/schemas/DiagnosticCounter'
+      required:
+      - gateway_id
+      - gateway_name
+      - observed_at
+      - proxy
+      - direct
+      - provider_quota
+    SourceFilters:
+      type: object
+      additionalProperties: false
+      properties:
+        provider_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        protocols:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        exclude_provider_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        exclude_protocols:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        include_node_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        exclude_node_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        include_names:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+        exclude_names:
+          type: array
+          items:
+            type: string
+          maxItems: 1024
+      description: At least one positive constraint is required. Provider/protocol restrictions are ANDed; included
+        IDs OR included exact case-sensitive names can match. Exclusions always win. Names are not regular expressions.
+      x-go-type: outbounds.SourceFilters
+      x-source: internal/outbounds/filters.go
+    ProviderEdit:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        format:
+          type: string
+          nullable: true
+          enum:
+          - auto
+          - native
+          - base64
+          - links
+          - sip008
+          - clash
+          - json
+          - local
+          - ''
+        fetch_route:
+          type: string
+          nullable: true
+      description: Only supplied non-null fields change. Omitted/null source preserves its private reference. Source
+        must be new URL/content, never [redacted] or a secret_ reference. Edits do not fetch or publish.
+      x-go-type: api.providerEdit
+      x-source: internal/api/provider_crud.go
+x-oidc-callback:
+  x-implementation-status: configured-route
+  configured_by: OIDC_REDIRECT_URL
+  method: GET
+  description: The exact configured host, scheme and path are matched; no default callback route is assumed. Example
+    deployment config uses /api/v1/auth/callback. Requires one state query plus authorization code (or identity
+    provider error) and the browser-bound login cookie. Verifies state, PKCE and nonce, then sets session/CSRF cookies
+    and redirects with HTTP 303. Errors use nested auth error bodies.
+  parameters:
+  - name: state
+    in: query
+    required: true
+    schema:
+      type: string
+  - name: code
+    in: query
+    schema:
+      type: string
+  - name: error
+    in: query
+    schema:
+      type: string
+  responses:
+    '303':
+      description: Redirect after successful login
+    '400':
+      description: Invalid callback or login state
+    '401':
+      description: Identity token rejected
+    '502':
+      description: Token exchange failed

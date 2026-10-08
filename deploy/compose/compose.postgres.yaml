@@ -1,0 +1,30 @@
+# Use with: docker compose -f deploy/compose/compose.yaml \
+#   -f deploy/compose/compose.postgres.yaml up --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-homelab_proxy}
+      POSTGRES_USER: ${POSTGRES_USER:-homelab_proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random value}
+    volumes:
+      - postgres-state:/var/lib/postgresql/data
+      - ../../migrations/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    networks: [control]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  controller:
+    environment:
+      STORAGE_DRIVER: pgx
+      STORAGE_DSN: postgres://${POSTGRES_USER:-homelab_proxy}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random value}@postgres:5432/${POSTGRES_DB:-homelab_proxy}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-state:

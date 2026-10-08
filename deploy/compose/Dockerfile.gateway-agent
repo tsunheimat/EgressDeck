@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+# The agent is packaged separately from the controller. This image only
+# exposes the agent contract; a qualified deployment must bind it to a tested
+# dae host and network namespace (see deploy/openwrt and docs/compatibility.md).
+FROM golang:1.23-alpine AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -buildvcs=false -ldflags='-s -w' \
+    -o /out/homelab-proxy-gateway-agent ./cmd/gateway-agent
+
+FROM alpine:3.20
+
+RUN addgroup -S -g 10002 gateway \
+    && adduser -S -D -H -u 10002 -G gateway gateway \
+    && mkdir -p /var/lib/homelab-proxy-gateway-agent \
+    && chmod 0700 /var/lib/homelab-proxy-gateway-agent \
+    && chown gateway:gateway /var/lib/homelab-proxy-gateway-agent \
+    && apk add --no-cache ca-certificates
+
+COPY --from=build /out/homelab-proxy-gateway-agent /usr/local/bin/homelab-proxy-gateway-agent
+
+USER 10002:10002
+WORKDIR /var/lib/homelab-proxy-gateway-agent
+ENV GATEWAY_AGENT_LISTEN=:9090 \
+    GATEWAY_AGENT_JOURNAL=/var/lib/homelab-proxy-gateway-agent/journal.ndjson
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/homelab-proxy-gateway-agent"]

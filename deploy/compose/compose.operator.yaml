@@ -1,0 +1,12 @@
+# Optional controller operator configuration/certificate directory.
+# No files are read unless their *_CONFIG_FILE / CONTROLLER_GATEWAYS_FILE
+# variables select a path under the directory. Bind mounts preserve ownership.
+services:
+  controller:
+    volumes:
+      - type: bind
+        source: ${CONTROLLER_OPERATOR_DIR:?set CONTROLLER_OPERATOR_DIR to a private existing directory}
+        target: /run/egressdeck/operator
+        read_only: true
+        bind:
+          create_host_path: false

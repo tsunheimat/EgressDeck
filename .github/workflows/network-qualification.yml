@@ -1,0 +1,88 @@
+name: Network qualification
+
+# This workflow is deliberately manual. It runs only on the protected main
+# ref, on a trusted isolated runner, and after the environment owner supplies
+# a topology configuration. Pull requests must never execute here.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit to qualify (must be main)'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: network-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, egressdeck-network]
+    environment: network-qualification
+    timeout-minutes: 60
+    env:
+      NETWORK_QUALIFICATION_CONFIG: ${{ secrets.NETWORK_QUALIFICATION_CONFIG }}
+      NETWORK_QUALIFICATION_EVIDENCE: ${{ github.workspace }}/artifacts/network/qualification.json
+    steps:
+      - name: Require protected main dispatch
+        env:
+          DISPATCH_REF: ${{ inputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main \
+            || { echo "Network qualification must be dispatched from main (got $GITHUB_REF)."; exit 1; }
+          test "$DISPATCH_REF" = main \
+            || { echo "The ref input must be main."; exit 1; }
+
+      - name: Check out protected main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Require configured isolated topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${NETWORK_QUALIFICATION_CONFIG:-}" \
+            || { echo 'The protected network-qualification environment must provide NETWORK_QUALIFICATION_CONFIG.'; exit 1; }
+          test -d tests/network \
+            || { echo 'tests/network is absent; the real-network gate is not qualified.'; exit 1; }
+
+      - name: Run real network qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This executable is provisioned by the protected runner owner, not
+          # pulled from a PR. It must exercise the isolated topology and write
+          # the source-bound receipt checked below. Absence is a failed gate.
+          test -x /opt/egressdeck/bin/run-network-qualification \
+            || { echo 'Trusted real-network harness is not installed.'; exit 1; }
+          /opt/egressdeck/bin/run-network-qualification \
+            --config "$NETWORK_QUALIFICATION_CONFIG" \
+            --source-commit "$GITHUB_SHA" \
+            --evidence "$NETWORK_QUALIFICATION_EVIDENCE"
+          # The tag is mandatory so ordinary unit tests cannot satisfy this gate.
+          go test -tags=network -count=1 -v ./tests/network/...
+
+      - name: Upload redacted qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-qualification-${{ github.sha }}
+          path: |
+            artifacts/network/**
+            tests/network/artifacts/**
+          if-no-files-found: error
+          retention-days: 30

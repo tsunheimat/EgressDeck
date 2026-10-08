@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: controller-state
+  labels:
+    app.kubernetes.io/name: controller
+    app.kubernetes.io/part-of: egressdeck
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

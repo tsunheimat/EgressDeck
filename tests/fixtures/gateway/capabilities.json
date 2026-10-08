@@ -1,0 +1,20 @@
+{
+  "implementation": "egressdeck-fake-engine",
+  "version": "0.1.0",
+  "capabilities": [
+    {"name": "inventory.read", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "provider.stage", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "provider.publish_hot", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "selection.set_runtime", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "selection.persist_restart", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "policy.validate", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "policy.apply_generation", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "probe.node", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "probe.group", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "connections.observe", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "connections.close_filtered", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "traffic.proxy_counters", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "traffic.direct_counters", "supported": true, "implementation": "egressdeck-fake-engine"},
+    {"name": "events.resume", "supported": true, "implementation": "egressdeck-fake-engine"}
+  ]
+}
