@@ -117,3 +117,23 @@ it('discards mismatched probe targets and hides a previous successful measuremen
   expect(container!.textContent).not.toContain('12 ms gateway measurement')
   expect(container!.textContent).not.toContain('1 ms gateway measurement')
 })
+
+
+it('keeps converged readback collapsible and places candidate selection first', async () => {
+  await mount('shared_tcp_udp', ['tcp', 'udp'].map(transport => ({ scope: { gateway_id: 'gw1', transport }, revision: 1, desired_node_id: 'n1', applied_node_id: 'n1', observed_node_id: 'n1' })))
+  const details = container!.querySelector<HTMLDetailsElement>('.readback-details')!
+  await vi.waitFor(() => expect(details.open).toBe(false))
+  const candidates = container!.querySelector('.node-grid')!
+  expect(candidates.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  expect(container!.querySelector('.group-card__heading')?.textContent).toContain('Gateway one')
+})
+
+it('expands readback when shared transports disagree instead of hiding the mismatch', async () => {
+  await mount('shared_tcp_udp', [
+    { scope: { gateway_id: 'gw1', transport: 'tcp' }, revision: 1, desired_node_id: 'n1', applied_node_id: 'n1', observed_node_id: 'n1' },
+    { scope: { gateway_id: 'gw1', transport: 'udp' }, revision: 1, desired_node_id: 'old', applied_node_id: 'old', observed_node_id: 'old' },
+  ])
+  await vi.waitFor(() => expect(container!.querySelector<HTMLDetailsElement>('.readback-details')!.open).toBe(true))
+  expect(container!.querySelector('.readback-details summary')?.textContent).toContain('需要检查回读')
+  expect(container!.textContent).toContain('TCP / UDP differ')
+})

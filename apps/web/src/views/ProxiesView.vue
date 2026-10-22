@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onActivated, ref } from 'vue'
 import StatusPill from '../components/StatusPill.vue'
+import UiIcon from '../components/UiIcon.vue'
 import StateStrip from '../components/StateStrip.vue'
 import { randomIdempotencyKey } from '../api/client'
 import { useControllerState } from '../state'
@@ -79,6 +80,13 @@ function selectionStates(group: OutboundGroupSummary) {
   return { desired: state('desired_node_id'), applied: state('applied_node_id'), observed: state('observed_node_id') }
 }
 function observedForSelection(group: OutboundGroupSummary, nodeID: string) { return selectionTransports(group).every(transport => selectionFor(group, transport)?.observed_node_id === nodeID) }
+function gatewayName(id: string) { return props.state.gateways.value.find(gateway => gateway.id === id)?.name ?? id }
+function selectionNeedsAttention(group: OutboundGroupSummary) {
+  if (readbackErrors.value[group.id] || groupConfigurationPending(group)) return true
+  const records = selectionTransports(group).map(transport => selectionFor(group, transport))
+  if (records.some(record => !record?.observed_node_id || record.desired_node_id !== record.applied_node_id || record.applied_node_id !== record.observed_node_id)) return true
+  return sharedSelection(group) && records.some(record => record?.observed_node_id !== records[0]?.observed_node_id)
+}
 function groupConfigurationPending(group: OutboundGroupSummary) { return group.appliedRevision !== undefined && (group.appliedRevision !== group.revision || group.observedRevision !== group.revision) }
 function groupApplyUnavailable(group: OutboundGroupSummary) {
   if (!canAdminister.value) return 'An administrator session is required to apply group configuration.'
@@ -270,7 +278,7 @@ onActivated(load)
 <template>
   <div class="page-grid">
     <section class="page-heading">
-      <div><p class="eyebrow">Proxy inventory</p><h1>Proxies</h1><p class="lede">Organize candidate nodes and choose an exit using each gateway’s selection mode.</p></div>
+      <div><p class="eyebrow">代理出口</p><h1>代理</h1><p class="lede">选择出口节点并管理代理组，为不同设备或场景配置合适的网络出口。</p></div>
       <div class="node-filters"><input v-model="search" class="search" type="search" placeholder="Search nodes" aria-label="Search nodes" /><label>Protocol<select v-model="protocolFilter" aria-label="Filter nodes by protocol"><option value="">All protocols</option><option v-for="protocol in protocols" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>Sort<select v-model="nodeSort" aria-label="Sort nodes"><option value="name">Name</option><option value="protocol">Protocol</option><option value="health">Health</option></select></label></div>
     </section>
     <section v-if="loadError" class="alert alert--bad" role="alert">{{ loadError }}</section>
@@ -303,14 +311,14 @@ onActivated(load)
         </fieldset>
       </form>
     </section>
-    <section class="panel">
-      <div class="panel__heading"><h2>Outbound groups</h2><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh</button><button class="button" :disabled="busy || !canAdminister" @click="openEditor()">New outbound group</button></div></div>
+    <section class="panel proxy-groups">
+      <div class="panel__heading"><h2>代理组</h2><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh</button><button class="button" :disabled="busy || !canAdminister" @click="openEditor()">New outbound group</button></div></div>
       <p v-if="!canAdminister" class="help">An administrator session is required to create or edit outbound groups.</p>
       <div v-if="loading && !groups.length" class="empty-state" role="status">Loading proxy inventory…</div>
       <div v-else-if="!groups.length" class="empty-state">No outbound groups are configured.</div>
       <article v-for="group in groups" :key="group.id" class="group-card" :aria-label="`Outbound group ${group.name}`">
         <div class="group-card__heading">
-          <div><h3>{{ group.name }}</h3><p>{{ group.nodeIds.length }} candidates · {{ group.mode }} · gateway {{ group.gatewayId }} · configuration revision {{ group.revision }}</p></div>
+          <div><h3>{{ group.name }}</h3><p>{{ group.nodeIds.length }} 个候选节点 · {{ group.mode === 'manual' ? '手动选择' : '自动选择' }} · {{ gatewayName(group.gatewayId) }}</p></div>
           <div class="actions"><StatusPill :label="pendingGroup === group.id ? 'Applying' : readbackErrors[group.id] ? 'Readback unavailable' : groupConfigurationPending(group) ? 'Configuration pending' : 'Configured'" :tone="pendingGroup === group.id || readbackErrors[group.id] || groupConfigurationPending(group) ? 'warn' : 'neutral'" /><button v-if="groupConfigurationPending(group)" class="button" :aria-label="`Apply configuration for ${group.name}`" :title="groupApplyUnavailable(group)" :disabled="busy || !!groupApplyUnavailable(group)" @click="applyGroup(group)">Apply configuration</button><button class="button button--secondary" :aria-label="`Test group ${group.name} from gateway`" :title="probeUnavailable(group)" :disabled="!!probing || !!probeUnavailable(group)" @click="runProbe(group)">{{ probing === probeKey(group) ? 'Testing…' : 'Test group' }}</button><button class="button button--secondary" :aria-label="`Edit ${group.name}`" :disabled="busy || !canAdminister" @click="openEditor(group)">Edit</button></div>
         </div>
         <p v-if="group.appliedRevision !== undefined" class="help">Group configuration: desired revision {{ group.revision }} · applied {{ group.appliedRevision || 'Not applied' }} · observed {{ group.observedRevision || 'Not observed' }}<span v-if="group.appliedGeneration"> · gateway generation {{ group.appliedGeneration }}</span></p>
@@ -318,7 +326,7 @@ onActivated(load)
         <p v-if="readbackErrors[group.id]" class="alert alert--bad" role="alert">{{ readbackErrors[group.id] }} Previously loaded values may be stale.</p>
         <p v-if="probeResults[probeKey(group)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group)]!) }}<span v-if="probeResults[probeKey(group)]?.probe.error"> · {{ probeResults[probeKey(group)]?.probe.error }}</span></p>
         <p v-if="probeErrors[probeKey(group)]" class="help warning" role="alert">{{ probeErrors[probeKey(group)] }}</p>
-        <div class="table-scroll"><table :aria-label="`Selection readback for ${group.name}`"><thead><tr><th>Transport</th><th>Desired</th><th>Applied</th><th>Observed</th><th>Revision</th></tr></thead><tbody><tr v-for="transport in transports(group)" :key="transport"><th scope="row">{{ transport.toUpperCase() }}</th><td>{{ nodeName(selectionFor(group, transport)?.desired_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.applied_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.observed_node_id) ?? '—' }}</td><td>{{ selectionFor(group, transport)?.revision ?? 'No selection' }}</td></tr></tbody></table></div>
+
         <p v-if="sharedSelection(group)" class="help">Shared TCP + UDP selection. Choosing a node changes both transports together.</p>
         <label v-else class="transport-control">Selection transport<select :value="activeTransport(group)" :aria-label="`Selection transport for ${group.name}`" :disabled="busy" @change="selectedTransports[group.id] = ($event.target as HTMLSelectElement).value"><option v-for="transport in transports(group)" :key="transport" :value="transport">{{ transport.toUpperCase() }}</option></select></label>
         <StateStrip :states="selectionStates(group)" :pending="pendingGroup === group.id" />
@@ -326,11 +334,16 @@ onActivated(load)
         <p v-else-if="!state.capabilities.value['selection.persist_restart']" class="help warning">This adapter does not report durable selection across gateway restarts.</p>
         <div class="node-grid">
           <div v-for="node in nodesForGroup(group)" :key="node.id" class="node-entry"><button class="node-card" :class="{ 'node-card--selected': observedForSelection(group, node.id) }" :aria-label="`Select ${node.name} for ${group.name} (${selectionLabel(group)})`" :aria-pressed="observedForSelection(group, node.id)" :disabled="busy || !!selectionUnavailable(group) || !node.supported" @click="select(group, node)">
-            <span class="node-card__name">{{ node.name }}</span><span class="node-card__meta">{{ node.protocol }} · {{ node.health }}</span><span v-if="!node.supported" class="node-card__warning">Unsupported</span><span v-if="observedForSelection(group, node.id)" class="node-card__meta">Observed for {{ selectionLabel(group) }}</span>
+            <span class="node-card__name"><UiIcon name="globe" :size="19" />{{ node.name }}<UiIcon v-if="observedForSelection(group, node.id)" class="node-check" name="check" :size="17" /></span><span class="node-card__meta">{{ node.protocol }} · {{ node.health }}</span><span v-if="!node.supported" class="node-card__warning">Unsupported</span><span v-if="observedForSelection(group, node.id)" class="node-card__meta">Observed for {{ selectionLabel(group) }}</span>
           </button><button class="button button--secondary" :aria-label="`Test node ${node.name} from gateway for ${group.name}`" :title="probeUnavailable(group, node)" :disabled="!!probing || !!probeUnavailable(group, node)" @click="runProbe(group, node)">{{ probing === probeKey(group, node) ? 'Testing…' : 'Test node' }}</button><p v-if="probeResults[probeKey(group, node)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group, node)]!) }}<span v-if="probeResults[probeKey(group, node)]?.probe.error"> · {{ probeResults[probeKey(group, node)]?.probe.error }}</span></p><p v-if="probeErrors[probeKey(group, node)]" class="help warning" role="alert">{{ probeErrors[probeKey(group, node)] }}</p></div>
         </div>
         <p v-if="group.nodeIds.length && !nodesForGroup(group).length && !missingCandidates(group).length" class="help">No candidate nodes match the search.</p>
         <p v-if="missingCandidates(group).length" class="help warning">Candidates unavailable in current inventory: {{ missingCandidates(group).join(', ') }}</p>
+        <details class="readback-details" :open="selectionNeedsAttention(group)">
+          <summary><span>部署与传输详情</span><span>{{ selectionNeedsAttention(group) ? '需要检查回读' : '查看 TCP / UDP 配置回读' }}</span></summary>
+          <p class="help">以下是配置版本与传输选择的回读，不代表客户端流量已通过验证。</p>
+        <div class="table-scroll"><table :aria-label="`Selection readback for ${group.name}`"><thead><tr><th>Transport</th><th>Desired</th><th>Applied</th><th>Observed</th><th>Revision</th></tr></thead><tbody><tr v-for="transport in transports(group)" :key="transport"><th scope="row">{{ transport.toUpperCase() }}</th><td>{{ nodeName(selectionFor(group, transport)?.desired_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.applied_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.observed_node_id) ?? '—' }}</td><td>{{ selectionFor(group, transport)?.revision ?? 'No selection' }}</td></tr></tbody></table></div>
+        </details>
         <section class="usage-panel" :aria-label="`Used by ${group.name}`">
           <h4>Used by</h4>
           <p class="help">References in saved controller configuration. Disabled references remain listed; deployed traffic may differ.</p>
@@ -401,4 +414,19 @@ thead th { color: var(--muted); font-weight: 500; }
 .transport-control { display: flex; gap: .65rem; align-items: center; font-size: .8rem; }
 .transport-control select { padding: .4rem .65rem; }
 @media (max-width: 760px) { .page-heading, .group-card__heading { display: grid; } .search { width: 100%; } .form-grid { grid-template-columns: 1fr; } .panel__heading { flex-wrap: wrap; } }
+
+.proxy-groups { background: transparent !important; border: 0; padding: 0; }
+.group-card { border: 1px solid var(--border); background: linear-gradient(120deg, #0d2238, #091b2b); padding: 1rem; border-radius: 10px; }
+.group-card__heading h3 { font-size: 1.1rem; }
+.node-card { min-height: 85px; border-radius: 8px; background: #081a2c; }
+.node-card--selected { border-color: var(--good); box-shadow: inset 0 0 0 1px var(--good), 0 0 14px #22e3ad0d; }
+.node-card__name { display: flex; align-items: center; gap: 8px; font-size: .84rem; }
+.node-card__name > .ui-icon { color: var(--accent); }
+.node-card__name > .node-check { color: var(--good); margin-left: auto; }
+.readback-details { min-width: 0; padding: .7rem .8rem; border: 1px solid var(--border); border-radius: 7px; background: #081a2b; }
+.readback-details summary { color: var(--muted); font-size: .78rem; cursor: pointer; }
+.readback-details summary > span:first-child { color: #c9dcf2; margin-right: 1rem; }
+.readback-details[open] > .help { margin: .75rem 0; }
+.usage-list { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.usage-list li { padding: .7rem; border: 1px solid #1c3854; border-radius: 7px; background: #0b2137; }
 </style>

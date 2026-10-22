@@ -432,7 +432,7 @@ onUnmounted(() => { unsubscribeNavigation(); loadSequence++ })
 
 <template>
   <div class="page-grid">
-    <section class="page-heading"><div><p class="eyebrow">Policy compiler</p><h1>Rules</h1><p class="lede">Build typed policies, review rule order, and predict a packet’s path before applying a generation.</p></div><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh policies</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="newPolicy">New policy</button><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="newRuleSet">New rule set</button></div></section>
+    <section class="page-heading"><div><p class="eyebrow">路由策略</p><h1>规则策略</h1><p class="lede">按顺序组织匹配条件与路由动作，在应用前预览策略与预计路径。</p></div><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh policies</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="newPolicy">New policy</button><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="newRuleSet">New rule set</button></div></section>
     <p v-if="error" class="alert alert--bad" role="alert">{{ error }}</p><p v-if="notice" class="alert alert--good" role="status">{{ notice }}</p>
     <InventoryPlanPanel :state="state" />
     <div class="workspace">
