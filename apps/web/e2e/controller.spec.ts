@@ -2,9 +2,12 @@ import { expect, test, type Page } from '@playwright/test'
 import { signIn } from './auth'
 
 async function navigate(page: Page, label: string) {
-  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: label, exact: false }).click()
-  if (label === 'Overview') await expect(page.getByText('Controller overview', { exact: true })).toBeVisible()
-  else await expect(page.getByRole('heading', { level: 1, name: label, exact: true })).toBeVisible()
+  const labels: Record<string, string> = { Overview: '总览', Proxies: '代理', Subscriptions: '订阅', 'Devices & Groups': '设备与分组', Rules: '规则策略', Infrastructure: '基础设施', 'Activity & Diagnostics': '活动与诊断' }
+  const navigation = page.getByRole('navigation', { name: '主导航' })
+  if (!await navigation.isVisible()) await page.getByRole('button', { name: '打开导航', exact: true }).click()
+  const localized = labels[label] ?? label
+  await navigation.getByRole('button', { name: localized, exact: true }).click()
+  await expect(page.getByRole('heading', { level: 1, name: localized, exact: true })).toBeVisible()
 }
 
 async function list(page: Page, path: string): Promise<Array<Record<string, any>>> {
@@ -23,8 +26,8 @@ test('session, authorization and CSRF stay active across the browser boundary', 
   expect(denied.status()).toBe(403)
   expect((await list(page, 'devices')).some(item => item.name === 'Missing CSRF')).toBe(false)
   await page.goto('/')
-  await expect(page.getByText('Controller overview', { exact: true })).toBeVisible()
-  await expect(page.getByRole('combobox', { name: 'Gateway', exact: true })).toHaveValue('fixture-gateway')
+  await expect(page.getByRole('heading', { level: 1, name: '总览', exact: true })).toBeVisible()
+  await expect(page.getByRole('combobox', { name: '默认操作网关', exact: true })).toHaveValue('fixture-gateway')
   await signIn(context, 'viewer')
   expect((await page.request.get('/api/v1/providers')).status()).toBe(200)
   expect((await page.request.get('/api/v1/gateways')).status()).toBe(200)
@@ -138,6 +141,8 @@ test('subscription import and shared native selection converge for TCP and UDP',
   await page.screenshot({ path: 'e2e/artifacts/proxy-selection-desktop.png', fullPage: true })
   await page.setViewportSize({ width: 390, height: 844 })
   await expect.poll(async () => page.locator('.sidebar').evaluate(element => element.getBoundingClientRect().right)).toBeLessThanOrEqual(0)
+  await expect(groupCard.locator('.readback-details')).not.toHaveAttribute('open', '')
+  await groupCard.locator('.readback-details > summary').click()
   await expect(groupCard.getByRole('table').getByRole('row').filter({ hasText: 'TCP' })).toBeVisible()
   await expect(groupCard.getByRole('table').getByRole('row').filter({ hasText: 'UDP' })).toBeVisible()
   const scrollRegion = groupCard.locator('.table-scroll')

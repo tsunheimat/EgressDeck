@@ -9,13 +9,13 @@ export interface NavigationItem {
 }
 
 export const navigation: NavigationItem[] = [
-  { id: 'overview', label: 'Overview', route: '/', description: 'Gateway, firewall, coverage, and recent operations' },
-  { id: 'proxies', label: 'Proxies', route: '/proxies', description: 'Nodes, groups, health, and manual selection', requiredCapabilities: ['inventory.read'] },
-  { id: 'subscriptions', label: 'Subscriptions', route: '/subscriptions', description: 'Providers, staged revisions, and publication', requiredCapabilities: ['provider.stage'] },
-  { id: 'devices', label: 'Devices & Groups', route: '/devices', description: 'Address verification and enrollment', requiredCapabilities: ['inventory.read'] },
-  { id: 'rules', label: 'Rules', route: '/rules', description: 'Ordered rules, defaults, and impact preview', requiredCapabilities: ['policy.validate'] },
-  { id: 'infrastructure', label: 'Infrastructure', route: '/infrastructure', description: 'Gateway capabilities and firewall bindings', requiredCapabilities: ['inventory.read'] },
-  { id: 'activity', label: 'Activity & Diagnostics', route: '/activity', description: 'Durable operations, audit, and observed traffic', requiredCapabilities: ['events.resume'] },
+  { id: 'overview', label: '总览', route: '/', description: '网关、防火墙、验证覆盖率与最近操作' },
+  { id: 'proxies', label: '代理', route: '/proxies', description: '管理代理组、候选节点与出口选择', requiredCapabilities: ['inventory.read'] },
+  { id: 'subscriptions', label: '订阅', route: '/subscriptions', description: '导入订阅、审查节点变化与应用更新', requiredCapabilities: ['provider.stage'] },
+  { id: 'devices', label: '设备与分组', route: '/devices', description: '设备清单、分组策略与安全纳管', requiredCapabilities: ['inventory.read'] },
+  { id: 'rules', label: '规则策略', route: '/rules', description: '有序规则、默认动作与配置影响预览', requiredCapabilities: ['policy.validate'] },
+  { id: 'infrastructure', label: '基础设施', route: '/infrastructure', description: '网关能力、连接状态与防火墙绑定', requiredCapabilities: ['inventory.read'] },
+  { id: 'activity', label: '活动与诊断', route: '/activity', description: '操作记录、审计与诊断证据', requiredCapabilities: ['events.resume'] },
 ]
 
 export interface VisibleNavigationItem extends NavigationItem {

@@ -81,7 +81,7 @@ onDeactivated(() => { active = false; diagnosticRequest++; diagnosticAbort?.abor
 </script>
 
 <template>
-  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">Operations and evidence</p><h1>Activity &amp; Diagnostics</h1><p class="lede">Operation acceptance comes from durable readback. A browser-to-controller request is not a gateway traffic verification.</p></div><button class="button button--secondary" :disabled="loading" @click="load">Refresh</button></section>
+  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">操作与证据</p><h1>活动与诊断</h1><p class="lede">追踪操作结果、排查失败原因。配置请求成功不等于网关上的真实流量已验证。</p></div><button class="button button--secondary" :disabled="loading" @click="load">Refresh</button></section>
     <section v-if="error" class="alert alert--bad" role="alert">{{ error }}</section>
     <section class="panel" aria-label="Gateway diagnostics">
       <div class="panel__heading"><div><h2>Gateway traffic</h2><p class="muted">{{ selectedGateway ? `Measurements from ${selectedGateway.name}` : 'Select a gateway to inspect traffic' }}</p></div><button class="button button--secondary" :disabled="diagnosticLoading || !selectedGateway || (!supportsConnections && !supportsCounters)" @click="loadDiagnostics">{{ diagnosticLoading ? 'Reading gateway…' : 'Read gateway' }}</button></div>

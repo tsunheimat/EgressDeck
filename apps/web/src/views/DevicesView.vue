@@ -219,7 +219,7 @@ onActivated(async () => { await load(); await focusLinkedGroup() })
 </script>
 
 <template>
-  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">Source identity</p><h1>Devices &amp; Groups</h1><p class="lede">Register addresses and assign one primary routing group. Saving inventory does not verify addresses or apply traffic policy.</p></div><button class="button button--secondary" :disabled="loading || saving" @click="load">{{ loading ? 'Refreshing…' : 'Refresh' }}</button></section>
+  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">设备管理</p><h1>设备与分组</h1><p class="lede">管理家庭网络中的设备，按场景分组并配置策略。保存清单不代表地址已验证或代理已生效。</p></div><button class="button button--secondary" :disabled="loading || saving" @click="load">{{ loading ? 'Refreshing…' : 'Refresh' }}</button></section>
     <section v-if="error" class="alert alert--bad" role="alert">{{ error }}</section>
     <section v-if="notice" class="alert alert--good" role="status">{{ notice }}</section>
     <section class="panel"><div class="panel__heading"><h2>Traffic enrollment</h2><button class="button" disabled>Enroll selected devices</button></div><p class="muted">Enrollment is unavailable until a gateway and OPNsense deployment adapter can apply policy, verify steering, and read back the result. Saving device records only changes controller intent.</p></section>

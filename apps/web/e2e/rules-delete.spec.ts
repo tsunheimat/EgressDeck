@@ -40,8 +40,8 @@ async function readDocuments(context: BrowserContext, kind: DocumentKind): Promi
 
 async function openRules(page: Page) {
   await page.goto('/')
-  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Rules', exact: false }).click()
-  await expect(page.getByRole('heading', { level: 1, name: 'Rules', exact: true })).toBeVisible()
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '规则策略', exact: false }).click()
+  await expect(page.getByRole('heading', { level: 1, name: '规则策略', exact: true })).toBeVisible()
 }
 
 function choice(page: Page, item: Resource) {
@@ -242,12 +242,12 @@ test('direct policy and rule-set links select the requested non-first rule after
   await expect(page.getByLabel('Rule name', { exact: true })).toHaveValue(policyRules[1]!.name)
 
   for (const [resource, item, linkedRule] of [['rule_set', ruleSet, setRules[1]!], ['policy', policy, policyRules[1]!]] as const) {
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Overview', exact: false }).click()
-    await expect(page.getByText('Controller overview', { exact: true })).toBeVisible()
+    await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '总览', exact: false }).click()
+    await expect(page.getByRole('heading', { level: 1, name: '总览', exact: true })).toBeVisible()
     const readback = page.waitForResponse(response => hasPath(response.request(), 'GET', resource === 'policy' ? resourcePath('policy', item) : '/api/v1/rule-sets'))
     await page.evaluate(hash => { window.location.hash = hash }, target(resource, item, linkedRule.id))
     expect((await readback).status()).toBe(200)
-    await expect(page.getByRole('heading', { level: 1, name: 'Rules', exact: true })).toBeVisible()
+    await expect(page.getByRole('heading', { level: 1, name: '规则策略', exact: true })).toBeVisible()
     await expect(page.getByLabel(resource === 'policy' ? 'Policy name' : 'Rule set name', { exact: true })).toHaveValue(item.name)
     await expect(page.getByLabel('Rule ID', { exact: true })).toHaveValue(linkedRule.id)
     await expect(page.getByLabel('Rule name', { exact: true })).toHaveValue(linkedRule.name)

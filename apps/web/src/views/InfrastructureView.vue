@@ -194,7 +194,7 @@ onUnmounted(stopFreshnessTimer)
 </script>
 
 <template>
-  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">Capability and topology</p><h1>Infrastructure</h1><p class="lede">Register gateways and inspect their reported capabilities, health, and firewall bindings.</p></div><button class="button button--secondary" :disabled="loading || saving || attaching || readingBindings.size > 0" @click="load">{{ loading ? 'Refreshing…' : 'Refresh' }}</button></section>
+  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">网关与防火墙</p><h1>基础设施</h1><p class="lede">管理网关与 OPNsense 绑定，检查组件报告的能力、健康状态与配置回读。</p></div><button class="button button--secondary" :disabled="loading || saving || attaching || readingBindings.size > 0" @click="load">{{ loading ? 'Refreshing…' : 'Refresh' }}</button></section>
     <section v-if="error" class="alert alert--bad" role="alert">{{ error }}</section>
     <section v-if="notice" class="alert alert--good" role="status">{{ notice }}</section>
     <section class="panel"><div class="panel__heading"><h2>Gateways</h2><div class="actions"><span class="muted">{{ gateways.length }} registered</span><button v-if="isAdministrator" class="button" :disabled="loading || saving" @click="registerGateway">Register gateway</button></div></div>

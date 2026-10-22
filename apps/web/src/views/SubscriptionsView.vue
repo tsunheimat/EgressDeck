@@ -321,7 +321,7 @@ onActivated(() => load())
 <template>
   <div class="page-grid">
     <section class="page-heading">
-      <div><p class="eyebrow">Provider lifecycle</p><h1>Subscriptions</h1><p class="lede">Import, stage, review, then publish a provider revision. Parser reports show which nodes were accepted.</p></div>
+      <div><p class="eyebrow">订阅管理</p><h1>订阅</h1><p class="lede">导入、检查并审查节点更新，再将确认的版本应用到网关。</p></div>
       <div class="actions"><button class="button button--secondary" :disabled="busy" @click="load()">Refresh list</button><button class="button" :disabled="busy || !canStage" @click="addOpen = !addOpen">Add subscription</button></div>
     </section>
     <p v-if="!canManage" class="notice">Administrator access is required to manage subscription settings, deletion, and staging.</p>
