@@ -5,6 +5,7 @@ import { signIn } from './auth'
 type Resource = { id: string; name: string; revision: number }
 type DocumentKind = 'policy' | 'rule set'
 
+const kindLabel = (kind: DocumentKind) => kind === 'policy' ? '策略' : '规则集'
 const collection = (kind: DocumentKind) => kind === 'policy' ? 'policies' : 'rule-sets'
 const resourcePath = (kind: DocumentKind, item: Resource) => `/api/v1/${collection(kind)}/${encodeURIComponent(item.id)}`
 const hasPath = (request: Request, method: string, path: string) => request.method() === method && new URL(request.url()).pathname === path
@@ -50,15 +51,15 @@ function choice(page: Page, item: Resource) {
 
 async function selectDocument(page: Page, kind: DocumentKind, item: Resource) {
   await choice(page, item).click()
-  await expect(page.getByLabel(kind === 'policy' ? 'Policy name' : 'Rule set name', { exact: true })).toHaveValue(item.name)
+  await expect(page.getByLabel(kind === 'policy' ? '策略名称' : '规则集名称', { exact: true })).toHaveValue(item.name)
 }
 
 async function confirmDelete(page: Page, kind: DocumentKind, item: Resource) {
-  await page.getByRole('button', { name: `Delete ${kind}`, exact: true }).click()
-  await expect(page.getByRole('heading', { name: `Delete ${kind} “${item.name}”?`, exact: true })).toBeVisible()
-  const confirmation = page.getByRole('button', { name: `Confirm delete ${kind}`, exact: true })
+  await page.getByRole('button', { name: `删除${kindLabel(kind)}`, exact: true }).click()
+  await expect(page.getByRole('heading', { name: `删除${kindLabel(kind)}“${item.name}”？`, exact: true })).toBeVisible()
+  const confirmation = page.getByRole('button', { name: `确认删除${kindLabel(kind)}`, exact: true })
   await expect(confirmation).toBeDisabled()
-  await page.getByRole('checkbox', { name: `I confirm deletion of ${item.name} (${item.id}).`, exact: true }).check()
+  await page.getByRole('checkbox', { name: `我确认删除 ${item.name}（${item.id}）。`, exact: true }).check()
   await expect(confirmation).toBeEnabled()
   return confirmation
 }
@@ -100,7 +101,7 @@ test('policy and rule-set deletion require saved-identity confirmation and contr
 
   for (const [kind, item] of [['policy', policy], ['rule set', ruleSet]] as const) {
     await selectDocument(page, kind, item)
-    await page.getByLabel(kind === 'policy' ? 'Policy name' : 'Rule set name', { exact: true }).fill('Unsaved draft name must not identify deletion')
+    await page.getByLabel(kind === 'policy' ? '策略名称' : '规则集名称', { exact: true }).fill('Unsaved draft name must not identify deletion')
     const confirmation = await confirmDelete(page, kind, item)
     expect((await readDocuments(context, kind)).some(record => record.id === item.id)).toBe(true)
 
@@ -124,7 +125,7 @@ test('policy and rule-set deletion require saved-identity confirmation and contr
       // authoritative list independently through the same controller API.
       for (const response of responses) expect(response.status()).toBe(200)
       await expect(choice(page, item)).toHaveCount(0)
-      await expect(page.getByRole('status')).toContainText(/deleted/i)
+      await expect(page.getByRole('status')).toContainText(/已删除/)
       expect((await readDocuments(context, kind)).some(record => record.id === item.id)).toBe(false)
     } finally {
       await gate.release()
@@ -158,7 +159,7 @@ test('stale policy and rule-set revisions show typed conflicts and retain the se
     await expect(page.getByRole('alert')).toContainText('[revision_conflict]')
     await expect(page.getByRole('alert')).toContainText('resource revision conflict')
     await expect(choice(page, item)).toBeVisible()
-    await expect(page.getByLabel(kind === 'policy' ? 'Policy name' : 'Rule set name', { exact: true })).toHaveValue(item.name)
+    await expect(page.getByLabel(kind === 'policy' ? '策略名称' : '规则集名称', { exact: true })).toHaveValue(item.name)
     await expect(page.getByRole('status')).toHaveCount(0)
     expect((await readDocuments(context, kind)).find(record => record.id === item.id)).toMatchObject({ name: updatedName, revision: item.revision + 1 })
   }
@@ -178,10 +179,10 @@ test('referenced rule sets are blocked locally and referenced policies retain th
 
   const deleteRequests: string[] = []
   page.on('request', request => { if (request.method() === 'DELETE') deleteRequests.push(new URL(request.url()).pathname) })
-  await selectDocument(page, 'rule set', ruleSet)
-  await expect(page.getByRole('button', { name: 'Delete rule set', exact: true })).toBeDisabled()
-  await expect(page.getByText(`Cannot delete this rule set while referenced by policy: ${policy.name} (${policy.id}).`, { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Confirm delete rule set', exact: true })).toHaveCount(0)
+  await selectDocument(page, '规则集', ruleSet)
+  await expect(page.getByRole('button', { name: '删除规则集', exact: true })).toBeDisabled()
+  await expect(page.getByText(`此规则集仍被引用，无法删除。引用来源：策略: ${policy.name} (${policy.id}).`, { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '确认删除规则集', exact: true })).toHaveCount(0)
   expect(deleteRequests).toEqual([])
   expect((await readDocuments(context, 'rule set')).find(record => record.id === ruleSet.id)).toMatchObject(ruleSet)
 
@@ -196,7 +197,7 @@ test('referenced rule sets are blocked locally and referenced policies retain th
   await expect(page.getByRole('alert')).toContainText('[resource_referenced]')
   await expect(page.getByRole('alert')).toContainText(`policy is referenced by device group ${group.id}`)
   await expect(choice(page, policy)).toBeVisible()
-  await expect(page.getByLabel('Policy name', { exact: true })).toHaveValue(policy.name)
+  await expect(page.getByLabel('策略名称', { exact: true })).toHaveValue(policy.name)
   await expect(page.getByRole('status')).toHaveCount(0)
   expect(deleteRequests).toEqual([resourcePath('policy', policy)])
   expect((await readDocuments(context, 'policy')).find(record => record.id === policy.id)).toMatchObject(policy)
@@ -212,8 +213,8 @@ test('viewer and operator sessions cannot expose or execute policy and rule-set 
     await openRules(page)
     for (const [kind, item] of [['policy', policy], ['rule set', ruleSet]] as const) {
       await selectDocument(page, kind, item)
-      await expect(page.getByRole('button', { name: `Delete ${kind}`, exact: true })).toHaveCount(0)
-      await expect(page.getByRole('button', { name: `Confirm delete ${kind}`, exact: true })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: `删除${kindLabel(kind)}`, exact: true })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: `确认删除${kindLabel(kind)}`, exact: true })).toHaveCount(0)
       const rejected = await context.request.delete(resourcePath(kind, item), {
         headers: { ...await csrfHeaders(context), 'If-Match': String(item.revision) },
       })
@@ -236,10 +237,10 @@ test('direct policy and rule-set links select the requested non-first rule after
   const policyReadback = page.waitForResponse(response => hasPath(response.request(), 'GET', resourcePath('policy', policy)))
   await page.goto(`/${target('policy', policy, policyRules[1]!.id)}`)
   expect((await policyReadback).status()).toBe(200)
-  await expect(page.getByLabel('Policy name', { exact: true })).toHaveValue(policy.name)
-  await expect(page.getByRole('combobox', { name: 'Evaluation phase', exact: true })).toHaveValue('mandatory_rules')
-  await expect(page.getByLabel('Rule ID', { exact: true })).toHaveValue(policyRules[1]!.id)
-  await expect(page.getByLabel('Rule name', { exact: true })).toHaveValue(policyRules[1]!.name)
+  await expect(page.getByLabel('策略名称', { exact: true })).toHaveValue(policy.name)
+  await expect(page.getByRole('combobox', { name: '匹配阶段', exact: true })).toHaveValue('mandatory_rules')
+  await expect(page.getByLabel('规则 ID', { exact: true })).toHaveValue(policyRules[1]!.id)
+  await expect(page.getByLabel('规则名称', { exact: true })).toHaveValue(policyRules[1]!.name)
 
   for (const [resource, item, linkedRule] of [['rule_set', ruleSet, setRules[1]!], ['policy', policy, policyRules[1]!]] as const) {
     await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '总览', exact: false }).click()
@@ -248,24 +249,24 @@ test('direct policy and rule-set links select the requested non-first rule after
     await page.evaluate(hash => { window.location.hash = hash }, target(resource, item, linkedRule.id))
     expect((await readback).status()).toBe(200)
     await expect(page.getByRole('heading', { level: 1, name: '规则策略', exact: true })).toBeVisible()
-    await expect(page.getByLabel(resource === 'policy' ? 'Policy name' : 'Rule set name', { exact: true })).toHaveValue(item.name)
-    await expect(page.getByLabel('Rule ID', { exact: true })).toHaveValue(linkedRule.id)
-    await expect(page.getByLabel('Rule name', { exact: true })).toHaveValue(linkedRule.name)
+    await expect(page.getByLabel(resource === 'policy' ? '策略名称' : '规则集名称', { exact: true })).toHaveValue(item.name)
+    await expect(page.getByLabel('规则 ID', { exact: true })).toHaveValue(linkedRule.id)
+    await expect(page.getByLabel('规则名称', { exact: true })).toHaveValue(linkedRule.name)
   }
 
   const reloadGate = await holdResponses(context, page, [resourcePath('policy', policy)])
   try {
     const oldReload = page.waitForResponse(response => hasPath(response.request(), 'GET', resourcePath('policy', policy)))
-    await page.getByRole('button', { name: 'Reload policy', exact: true }).click()
+    await page.getByRole('button', { name: '重新读取策略', exact: true }).click()
     await reloadGate.paused
     await page.evaluate(hash => { window.location.hash = hash }, target('rule_set', ruleSet, setRules[1]!.id))
-    await expect(page.getByLabel('Rule set name', { exact: true })).toHaveValue(ruleSet.name)
-    await expect(page.getByLabel('Rule ID', { exact: true })).toHaveValue(setRules[1]!.id)
+    await expect(page.getByLabel('规则集名称', { exact: true })).toHaveValue(ruleSet.name)
+    await expect(page.getByLabel('规则 ID', { exact: true })).toHaveValue(setRules[1]!.id)
     await reloadGate.release()
     await (await oldReload).finished()
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-    await expect(page.getByLabel('Rule set name', { exact: true })).toHaveValue(ruleSet.name)
-    await expect(page.getByLabel('Rule ID', { exact: true })).toHaveValue(setRules[1]!.id)
+    await expect(page.getByLabel('规则集名称', { exact: true })).toHaveValue(ruleSet.name)
+    await expect(page.getByLabel('规则 ID', { exact: true })).toHaveValue(setRules[1]!.id)
   } finally {
     await reloadGate.release()
   }

@@ -49,7 +49,7 @@ afterEach(() => {
 })
 
 function button(text: string) { return [...container.querySelectorAll<HTMLButtonElement>('button')].find(item => item.textContent?.trim() === text) }
-function card() { return container.querySelector<HTMLElement>('article[aria-label="Firewall binding HomeProxy"]')! }
+function card() { return container.querySelector<HTMLElement>('article[aria-label="防火墙绑定 HomeProxy"]')! }
 function metric(label: string) { return [...card().querySelectorAll('dl > div')].find(item => item.querySelector('dt')?.textContent === label)?.querySelector('dd')?.textContent }
 async function click(text: string) { const target = button(text); expect(target).toBeDefined(); target!.click(); await nextTick() }
 async function fill(name: string, value: string) {
@@ -60,13 +60,13 @@ async function fill(name: string, value: string) {
   await nextTick()
 }
 async function fillAttach() {
-  await click('Attach Host binding')
+  await click('添加主机别名绑定')
   await fill('alias', '  HomeProxy  ')
   await fill('interface_scope', '  lan  ')
   await fill('rule_ids', 'rule-1, rule-2\nrule-1\n')
 }
 async function submitAttach() {
-  container.querySelector('form[aria-label="Attach Host binding"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+  container.querySelector('form[aria-label="添加主机别名绑定"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
   await nextTick()
 }
 function deferred<T>() {
@@ -85,25 +85,25 @@ async function revisit(active: Ref<boolean>) {
 describe('firewall binding registration and observation', () => {
   it('distinguishes unknown observations from genuine zero counts and never presents verification', async () => {
     await mount([unread, { ...observed, id: 'empty-binding', alias: 'EmptyAlias', activeCount: 0, persistedCount: 0, desiredCount: 0 }])
-    expect(metric('Desired addresses')).toBe('0')
-    expect(metric('Persisted addresses')).toBe('Unknown')
-    expect(metric('Active addresses')).toBe('Unknown')
-    expect(metric('Drift')).toBe('Unknown')
-    expect(card().textContent).toContain('Never read')
-    const empty = container.querySelector('article[aria-label="Firewall binding EmptyAlias"]')!
-    expect([...empty.querySelectorAll('.binding-metrics dd')].map(item => item.textContent)).toEqual(['0', '0', '0', 'None observed'])
+    expect(metric('期望地址数')).toBe('0')
+    expect(metric('已持久化地址数')).toBe('未知')
+    expect(metric('生效地址数')).toBe('未知')
+    expect(metric('配置差异')).toBe('未知')
+    expect(card().textContent).toContain('尚未读取')
+    const empty = container.querySelector('article[aria-label="防火墙绑定 EmptyAlias"]')!
+    expect([...empty.querySelectorAll('.binding-metrics dd')].map(item => item.textContent)).toEqual(['0', '0', '0', '尚未观测到'])
     expect(container.textContent).not.toMatch(/verified/i)
-    expect([...container.querySelectorAll('button')].map(item => item.textContent).join(' ')).not.toMatch(/enroll|bypass|disable/i)
+    expect([...container.querySelectorAll('button')].map(item => item.textContent).join(' ')).not.toMatch(/纳管|绕过|禁用/)
   })
 
   it('allows viewers to read the firewall and hides administrative registration', async () => {
     const { api, load } = await mount([unread], 'viewer')
-    expect(button('Attach Host binding')).toBeUndefined()
-    expect(button('Register gateway')).toBeUndefined()
-    await click('Read firewall')
+    expect(button('添加主机别名绑定')).toBeUndefined()
+    expect(button('登记网关')).toBeUndefined()
+    await click('读取防火墙')
     await vi.waitFor(() => expect(api.readbackBinding).toHaveBeenCalledWith(unread.id))
-    await vi.waitFor(() => expect(metric('Active addresses')).toBe('2'))
-    expect(card().textContent).toContain('observed')
+    await vi.waitFor(() => expect(metric('生效地址数')).toBe('2'))
+    expect(card().textContent).toContain('已观测')
     expect(card().textContent).toContain(observed.observedAt)
     expect(api.attachBinding).not.toHaveBeenCalled()
     expect(load).toHaveBeenCalledOnce()
@@ -121,11 +121,11 @@ describe('firewall binding registration and observation', () => {
     await submitAttach()
     await vi.waitFor(() => expect(api.binding).toHaveBeenCalledWith(unread.id))
     expect(api.attachBinding).toHaveBeenCalledWith({ gateway_id: gateway.id, alias: 'HomeProxy', alias_uuid: 'alias-uuid', alias_type: 'host', family: 'ipv6', interface_scope: 'lan', rule_ids: ['rule-1', 'rule-2'] })
-    expect(container.textContent).not.toContain('Host binding HomeProxy registered.')
+    expect(container.textContent).not.toContain('主机别名绑定 HomeProxy 已登记。')
     confirm(attached)
-    await vi.waitFor(() => expect(container.textContent).toContain('Host binding HomeProxy registered.'))
-    expect(card().textContent).toContain('desired')
-    expect(card().textContent).toContain('Never read')
+    await vi.waitFor(() => expect(container.textContent).toContain('主机别名绑定 HomeProxy 已登记。'))
+    expect(card().textContent).toContain('期望状态')
+    expect(card().textContent).toContain('尚未读取')
     expect(api.readbackBinding).not.toHaveBeenCalled()
     expect(load).toHaveBeenCalledOnce()
   })
@@ -135,10 +135,10 @@ describe('firewall binding registration and observation', () => {
     api.binding.mockResolvedValue({ ...unread, alias: 'OtherAlias' })
     await fillAttach()
     await submitAttach()
-    await vi.waitFor(() => expect(container.textContent).toContain('registration could not be confirmed'))
-    expect(container.textContent).toContain('Refresh before attaching it again')
-    expect(container.textContent).not.toContain('Host binding HomeProxy registered.')
-    expect(container.querySelector('article[aria-label="Firewall binding OtherAlias"]')).toBeNull()
+    await vi.waitFor(() => expect(container.textContent).toContain('无法确认登记'))
+    expect(container.textContent).toContain('再次绑定前请刷新状态')
+    expect(container.textContent).not.toContain('主机别名绑定 HomeProxy 已登记。')
+    expect(container.querySelector('article[aria-label="防火墙绑定 OtherAlias"]')).toBeNull()
   })
 
   it('rejects incomplete associations before calling the attach API', async () => {
@@ -146,7 +146,7 @@ describe('firewall binding registration and observation', () => {
     await fillAttach()
     await fill('rule_ids', ' , \n ')
     await submitAttach()
-    expect(container.textContent).toContain('at least one steering rule ID')
+    expect(container.textContent).toContain('至少一个流量引导规则 ID')
     expect(api.attachBinding).not.toHaveBeenCalled()
   })
 
@@ -154,14 +154,14 @@ describe('firewall binding registration and observation', () => {
     const { api, load } = await mount([observed])
     api.readbackBinding.mockRejectedValue(new Error('Firewall unavailable'))
     api.binding.mockResolvedValue({ ...observed, observationStatus: 'error', observationError: 'Firewall unavailable', lastAttemptAt: '2026-10-08T08:10:00Z' })
-    await click('Read firewall')
-    await vi.waitFor(() => expect(container.textContent).toContain('Showing the last successful observation.'))
+    await click('读取防火墙')
+    await vi.waitFor(() => expect(container.textContent).toContain('显示上次成功的观测结果。'))
     expect(api.binding).toHaveBeenCalledWith(observed.id)
-    expect(metric('Persisted addresses')).toBe('2')
-    expect(metric('Active addresses')).toBe('2')
-    expect(metric('Last observed')).toBe(observed.observedAt)
-    expect(metric('Last attempt')).toBe('2026-10-08T08:10:00Z')
-    expect(card().querySelector('.observation')?.textContent).toContain('Error')
+    expect(metric('已持久化地址数')).toBe('2')
+    expect(metric('生效地址数')).toBe('2')
+    expect(metric('最近观测')).toBe(observed.observedAt)
+    expect(metric('最近尝试')).toBe('2026-10-08T08:10:00Z')
+    expect(card().querySelector('.observation')?.textContent).toContain('错误')
     expect(card().textContent).toContain('Firewall unavailable')
     expect(load).toHaveBeenCalledOnce()
     expect(container.querySelector('.alert--good')).toBeNull()
@@ -171,33 +171,33 @@ describe('firewall binding registration and observation', () => {
     const { api } = await mount([observed])
     api.readbackBinding.mockRejectedValueOnce(new Error('Firewall timed out'))
     api.binding.mockRejectedValueOnce(new Error('Controller unavailable'))
-    await click('Read firewall')
+    await click('读取防火墙')
     await vi.waitFor(() => expect(card().textContent).toContain('Firewall timed out'))
-    expect(metric('Active addresses')).toBe('2')
-    expect(metric('Last observed')).toBe(observed.observedAt)
-    await click('Read firewall')
+    expect(metric('生效地址数')).toBe('2')
+    expect(metric('最近观测')).toBe(observed.observedAt)
+    await click('读取防火墙')
     await vi.waitFor(() => expect(card().querySelector('[role="alert"]')).toBeNull())
-    expect(metric('Active addresses')).toBe('2')
+    expect(metric('生效地址数')).toBe('2')
   })
 
   it('does not treat an unsuccessful observation returned by the controller as read success', async () => {
     const { api } = await mount([observed])
     api.readbackBinding.mockResolvedValue({ ...unread, observationStatus: 'error', observationError: 'Alias lookup failed' })
     api.binding.mockResolvedValue(unread)
-    await click('Read firewall')
+    await click('读取防火墙')
     await vi.waitFor(() => expect(card().textContent).toContain('Alias lookup failed'))
-    expect(metric('Active addresses')).toBe('2')
-    expect(metric('Last observed')).toBe(observed.observedAt)
-    expect(card().querySelector('.observation')?.textContent).toContain('Error')
+    expect(metric('生效地址数')).toBe('2')
+    expect(metric('最近观测')).toBe(observed.observedAt)
+    expect(card().querySelector('.observation')?.textContent).toContain('错误')
   })
 
   it('ages freshness locally without automatically calling the firewall or controller', async () => {
     vi.useFakeTimers({ now: new Date('2026-10-08T08:00:00Z') })
     const { api, load } = await mount([observed])
-    expect(card().querySelector('.observation')?.textContent).toContain('Fresh')
+    expect(card().querySelector('.observation')?.textContent).toContain('最新')
     await vi.advanceTimersByTimeAsync(5 * 60_000 + 30_000)
     await nextTick()
-    expect(card().querySelector('.observation')?.textContent).toContain('Stale')
+    expect(card().querySelector('.observation')?.textContent).toContain('已过期')
     expect(api.bindings).toHaveBeenCalledOnce()
     expect(api.gateways).toHaveBeenCalledOnce()
     expect(api.binding).not.toHaveBeenCalled()
@@ -208,7 +208,7 @@ describe('firewall binding registration and observation', () => {
   it('marks observations dated in the future as stale', async () => {
     vi.useFakeTimers({ now: new Date('2026-10-08T07:59:00Z') })
     await mount([observed])
-    expect(card().querySelector('.observation')?.textContent).toContain('Stale')
+    expect(card().querySelector('.observation')?.textContent).toContain('已过期')
   })
 
   it('retains a completed firewall read when an older cached list arrives after reactivation', async () => {
@@ -217,15 +217,15 @@ describe('firewall binding registration and observation', () => {
     const cachedList = deferred<FirewallBindingSummary[]>()
     api.readbackBinding.mockReturnValueOnce(firewall.promise)
     api.bindings.mockReturnValueOnce(cachedList.promise)
-    await click('Read firewall')
+    await click('读取防火墙')
     await revisit(active)
     const latest = { ...observed, activeCount: 7, persistedCount: 7, observedAt: '2026-10-08T08:10:00Z', lastAttemptAt: '2026-10-08T08:10:00Z' }
     firewall.resolve(latest)
-    await vi.waitFor(() => expect(metric('Active addresses')).toBe('7'))
+    await vi.waitFor(() => expect(metric('生效地址数')).toBe('7'))
     cachedList.resolve([observed])
-    await vi.waitFor(() => expect(button('Refresh')?.disabled).toBe(false))
-    expect(metric('Active addresses')).toBe('7')
-    expect(metric('Last observed')).toBe(latest.observedAt)
+    await vi.waitFor(() => expect(button('刷新')?.disabled).toBe(false))
+    expect(metric('生效地址数')).toBe('7')
+    expect(metric('最近观测')).toBe(latest.observedAt)
     expect(api.bindings).toHaveBeenCalledTimes(2)
   })
 
@@ -235,15 +235,15 @@ describe('firewall binding registration and observation', () => {
     api.readbackBinding.mockReturnValueOnce(firewall.promise)
     const latestError = { ...observed, observationStatus: 'error' as const, observationError: 'Newer firewall attempt failed', lastAttemptAt: '2026-10-08T08:20:00Z' }
     api.bindings.mockResolvedValueOnce([latestError])
-    await click('Read firewall')
+    await click('读取防火墙')
     await revisit(active)
     await vi.waitFor(() => expect(card().textContent).toContain(latestError.observationError))
     firewall.resolve({ ...observed, activeCount: 5, observedAt: '2026-10-08T08:10:00Z', lastAttemptAt: '2026-10-08T08:10:00Z' })
-    await vi.waitFor(() => expect(button('Read firewall')?.disabled).toBe(false))
-    expect(metric('Active addresses')).toBe('2')
-    expect(metric('Last attempt')).toBe(latestError.lastAttemptAt)
+    await vi.waitFor(() => expect(button('读取防火墙')?.disabled).toBe(false))
+    expect(metric('生效地址数')).toBe('2')
+    expect(metric('最近尝试')).toBe(latestError.lastAttemptAt)
     expect(card().textContent).toContain(latestError.observationError)
-    expect(card().querySelector('.observation')?.textContent).toContain('Error')
+    expect(card().querySelector('.observation')?.textContent).toContain('错误')
   })
 
   it('shows the newest cached error after an older request fails instead of retaining the older error message', async () => {
@@ -253,27 +253,27 @@ describe('firewall binding registration and observation', () => {
     const latestError = { ...observed, observationStatus: 'error' as const, observationError: 'Newest alias drift failure', lastAttemptAt: '2026-10-08T08:20:00Z' }
     api.bindings.mockResolvedValueOnce([latestError])
     api.binding.mockResolvedValueOnce(latestError)
-    await click('Read firewall')
+    await click('读取防火墙')
     await revisit(active)
     await vi.waitFor(() => expect(card().textContent).toContain(latestError.observationError))
     firewall.reject(new Error('Earlier request lost connection'))
-    await vi.waitFor(() => expect(button('Read firewall')?.disabled).toBe(false))
+    await vi.waitFor(() => expect(button('读取防火墙')?.disabled).toBe(false))
     expect(card().textContent).toContain(latestError.observationError)
     expect(card().textContent).not.toContain('Earlier request lost connection')
-    expect(metric('Last attempt')).toBe(latestError.lastAttemptAt)
+    expect(metric('最近尝试')).toBe(latestError.lastAttemptAt)
   })
 
   it('clears a local read error after explicit successful cached refresh', async () => {
     const { api } = await mount([observed])
     api.readbackBinding.mockRejectedValueOnce(new Error('Read transport failed'))
     api.binding.mockResolvedValueOnce(observed)
-    await click('Read firewall')
+    await click('读取防火墙')
     await vi.waitFor(() => expect(card().textContent).toContain('Read transport failed'))
     api.bindings.mockResolvedValueOnce([observed])
-    await click('Refresh')
+    await click('刷新')
     await vi.waitFor(() => expect(card().querySelector('[role="alert"]')).toBeNull())
-    expect(metric('Last attempt')).toBe(observed.lastAttemptAt)
-    expect(metric('Active addresses')).toBe('2')
+    expect(metric('最近尝试')).toBe(observed.lastAttemptAt)
+    expect(metric('生效地址数')).toBe('2')
   })
 
   it('uses a newer successful cached observation if another reader recovered after this request failed', async () => {
@@ -281,24 +281,24 @@ describe('firewall binding registration and observation', () => {
     api.readbackBinding.mockRejectedValueOnce(new Error('Earlier request failed'))
     const recovered = { ...observed, activeCount: 8, observedAt: '2026-10-08T08:20:00Z', lastAttemptAt: '2026-10-08T08:20:00Z' }
     api.binding.mockResolvedValueOnce(recovered)
-    await click('Read firewall')
-    await vi.waitFor(() => expect(metric('Active addresses')).toBe('8'))
-    expect(metric('Last observed')).toBe(recovered.observedAt)
+    await click('读取防火墙')
+    await vi.waitFor(() => expect(metric('生效地址数')).toBe('8'))
+    expect(metric('最近观测')).toBe(recovered.observedAt)
     expect(card().querySelector('[role="alert"]')).toBeNull()
   })
 
   it('preserves gateway registration and its controller readback check', async () => {
     const { api, load } = await mount()
-    await click('Register gateway')
+    await click('登记网关')
     const form = container.querySelector<HTMLFormElement>('form')!
     const inputs = [...form.querySelectorAll<HTMLInputElement>('input')]
     inputs[0]!.value = gateway.name
     inputs[0]!.dispatchEvent(new Event('input', { bubbles: true }))
-    const endpoint = form.querySelector<HTMLInputElement>('[aria-label="Gateway endpoint"]')!
+    const endpoint = form.querySelector<HTMLInputElement>('[aria-label="网关地址"]')!
     endpoint.value = gateway.endpoint
     endpoint.dispatchEvent(new Event('input', { bubbles: true }))
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
-    await vi.waitFor(() => expect(container.textContent).toContain('Gateway Home gateway registered.'))
+    await vi.waitFor(() => expect(container.textContent).toContain('网关 Home gateway 已登记。'))
     expect(api.createGateway).toHaveBeenCalledWith({ name: gateway.name, endpoint: `${gateway.endpoint}/`, adapter: 'dae' })
     expect(api.gateways).toHaveBeenCalledTimes(2)
     expect(load).toHaveBeenCalledOnce()

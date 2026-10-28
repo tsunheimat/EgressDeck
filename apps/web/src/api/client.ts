@@ -93,12 +93,12 @@ function normalizeOutbound(value: unknown): OutboundGroupSummary {
 function normalizeOperation(value: unknown): OperationSummary {
   const o = wire(value)
   const target = wire(o.target)
-  return { id: text(o.id), target: typeof o.target === 'string' ? o.target : `${text(target.kind)}:${text(target.id)}`, action: text(o.action), status: o.status as OperationSummary['status'], requestedGeneration: number(o.requested_generation), createdAt: text(o.created_at), updatedAt: text(o.updated_at), error: text(o.error) || undefined, views: o.views as OperationSummary['views'] }
+  return { id: text(o.id), target: typeof o.target === 'string' ? o.target : `${text(target.kind)}:${text(target.id)}`, action: text(o.action), status: o.status as OperationSummary['status'], requestedGeneration: number(o.requested_generation), createdAt: text(o.created_at), updatedAt: text(o.updated_at), error: text(o.error) || undefined, enrollment: o.enrollment as OperationSummary['enrollment'], views: o.views as OperationSummary['views'] }
 }
 function normalizeAccepted(value: unknown): OperationResult {
   const body = wire(value)
   const id = text(body.operation_id, text(body.id))
-  if (!id) throw new ControllerApiError('The controller did not return a durable operation identifier. Reload observed state before retrying.', 502, 'operation_identifier_missing')
+  if (!id) throw new ControllerApiError('控制器未返回持久化操作标识。重试前请重新读取观测状态。', 502, 'operation_identifier_missing')
   return { operationId: id, status: body.status as OperationSummary['status'] }
 }
 function normalizeOverview(value: unknown): OverviewResponse {
@@ -135,7 +135,7 @@ export class ControllerApi {
         // Preserve the HTTP status when the server did not return JSON.
       }
       const detail = typeof body.error === 'object' ? body.error : body
-      throw new ControllerApiError(detail.message ?? `Controller request failed (${response.status})`, response.status, detail.code ?? (typeof body.error === 'string' ? body.error : undefined), detail.operationId ?? ('operation_id' in detail ? detail.operation_id : undefined))
+      throw new ControllerApiError(detail.message ?? `控制器请求失败（HTTP ${response.status})`, response.status, detail.code ?? (typeof body.error === 'string' ? body.error : undefined), detail.operationId ?? ('operation_id' in detail ? detail.operation_id : undefined))
     }
     if (response.status === 204) return undefined as T
     return (boundedList ? await boundedListJSON(response, init?.signal ?? undefined) : await response.json()) as T
@@ -154,17 +154,17 @@ export class ControllerApi {
       const body = await this.request<T[] | { items?: T[]; next_cursor?: string }>(pagePath, { signal }, true)
       const batch = Array.isArray(body) ? body : body.items ?? []
       if (!Array.isArray(batch) || batch.length > 500 || items.length + batch.length > 10_000) {
-        throw new ControllerApiError('The collection exceeds the browser list limit. Use the paginated API to inspect all items.', 413, 'collection_limit')
+        throw new ControllerApiError('条目数量超过浏览器列表上限。请使用分页 API 检查全部条目。', 413, 'collection_limit')
       }
       items.push(...batch)
       cursor = Array.isArray(body) ? undefined : body.next_cursor
       if (!cursor) return items
       if (typeof cursor !== 'string' || cursor.length > 2048 || seen.has(cursor)) {
-        throw new ControllerApiError('The controller returned an invalid or repeated collection cursor.', 502, 'invalid_cursor')
+        throw new ControllerApiError('控制器返回了无效或重复的分页游标。', 502, 'invalid_cursor')
       }
       seen.add(cursor)
     }
-    throw new ControllerApiError('The collection exceeds the browser page limit. Use the paginated API to inspect all items.', 413, 'collection_limit')
+    throw new ControllerApiError('集合超过浏览器分页上限。请使用分页 API 检查全部条目。', 413, 'collection_limit')
   }
 
   overview(signal?: AbortSignal): Promise<OverviewResponse> {
@@ -240,6 +240,15 @@ export class ControllerApi {
   previewPolicy<T>(body: unknown): Promise<T> { return this.request('/deployments/preview', { method: 'POST', body: JSON.stringify(body) }) }
   createInventoryPlan(body: { gateway_id: string; previous_operation_id?: string }): Promise<InventoryPlan> { return this.request('/deployments/plan', { method: 'POST', body: JSON.stringify(body) }) }
   inventoryPlan(checksum: string, signal?: AbortSignal): Promise<InventoryPlan> { return this.request(`/deployments/plans/${encodeURIComponent(checksum)}`, { signal }) }
+  applyInventoryPlan(checksum: string, idempotencyKey: string): Promise<OperationResult> {
+    return this.request(`/deployments/plans/${encodeURIComponent(checksum)}/apply`, { method: 'POST', headers: { 'If-Match': `"${checksum}"`, 'Idempotency-Key': idempotencyKey }, body: '{}' }).then(normalizeAccepted)
+  }
+  enrollDevice(body: { plan_checksum: string; device_id: string; binding_id: string; expected_device_revision: number }, idempotencyKey: string): Promise<OperationResult> {
+    return this.request('/deployments/enrollment', { method: 'POST', headers: { 'If-Match': String(body.expected_device_revision), 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body) }).then(normalizeAccepted)
+  }
+  recoverEnrollment(body: { previous_operation_id: string; plan_checksum: string; device_id: string; binding_id: string; expected_device_revision: number }, idempotencyKey: string): Promise<OperationResult> {
+    return this.request('/deployments/enrollment/recover', { method: 'POST', headers: { 'If-Match': String(body.expected_device_revision), 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body) }).then(normalizeAccepted)
+  }
   explainPolicy<T>(manifest: unknown, packet: unknown): Promise<T> { return this.request('/policies/explain', { method: 'POST', body: JSON.stringify({ manifest, packet }) }) }
   ruleSetDocuments<T>(): Promise<T[]> { return this.list('/rule-sets') }
   createRuleSet<T>(body: unknown): Promise<T> { return this.request('/rule-sets', { method: 'POST', body: JSON.stringify(body) }) }
@@ -297,7 +306,7 @@ export class ControllerApi {
         signal?.addEventListener('abort', abort, { once: true })
       })
     }
-    throw new ControllerApiError(`Operation ${operationId} is still in progress. Refresh Activity to read its outcome before retrying.`, 202, 'operation_pending', operationId)
+    throw new ControllerApiError(`操作 ${operationId} 仍在处理中。重试前请刷新“活动与诊断”确认结果。`, 202, 'operation_pending', operationId)
   }
 
   supports(gateway: GatewaySummary | undefined, capability: Capability): boolean {

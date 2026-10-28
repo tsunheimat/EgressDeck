@@ -35,3 +35,10 @@ evidence. Run `npm run test:e2e` after installing Playwright Chromium.
 No Zashboard source is copied into this initial shell. A future Zashboard
 adaptation must preserve its upstream notices and provenance and remain behind
 the same typed controller adapter.
+
+## Chinese interface
+
+The management UI uses Simplified Chinese, including workflow forms and diagnostics.
+See [localization and build verification](LOCALIZATION.md) for display boundaries,
+regression checks and the source fingerprint used to detect stale deployments.
+`npm run build` includes the localization audit and emits `dist/build-info.json`.

@@ -33,7 +33,7 @@ export function visibleNavigation(gateways: GatewaySummary[], selectedGatewayId?
     const missing = item.requiredCapabilities?.filter((capability) => !gateway?.capabilities.supported.includes(capability)) ?? []
     return missing.length === 0
       ? item
-      : { ...item, disabledReason: gateway ? `Gateway does not support ${missing.join(', ')}` : 'Register a gateway to inspect capabilities' }
+      : { ...item, disabledReason: gateway ? `网关不支持 ${missing.join(', ')}` : '请先登记网关以检查能力' }
   })
 }
 

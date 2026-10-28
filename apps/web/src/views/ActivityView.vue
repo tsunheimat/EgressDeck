@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { uiLabel, actionName, auditActionName, auditOutcomeName } from '../localization'
+import DiagnosticMessage from '../components/DiagnosticMessage.vue'
+import { formatTimestamp } from '../uiPresentation'
 import { computed, onActivated, onDeactivated, ref, watch } from 'vue'
 import StatusPill from '../components/StatusPill.vue'
 import StateStrip from '../components/StateStrip.vue'
@@ -43,18 +46,18 @@ async function loadDiagnostics() {
     const errors: string[] = []
     if (results[0].status === 'fulfilled' && results[0].value) {
       if (results[0].value.gateway_id === gateway.id) connections.value = results[0].value
-      else errors.push('Connection readback did not match the selected gateway')
-    } else if (results[0].status === 'rejected') errors.push(results[0].reason instanceof Error ? results[0].reason.message : 'Connections unavailable')
+      else errors.push('连接回读与所选网关不匹配')
+    } else if (results[0].status === 'rejected') errors.push(results[0].reason instanceof Error ? results[0].reason.message : '连接信息不可用')
     if (results[1].status === 'fulfilled' && results[1].value) {
       if (results[1].value.gateway_id === gateway.id) counters.value = results[1].value
-      else errors.push('Counter readback did not match the selected gateway')
-    } else if (results[1].status === 'rejected') errors.push(results[1].reason instanceof Error ? results[1].reason.message : 'Counters unavailable')
+      else errors.push('计数器回读与所选网关不匹配')
+    } else if (results[1].status === 'rejected') errors.push(results[1].reason instanceof Error ? results[1].reason.message : '计数器不可用')
     if (errors.length) diagnosticError.value = errors.join('; ')
   } finally { if (request === diagnosticRequest) diagnosticLoading.value = false }
 }
 
 function counterText(counter: GatewayCounterValue | undefined, unit: 'bytes' | 'packets') {
-  return counter?.available && counter[unit] !== undefined ? `${counter[unit]} ${unit}` : 'Unavailable'
+  return counter?.available && counter[unit] !== undefined ? `${counter[unit]} ${unit === 'bytes' ? '字节' : '数据包'}` : '不可用'
 }
 
 async function load() {
@@ -66,14 +69,14 @@ async function load() {
     if (results[0].status === 'fulfilled') operations.value = results[0].value
     if (results[1].status === 'fulfilled') audits.value = results[1].value
     const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-    if (failures.length) error.value = failures.map(r => r.reason instanceof Error ? r.reason.message : 'Unable to load activity').join('; ')
+    if (failures.length) error.value = failures.map(r => r.reason instanceof Error ? r.reason.message : '无法读取活动记录').join('; ')
   } finally { loading.value = false }
 }
 async function inspect(id: string) {
-  try { selectedOperation.value = await props.state.api.operation(id) } catch (cause) { error.value = cause instanceof Error ? cause.message : 'Readback unavailable' }
+  try { selectedOperation.value = await props.state.api.operation(id) } catch (cause) { error.value = cause instanceof Error ? cause.message : '回读不可用' }
 }
 function views(operation: OperationSummary) {
-  return Object.fromEntries(Object.entries(operation.views ?? {}).map(([kind, value]) => [kind, value?.revision ?? value?.status ?? `generation ${value?.generation}`]))
+  return Object.fromEntries(Object.entries(operation.views ?? {}).map(([kind, value]) => [kind, value?.revision ?? (value?.status ? uiLabel(value.status) : `代次 ${value?.generation}`)]))
 }
 watch(() => [selectedGateway.value?.id, supportsConnections.value, supportsCounters.value], () => { if (active) void loadDiagnostics() })
 onActivated(() => { active = true; void load() })
@@ -81,28 +84,28 @@ onDeactivated(() => { active = false; diagnosticRequest++; diagnosticAbort?.abor
 </script>
 
 <template>
-  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">操作与证据</p><h1>活动与诊断</h1><p class="lede">追踪操作结果、排查失败原因。配置请求成功不等于网关上的真实流量已验证。</p></div><button class="button button--secondary" :disabled="loading" @click="load">Refresh</button></section>
-    <section v-if="error" class="alert alert--bad" role="alert">{{ error }}</section>
-    <section class="panel" aria-label="Gateway diagnostics">
-      <div class="panel__heading"><div><h2>Gateway traffic</h2><p class="muted">{{ selectedGateway ? `Measurements from ${selectedGateway.name}` : 'Select a gateway to inspect traffic' }}</p></div><button class="button button--secondary" :disabled="diagnosticLoading || !selectedGateway || (!supportsConnections && !supportsCounters)" @click="loadDiagnostics">{{ diagnosticLoading ? 'Reading gateway…' : 'Read gateway' }}</button></div>
-      <p v-if="selectedGateway && !supportsConnections && !supportsCounters" class="muted">This gateway does not advertise connection or traffic counter support.</p>
-      <p v-if="diagnosticError" class="alert alert--bad" role="alert">{{ diagnosticError }}</p>
+  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">操作与证据</p><h1>活动与诊断</h1><p class="lede">追踪操作结果、排查失败原因。配置请求成功不等于网关上的真实流量已验证。</p></div><button class="button button--secondary" :disabled="loading" @click="load">刷新</button></section>
+    <section v-if="error" class="alert alert--bad" role="alert"><DiagnosticMessage :message="error" /></section>
+    <section class="panel" aria-label="网关诊断">
+      <div class="panel__heading"><div><h2>网关流量</h2><p class="muted">{{ selectedGateway ? `测量来源：${selectedGateway.name}` : '选择网关以检查流量' }}</p></div><button class="button button--secondary" :disabled="diagnosticLoading || !selectedGateway || (!supportsConnections && !supportsCounters)" @click="loadDiagnostics">{{ diagnosticLoading ? '正在读取网关…' : '读取网关' }}</button></div>
+      <p v-if="selectedGateway && !supportsConnections && !supportsCounters" class="muted">此网关未报告连接观测或流量计数器能力。</p>
+      <p v-if="diagnosticError" class="alert alert--bad" role="alert"><DiagnosticMessage :message="diagnosticError" /></p>
       <div class="counter-grid">
-        <div class="counter"><strong>Proxy traffic</strong><span>{{ counterText(counters?.proxy, 'bytes') }}</span><small>{{ counterText(counters?.proxy, 'packets') }}</small></div>
-        <div class="counter"><strong>Direct traffic</strong><span>{{ counterText(counters?.direct, 'bytes') }}</span><small>{{ counterText(counters?.direct, 'packets') }}</small></div>
-        <div class="counter"><strong>Provider quota</strong><span>Unavailable</span><small>Gateway traffic counters do not measure subscription allowance.</small></div>
+        <div class="counter"><strong>代理流量</strong><span>{{ counterText(counters?.proxy, 'bytes') }}</span><small>{{ counterText(counters?.proxy, 'packets') }}</small></div>
+        <div class="counter"><strong>直连流量</strong><span>{{ counterText(counters?.direct, 'bytes') }}</span><small>{{ counterText(counters?.direct, 'packets') }}</small></div>
+        <div class="counter"><strong>订阅额度</strong><span>不可用</span><small>网关流量计数器不代表订阅套餐额度。</small></div>
       </div>
-      <p v-if="counters" class="muted">Counter readback: {{ counters.gateway_name }} · {{ counters.observed_at }}. Values are gateway totals; they may reset when the engine restarts.</p>
-      <div class="panel__heading"><h3>Connections</h3><span class="muted">{{ connections ? `${connections.items.length} observed` : 'Unavailable' }}</span></div>
-      <p class="muted">Source, destination, matched rule, route chain, and policy generation are unavailable in this gateway observation contract.</p>
-      <p v-if="!supportsConnections" class="muted">Connection observation is unavailable on this gateway.</p>
-      <p v-else-if="connections && !connections.items.length" class="empty-state">No connections were observed on {{ connections.gateway_name }}.</p>
-      <div v-if="connections?.items.length" class="table-scroll"><table><thead><tr><th>Connection</th><th>Outbound group</th><th>Node</th><th>Transport</th><th>State</th><th>Opened</th></tr></thead><tbody><tr v-for="connection in connections.items" :key="connection.id"><td>{{ connection.id }}</td><td>{{ connection.group_id || 'Unknown' }}</td><td>{{ connection.node_id || 'Unknown' }}</td><td>{{ connection.transport || 'Unknown' }}</td><td>{{ connection.state || 'Unknown' }}</td><td>{{ connection.opened_at }}</td></tr></tbody></table></div>
-      <p v-if="connections" class="muted">Connection readback: {{ connections.gateway_name }} · {{ connections.observed_at }}</p>
+      <p v-if="counters" class="muted">计数器回读：{{ counters.gateway_name }} · {{ counters.observed_at }}。数值为网关累计值，引擎重启后可能归零。</p>
+      <div class="panel__heading"><h3>连接列表</h3><span class="muted">{{ connections ? `${connections.items.length} 个已观测` : '不可用' }}</span></div>
+      <p class="muted">此网关的观测接口不提供来源、目标、命中规则、路由链或策略代次。</p>
+      <p v-if="!supportsConnections" class="muted">此网关不支持连接观测。</p>
+      <p v-else-if="connections && !connections.items.length" class="empty-state">未在 {{ connections.gateway_name }} 上观测到连接。</p>
+      <div v-if="connections?.items.length" class="table-scroll"><table><thead><tr><th>连接</th><th>代理组</th><th>节点</th><th>传输协议</th><th>状态</th><th>建立时间</th></tr></thead><tbody><tr v-for="connection in connections.items" :key="connection.id"><td>{{ connection.id }}</td><td>{{ connection.group_id || '未知' }}</td><td>{{ connection.node_id || '未知' }}</td><td>{{ uiLabel(connection.transport) }}</td><td>{{ uiLabel(connection.state) }}</td><td>{{ connection.opened_at }}</td></tr></tbody></table></div>
+      <p v-if="connections" class="muted">连接回读：{{ connections.gateway_name }} · {{ connections.observed_at }}</p>
     </section>
-    <section class="panel"><div class="panel__heading"><h2>Operations</h2><span class="muted">{{ operations.length }} recorded</span></div><div v-if="!operations.length && !loading" class="empty-state">No operations are available.</div><div v-for="operation in operations" :key="operation.id" class="operation-row"><span><strong>{{ operation.action }}</strong><small>{{ operation.target }} · {{ operation.updatedAt }}</small><small>{{ operation.id }}</small></span><StatusPill :label="operation.status" :tone="operation.status === 'applied' ? 'good' : ['failed', 'outcome_unknown'].includes(operation.status) ? 'bad' : 'warn'" /><button class="button button--secondary" @click="inspect(operation.id)">Read operation</button><p v-if="operation.error" class="operation-error">{{ operation.error }}</p></div></section>
-    <section v-if="selectedOperation" class="panel"><h2>Operation readback</h2><p>{{ selectedOperation.id }} · {{ selectedOperation.status }}</p><StateStrip :states="views(selectedOperation)" /><p class="muted">An absent verified state means no verification evidence was recorded.</p></section>
-    <section class="panel"><h2>Audit history</h2><div v-if="!audits.length" class="empty-state">No audit events are available.</div><div v-for="event in audits" :key="event.id" class="operation-row"><span><strong>{{ event.action }} · {{ event.object_type }}</strong><small>{{ event.actor }} · {{ event.created_at }}</small></span><span>{{ event.outcome }}</span></div></section>
+    <section class="panel"><div class="panel__heading"><h2>操作记录</h2><span class="muted">{{ operations.length }} 条已记录</span></div><div v-if="!operations.length && !loading" class="empty-state">暂无操作记录。</div><div v-for="operation in operations" :key="operation.id" class="operation-row"><span><strong>{{ actionName(operation.action) }}</strong><small>{{ operation.target }} · {{ operation.updatedAt }}</small><small>{{ operation.id }}</small></span><StatusPill :label="uiLabel(operation.status)" :tone="operation.status === 'applied' ? 'good' : ['failed', 'outcome_unknown'].includes(operation.status) ? 'bad' : 'warn'" /><button class="button button--secondary" @click="inspect(operation.id)">读取操作</button><p v-if="operation.error" class="operation-error"><DiagnosticMessage :message="operation.error" /></p></div></section>
+    <section v-if="selectedOperation" class="panel"><h2>操作回读</h2><p>{{ selectedOperation.id }} · {{ uiLabel(selectedOperation.status) }}</p><StateStrip :states="views(selectedOperation)" /><p class="muted">没有已验证状态，表示尚未记录验证证据。</p></section>
+    <section class="panel"><h2>审计记录</h2><div v-if="!audits.length" class="empty-state">暂无审计事件。</div><div v-for="event in audits" :key="event.id" class="operation-row"><span><strong :title="event.action">{{ auditActionName(event.action) }} · {{ uiLabel(event.object_type) }}</strong><small>{{ event.actor }} · <time :datetime="event.created_at" :title="event.created_at">{{ formatTimestamp(event.created_at) }}</time></small></span><span>{{ auditOutcomeName(event.outcome) }}</span></div></section>
   </div>
 </template>
 
@@ -115,4 +118,7 @@ onDeactivated(() => { active = false; diagnosticRequest++; diagnosticAbort?.abor
 .panel { min-width: 0; } .panel__heading > div { min-width: 0; } .counter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; } .counter { display: grid; gap: .4rem; background: var(--surface-alt); padding: .8rem; border-radius: .45rem; overflow-wrap: anywhere; } .counter small { color: var(--muted); font-size: .78rem; } h3 { font-size: .95rem; margin: .3rem 0; } .table-scroll { max-width: 100%; overflow: auto; } table { width: 100%; border-collapse: collapse; text-align: left; font-size: .8rem; } th, td { padding: .6rem; border-bottom: 1px solid var(--border); } th { color: var(--muted); } td { overflow-wrap: anywhere; }
 @media (max-width: 760px) { .page-heading, .operation-row { align-items: flex-start; flex-direction: column; } }
 @media (max-width: 620px) { .counter-grid { grid-template-columns: 1fr; } .panel__heading { align-items: flex-start; flex-wrap: wrap; } }
+.operation-row, .operation-row > span, .panel p { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.operation-row > span:first-child { flex: 1 1 auto; }
+.operation-row strong, .operation-row small { min-width: 0; overflow-wrap: anywhere; }
 </style>

@@ -1,16 +1,17 @@
 <script setup lang="ts">
+import { uiLabel } from '../localization'
 import type { StateKind } from '../types'
 
 defineProps<{ states: Partial<Record<StateKind, string>>; pending?: boolean }>()
 </script>
 
 <template>
-  <div class="state-strip" aria-label="deployment state">
+  <div class="state-strip" aria-label="部署状态">
     <span v-for="kind in ['desired', 'applied', 'observed', 'verified']" :key="kind" class="state-strip__item" :class="{ 'state-strip__item--empty': !states[kind as StateKind] }">
-      <strong>{{ kind }}</strong>
+      <strong>{{ uiLabel(kind) }}</strong>
       <span>{{ states[kind as StateKind] ?? '—' }}</span>
     </span>
-    <span v-if="pending" class="state-strip__pending">Readback pending</span>
+    <span v-if="pending" class="state-strip__pending">等待回读</span>
   </div>
 </template>
 

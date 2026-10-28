@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { uiLabel } from '../localization'
+import DiagnosticMessage from '../components/DiagnosticMessage.vue'
 import { computed, onActivated, ref } from 'vue'
 import StatusPill from '../components/StatusPill.vue'
 import UiIcon from '../components/UiIcon.vue'
@@ -37,7 +39,7 @@ const editing = ref<{ id: string; revision: number }>()
 const form = ref({ name: '', gatewayId: '', mode: 'manual' as OutboundGroupSummary['mode'], replacementPolicy: 'block' as OutboundGroupSummary['replacementPolicy'], nodeIds: [] as string[] })
 const candidateMode = ref<'explicit' | 'filters'>('explicit')
 const filterForm = ref<Record<keyof OutboundSourceFilters, string>>({ provider_ids: '', protocols: '', exclude_provider_ids: '', exclude_protocols: '', include_node_ids: '', exclude_node_ids: '', include_names: '', exclude_names: '' })
-const filterFields: Array<{ key: keyof OutboundSourceFilters; label: string }> = [{ key: 'provider_ids', label: 'Included provider IDs' }, { key: 'protocols', label: 'Included protocols' }, { key: 'include_names', label: 'Included exact node names' }, { key: 'exclude_names', label: 'Excluded exact node names' }, { key: 'include_node_ids', label: 'Included node IDs' }, { key: 'exclude_node_ids', label: 'Excluded node IDs' }, { key: 'exclude_provider_ids', label: 'Excluded provider IDs' }, { key: 'exclude_protocols', label: 'Excluded protocols' }]
+const filterFields: Array<{ key: keyof OutboundSourceFilters; label: string }> = [{ key: 'provider_ids', label: '包含的订阅 ID' }, { key: 'protocols', label: '包含的协议' }, { key: 'include_names', label: '包含的精确节点名称' }, { key: 'exclude_names', label: '排除的精确节点名称' }, { key: 'include_node_ids', label: '包含的节点 ID' }, { key: 'exclude_node_ids', label: '排除的节点 ID' }, { key: 'exclude_provider_ids', label: '排除的订阅 ID' }, { key: 'exclude_protocols', label: '排除的协议' }]
 const sourceFilters = computed<OutboundSourceFilters>(() => Object.fromEntries(filterFields.map(field => [field.key, filterLines(filterForm.value[field.key]).map(value => field.key.includes('protocols') ? value.toLowerCase() : value)]).filter(([, values]) => (values as string[]).length)))
 const filterPreview = computed(() => previewCandidates(sourceFilters.value, nodes.value))
 const canAdminister = computed(() => props.state.isAdministrator.value)
@@ -75,7 +77,7 @@ function selectionStates(group: OutboundGroupSummary) {
   const records = selectionTransports(group).map(transport => selectionFor(group, transport))
   const state = (field: 'desired_node_id' | 'applied_node_id' | 'observed_node_id') => {
     const ids = records.map(record => record?.[field])
-    return ids.every(id => id === ids[0]) ? nodeName(ids[0]) : 'TCP / UDP differ — see readback'
+    return ids.every(id => id === ids[0]) ? nodeName(ids[0]) : 'TCP / UDP 不一致，请检查回读'
   }
   return { desired: state('desired_node_id'), applied: state('applied_node_id'), observed: state('observed_node_id') }
 }
@@ -89,19 +91,19 @@ function selectionNeedsAttention(group: OutboundGroupSummary) {
 }
 function groupConfigurationPending(group: OutboundGroupSummary) { return group.appliedRevision !== undefined && (group.appliedRevision !== group.revision || group.observedRevision !== group.revision) }
 function groupApplyUnavailable(group: OutboundGroupSummary) {
-  if (!canAdminister.value) return 'An administrator session is required to apply group configuration.'
-  if (!props.state.capabilities.value['group.publish_hot']) return 'This controller does not report group publication support.'
-  if (!group.nodeIds.length) return 'Add candidate nodes before applying group configuration.'
+  if (!canAdminister.value) return '应用组配置需要管理员会话。'
+  if (!props.state.capabilities.value['group.publish_hot']) return '此控制器未报告组发布能力。'
+  if (!group.nodeIds.length) return '应用组配置前请先添加候选节点。'
   return undefined
 }
 function selectionUnavailable(group: OutboundGroupSummary) {
-  if (!props.state.canOperate.value) return 'An operator or administrator session is required to change selection.'
-  if (!props.state.capabilities.value['selection.set_runtime']) return 'Runtime selection is unavailable on this controller.'
-  if (group.mode !== 'manual') return 'Use manual selection mode to choose a node.'
-  if (groupConfigurationPending(group)) return 'Group configuration is not applied. Apply the saved group revision before choosing a node.'
-  if (readbackErrors.value[group.id]) return 'Selection readback is unavailable. Refresh before changing selection.'
-  if (!Object.prototype.hasOwnProperty.call(selections.value, group.id)) return 'Selection readback is pending.'
-  if (!group.nodeIds.length) return 'Add candidate nodes before changing selection.'
+  if (!props.state.canOperate.value) return '更改节点选择需要操作员或管理员会话。'
+  if (!props.state.capabilities.value['selection.set_runtime']) return '此控制器不支持运行时节点选择。'
+  if (group.mode !== 'manual') return '请使用手动选择模式选择节点。'
+  if (groupConfigurationPending(group)) return '组配置尚未应用。选择节点前请先应用已保存的组版本。'
+  if (readbackErrors.value[group.id]) return '节点选择回读不可用，更改选择前请刷新。'
+  if (!Object.prototype.hasOwnProperty.call(selections.value, group.id)) return '正在等待节点选择回读。'
+  if (!group.nodeIds.length) return '更改选择前请先添加候选节点。'
   return undefined
 }
 function errorMessage(cause: unknown, fallback: string) {
@@ -109,10 +111,10 @@ function errorMessage(cause: unknown, fallback: string) {
 }
 function probeKey(group: OutboundGroupSummary, node?: NodeSummary) { return `${group.gatewayId}:${node ? `node:${node.id}` : `group:${group.id}`}` }
 function probeUnavailable(group: OutboundGroupSummary, node?: NodeSummary) {
-  if (!props.state.canOperate.value) return 'An operator session is required for gateway probes.'
+  if (!props.state.canOperate.value) return '网关探测需要操作员会话。'
   const gateway = props.state.gateways.value.find(item => item.id === group.gatewayId)
-  if (!gateway?.capabilities.supported.includes(node ? 'probe.node' : 'probe.group')) return 'This gateway does not report the required probe capability.'
-  if (node && (!node.supported || !group.nodeIds.includes(node.id))) return 'The node must be a supported candidate assigned to this gateway.'
+  if (!gateway?.capabilities.supported.includes(node ? 'probe.node' : 'probe.group')) return '此网关未报告所需的探测能力。'
+  if (node && (!node.supported || !group.nodeIds.includes(node.id))) return '节点必须是分配给此网关且受支持的候选节点。'
   return undefined
 }
 async function runProbe(group: OutboundGroupSummary, node?: NodeSummary) {
@@ -124,13 +126,13 @@ async function runProbe(group: OutboundGroupSummary, node?: NodeSummary) {
   delete probeResults.value[key]
   try {
     const result = node ? await props.state.api.gatewayProbeNode(group.gatewayId, node.id) : await props.state.api.gatewayProbeGroup(group.gatewayId, group.id)
-    if (result.gateway_id !== group.gatewayId || result.target_id !== (node?.id ?? group.id) || result.target_kind !== (node ? 'node' : 'group')) throw new Error('Gateway probe returned a different target. Result was discarded.')
+    if (result.gateway_id !== group.gatewayId || result.target_id !== (node?.id ?? group.id) || result.target_kind !== (node ? 'node' : 'group')) throw new Error('网关探测返回了不同的目标，结果已丢弃。')
     probeResults.value[key] = result
-  } catch (cause) { probeErrors.value[key] = errorMessage(cause, 'Gateway probe failed') }
+  } catch (cause) { probeErrors.value[key] = errorMessage(cause, '网关探测失败') }
   finally { probing.value = undefined }
 }
 function probeLabel(result: GatewayProbeResponse) {
-  return `${result.gateway_name || result.gateway_id}: ${result.probe.ok ? `${result.probe.latency_ms} ms gateway measurement` : 'probe failed'} · ${result.observed_at}`
+  return `${result.gateway_name || result.gateway_id}: ${result.probe.ok ? `${result.probe.latency_ms} 毫秒（网关测量）` : '探测失败'} · ${result.observed_at}`
 }
 
 async function load() {
@@ -155,7 +157,7 @@ async function load() {
       usageError.value = undefined
     } else {
       const failures = [policyResult, ruleSetResult, deviceGroupResult].filter(result => !result.ok)
-      usageError.value = failures.map(result => !result.ok ? errorMessage(result.cause, 'Reference inventory unavailable') : '').join('; ')
+      usageError.value = failures.map(result => !result.ok ? errorMessage(result.cause, '引用清单不可用') : '').join('; ')
     }
     const nextErrors: Record<string, string> = {}
     const nextSelections: Record<string, SelectionSummary[]> = {}
@@ -163,16 +165,16 @@ async function load() {
       const group = outboundGroups[index]!
       if (result.status === 'fulfilled') nextSelections[group.id] = result.value
       else {
-        nextErrors[group.id] = errorMessage(result.reason, 'Unable to read selection')
+        nextErrors[group.id] = errorMessage(result.reason, '无法读取节点选择')
         if (selections.value[group.id]) nextSelections[group.id] = selections.value[group.id]!
       }
     })
     selections.value = nextSelections
     readbackErrors.value = nextErrors
   } catch (cause) {
-    loadError.value = errorMessage(cause, 'Unable to load proxy inventory')
-    usageError.value = 'Reference inventory was not refreshed; previously loaded references may be stale.'
-    for (const group of groups.value) readbackErrors.value[group.id] = 'Inventory refresh failed. Selection readback may be stale.'
+    loadError.value = errorMessage(cause, '无法读取代理清单')
+    usageError.value = '引用清单未刷新，之前读取的引用可能已过期。'
+    for (const group of groups.value) readbackErrors.value[group.id] = '清单刷新失败，节点选择回读可能已过期。'
   } finally {
     loading.value = false
   }
@@ -194,11 +196,11 @@ function openEditor(group?: OutboundGroupSummary) {
 async function saveGroup() {
   if (!canAdminister.value || busy.value) return
   if (!form.value.name.trim() || !form.value.gatewayId) {
-    actionError.value = 'Enter a group name and choose a gateway.'
+    actionError.value = '请输入代理组名称并选择网关。'
     return
   }
-  if (form.value.mode === 'automatic') { actionError.value = 'Automatic selection is unavailable until a gateway adapter reports a qualified automatic chooser.'; return }
-  if (candidateMode.value === 'filters' && !['provider_ids', 'protocols', 'include_node_ids', 'include_names'].some(key => sourceFilters.value[key as keyof OutboundSourceFilters]?.length)) { actionError.value = 'Source filters need at least one included provider, protocol, node ID, or exact name.'; return }
+  if (form.value.mode === 'automatic') { actionError.value = '网关适配器报告经过验证的自动选择能力前，自动模式不可用。'; return }
+  if (candidateMode.value === 'filters' && !['provider_ids', 'protocols', 'include_node_ids', 'include_names'].some(key => sourceFilters.value[key as keyof OutboundSourceFilters]?.length)) { actionError.value = '来源筛选至少需要包含一个订阅、协议、节点 ID 或精确名称。'; return }
   saving.value = true
   actionError.value = undefined
   notice.value = undefined
@@ -211,12 +213,12 @@ async function saveGroup() {
     await load()
     const readback = groups.value.find(group => group.id === saved.id)
     if (!readback || readback.revision !== saved.revision) {
-      actionError.value = 'The controller accepted the group change, but readback did not confirm the saved revision. Refresh before retrying.'
+      actionError.value = '控制器已受理组变更，但回读尚未确认保存版本。重试前请刷新。'
       return
     }
-    notice.value = `Outbound group configuration saved at revision ${readback.revision}.`
+    notice.value = `代理组配置已保存，版本为 ${readback.revision}.`
   } catch (cause) {
-    actionError.value = errorMessage(cause, 'Unable to save outbound group')
+    actionError.value = errorMessage(cause, '无法保存代理组')
   } finally {
     saving.value = false
   }
@@ -226,7 +228,7 @@ async function select(group: OutboundGroupSummary, node: NodeSummary) {
   if (busy.value) return
   const unavailable = selectionUnavailable(group)
   if (unavailable || !node.supported || !group.nodeIds.includes(node.id)) {
-    actionError.value = unavailable ?? 'This node is not a supported candidate in the group.'
+    actionError.value = unavailable ?? '此节点不是组内受支持的候选节点。'
     return
   }
   const transportScopes = selectionTransports(group)
@@ -237,13 +239,13 @@ async function select(group: OutboundGroupSummary, node: NodeSummary) {
   notice.value = undefined
   try {
     const result = await props.state.api.setSelection(group.id, { nodeId: node.id, gatewayId: group.gatewayId, transportScopes, expectedRevision, ...(sharedSelection(group) ? { expectedRevisions } : {}) }, randomIdempotencyKey())
-    if (!result.operationId) throw new Error('The controller did not return an operation identifier. Refresh selection readback before retrying.')
+    if (!result.operationId) throw new Error('控制器未返回操作标识。重试前请刷新节点选择回读。')
     const operation = await props.state.api.waitForOperation(result.operationId)
     props.state.recordOperation(operation)
-    if (['failed', 'outcome_unknown', 'partially_applied'].includes(operation.status)) actionError.value = operation.error ?? `Selection operation is ${operation.status}.`
-    else notice.value = `Selection operation ${operation.status}. Review the ${selectionLabel(group)} readback below.`
+    if (['failed', 'outcome_unknown', 'partially_applied'].includes(operation.status)) actionError.value = operation.error ?? `节点选择操作状态为 ${uiLabel(operation.status)}.`
+    else notice.value = `节点选择操作 ${uiLabel(operation.status)}。请检查下方的 ${selectionLabel(group)} 回读。`
   } catch (cause) {
-    actionError.value = errorMessage(cause, 'Selection failed')
+    actionError.value = errorMessage(cause, '节点选择失败')
   } finally {
     await load()
     pendingGroup.value = undefined
@@ -263,11 +265,11 @@ async function applyGroup(group: OutboundGroupSummary) {
     props.state.recordOperation(operation)
     await load()
     const readback = groups.value.find(item => item.id === group.id)
-    if (operation.status !== 'applied') actionError.value = operation.error ?? `Group configuration operation is ${operation.status}.`
-    else if (!readback || readback.revision !== group.revision || readback.appliedRevision !== group.revision || readback.observedRevision !== group.revision) actionError.value = 'The controller accepted the group publication, but readback has not confirmed the requested revision.'
-    else notice.value = `Group configuration revision ${group.revision} applied and observed on the gateway.`
+    if (operation.status !== 'applied') actionError.value = operation.error ?? `组配置操作状态为 ${uiLabel(operation.status)}.`
+    else if (!readback || readback.revision !== group.revision || readback.appliedRevision !== group.revision || readback.observedRevision !== group.revision) actionError.value = '控制器已受理组发布，但回读尚未确认请求版本。'
+    else notice.value = `组配置版本 ${group.revision} 已在网关上应用并观测确认。`
   } catch (cause) {
-    actionError.value = errorMessage(cause, 'Unable to apply group configuration')
+    actionError.value = errorMessage(cause, '无法应用组配置')
     await load()
   } finally { pendingGroup.value = undefined }
 }
@@ -279,81 +281,81 @@ onActivated(load)
   <div class="page-grid">
     <section class="page-heading">
       <div><p class="eyebrow">代理出口</p><h1>代理</h1><p class="lede">选择出口节点并管理代理组，为不同设备或场景配置合适的网络出口。</p></div>
-      <div class="node-filters"><input v-model="search" class="search" type="search" placeholder="Search nodes" aria-label="Search nodes" /><label>Protocol<select v-model="protocolFilter" aria-label="Filter nodes by protocol"><option value="">All protocols</option><option v-for="protocol in protocols" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>Sort<select v-model="nodeSort" aria-label="Sort nodes"><option value="name">Name</option><option value="protocol">Protocol</option><option value="health">Health</option></select></label></div>
+      <div class="node-filters"><input v-model="search" class="search" type="search" placeholder="搜索节点" aria-label="搜索节点" /><label>协议<select v-model="protocolFilter" aria-label="按协议筛选节点"><option value="">全部协议</option><option v-for="protocol in protocols" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>排序<select v-model="nodeSort" aria-label="节点排序"><option value="name">名称</option><option value="protocol">协议</option><option value="health">健康状态</option></select></label></div>
     </section>
-    <section v-if="loadError" class="alert alert--bad" role="alert">{{ loadError }}</section>
-    <section v-if="actionError" class="alert alert--bad" role="alert">{{ actionError }}</section>
+    <section v-if="loadError" class="alert alert--bad" role="alert"><DiagnosticMessage :message="loadError" /></section>
+    <section v-if="actionError" class="alert alert--bad" role="alert"><DiagnosticMessage :message="actionError" /></section>
     <section v-if="notice" class="alert alert--info" role="status">{{ notice }}</section>
     <section v-if="editorOpen" class="panel">
-      <div class="panel__heading"><h2>{{ editing ? 'Edit outbound group' : 'New outbound group' }}</h2><button class="button button--secondary" :disabled="saving" @click="editorOpen = false">Cancel</button></div>
+      <div class="panel__heading"><h2>{{ editing ? '编辑代理组' : '新建代理组' }}</h2><button class="button button--secondary" :disabled="saving" @click="editorOpen = false">取消</button></div>
       <form class="group-form" @submit.prevent="saveGroup">
         <fieldset :disabled="busy || !canAdminister">
           <div class="form-grid">
-            <label>Outbound group name<input v-model="form.name" required maxlength="200" /></label>
-            <label>Outbound gateway<select v-model="form.gatewayId" required><option value="" disabled>Choose a gateway</option><option v-for="gateway in state.gateways.value" :key="gateway.id" :value="gateway.id">{{ gateway.name }}</option><option v-if="form.gatewayId && !state.gateways.value.some(gateway => gateway.id === form.gatewayId)" :value="form.gatewayId">{{ form.gatewayId }} (unavailable)</option></select></label>
-            <label>Selection mode<select v-model="form.mode"><option value="manual">Manual</option><option value="automatic" disabled>Automatic — unavailable</option></select></label>
-            <label>Replacement behavior<select v-model="form.replacementPolicy"><option value="block">Block when the selected node disappears</option><option value="none">Leave selection unresolved</option></select></label>
-            <label>Candidate source<select v-model="candidateMode"><option value="explicit">Choose individual nodes</option><option value="filters">Filter provider inventory</option></select></label>
+            <label>代理组名称<input v-model="form.name" required maxlength="200" /></label>
+            <label>出口网关<select v-model="form.gatewayId" required><option value="" disabled>选择网关</option><option v-for="gateway in state.gateways.value" :key="gateway.id" :value="gateway.id">{{ gateway.name }}</option><option v-if="form.gatewayId && !state.gateways.value.some(gateway => gateway.id === form.gatewayId)" :value="form.gatewayId">{{ form.gatewayId }}（不可用）</option></select></label>
+            <label>选择模式<select v-model="form.mode"><option value="manual">手动选择</option><option value="automatic" disabled>自动选择（暂不可用）</option></select></label>
+            <label>节点替换行为<select v-model="form.replacementPolicy"><option value="block">所选节点消失时阻断流量</option><option value="none">保留未确定的选择状态</option></select></label>
+            <label>候选节点来源<select v-model="candidateMode"><option value="explicit">逐个选择节点</option><option value="filters">筛选订阅清单</option></select></label>
           </div>
-          <template v-if="candidateMode === 'filters'"><p class="help">Filters persist across provider updates. Enter one value per line. Provider and protocol constraints both apply; included IDs or names match either list. Names are exact and case-sensitive. Exclusions always win.</p><div class="form-grid"><label v-for="field in filterFields" :key="field.key">{{ field.label }}<textarea v-model="filterForm[field.key]" rows="2" spellcheck="false" /></label></div><p class="help">Local preview from the loaded inventory: {{ filterPreview.length }} supported candidates. The controller validates the saved membership.</p><ul class="filter-preview"><li v-for="node in filterPreview" :key="node.id">{{ node.name }} · {{ node.protocol }} · provider {{ node.providerId }}</li></ul></template>
+          <template v-if="candidateMode === 'filters'"><p class="help">筛选条件在订阅更新后仍保留。每行输入一个值。订阅与协议条件需同时满足；包含的节点标识或名称匹配任一列表即可。名称精确匹配且区分大小写，排除条件优先。</p><div class="form-grid"><label v-for="field in filterFields" :key="field.key">{{ field.label }}<textarea v-model="filterForm[field.key]" rows="2" spellcheck="false" /></label></div><p class="help">已加载清单的本地预览：{{ filterPreview.length }} 个受支持的候选节点。控制器将校验保存后的成员。</p><ul class="filter-preview"><li v-for="node in filterPreview" :key="node.id">{{ node.name }} · {{ node.protocol }} · 订阅 {{ node.providerId }}</li></ul></template>
           <template v-else>
-          <div class="candidate-heading"><h3>Candidates</h3><span>{{ form.nodeIds.length }} selected</span></div>
-          <p class="help">Candidates use stable node identities from provider inventory. Unsupported nodes cannot be added.</p>
+          <div class="candidate-heading"><h3>候选节点</h3><span>已选择 {{ form.nodeIds.length }} 个</span></div>
+          <p class="help">候选节点使用订阅清单中的稳定标识。不支持的节点不能加入。</p>
           <div class="candidate-grid">
-            <label v-for="node in filteredNodes" :key="node.id" class="candidate-choice"><input v-model="form.nodeIds" type="checkbox" :value="node.id" :disabled="!node.supported && !form.nodeIds.includes(node.id)" :aria-label="`Candidate ${node.name}`" /><span><strong>{{ node.name }}</strong><small>{{ node.protocol }}<span v-if="!node.supported"> · Unsupported</span></small></span></label>
+            <label v-for="node in filteredNodes" :key="node.id" class="candidate-choice"><input v-model="form.nodeIds" type="checkbox" :value="node.id" :disabled="!node.supported && !form.nodeIds.includes(node.id)" :aria-label="`候选节点 ${node.name}`" /><span><strong>{{ node.name }}</strong><small>{{ node.protocol }}<span v-if="!node.supported"> · 不支持</span></small></span></label>
           </div>
-          <p v-if="!nodes.length" class="help">Stage a subscription revision to make candidate nodes available.</p>
-          <p v-else-if="!filteredNodes.length" class="help">No nodes match the search.</p>
-          <label v-for="id in missingFormNodes" :key="id" class="candidate-choice"><input v-model="form.nodeIds" type="checkbox" :value="id" :aria-label="`Candidate ${id}`" /><span>{{ id }} · Missing from current inventory; uncheck to remove.</span></label>
+          <p v-if="!nodes.length" class="help">暂存一个订阅版本后，即可选择候选节点。</p>
+          <p v-else-if="!filteredNodes.length" class="help">没有匹配搜索条件的节点。</p>
+          <label v-for="id in missingFormNodes" :key="id" class="candidate-choice"><input v-model="form.nodeIds" type="checkbox" :value="id" :aria-label="`候选节点 ${id}`" /><span>{{ id }} · 当前清单中不存在；取消勾选可移除。</span></label>
           </template>
-          <p v-if="editing" class="help">Editing configuration revision {{ editing.revision }}. If another administrator changes this group, reopen the editor after refreshing.</p>
-          <button class="button" type="submit" :disabled="!form.name.trim() || !form.gatewayId">{{ saving ? 'Saving…' : editing ? 'Save outbound group' : 'Create outbound group' }}</button>
+          <p v-if="editing" class="help">正在编辑配置版本 {{ editing.revision }}。其他管理员修改此组后，请刷新并重新打开编辑器。</p>
+          <button class="button" type="submit" :disabled="!form.name.trim() || !form.gatewayId">{{ saving ? '正在保存…' : editing ? '保存代理组' : '创建代理组' }}</button>
         </fieldset>
       </form>
     </section>
     <section class="panel proxy-groups">
-      <div class="panel__heading"><h2>代理组</h2><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh</button><button class="button" :disabled="busy || !canAdminister" @click="openEditor()">New outbound group</button></div></div>
-      <p v-if="!canAdminister" class="help">An administrator session is required to create or edit outbound groups.</p>
-      <div v-if="loading && !groups.length" class="empty-state" role="status">Loading proxy inventory…</div>
-      <div v-else-if="!groups.length" class="empty-state">No outbound groups are configured.</div>
-      <article v-for="group in groups" :key="group.id" class="group-card" :aria-label="`Outbound group ${group.name}`">
+      <div class="panel__heading"><h2>代理组</h2><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">刷新</button><button class="button" :disabled="busy || !canAdminister" @click="openEditor()">新建代理组</button></div></div>
+      <p v-if="!canAdminister" class="help">创建或编辑代理组需要管理员会话。</p>
+      <div v-if="loading && !groups.length" class="empty-state" role="status">正在读取代理清单…</div>
+      <div v-else-if="!groups.length" class="empty-state">尚未配置代理组。</div>
+      <article v-for="group in groups" :key="group.id" class="group-card" :aria-label="`代理组 ${group.name}`">
         <div class="group-card__heading">
           <div><h3>{{ group.name }}</h3><p>{{ group.nodeIds.length }} 个候选节点 · {{ group.mode === 'manual' ? '手动选择' : '自动选择' }} · {{ gatewayName(group.gatewayId) }}</p></div>
-          <div class="actions"><StatusPill :label="pendingGroup === group.id ? 'Applying' : readbackErrors[group.id] ? 'Readback unavailable' : groupConfigurationPending(group) ? 'Configuration pending' : 'Configured'" :tone="pendingGroup === group.id || readbackErrors[group.id] || groupConfigurationPending(group) ? 'warn' : 'neutral'" /><button v-if="groupConfigurationPending(group)" class="button" :aria-label="`Apply configuration for ${group.name}`" :title="groupApplyUnavailable(group)" :disabled="busy || !!groupApplyUnavailable(group)" @click="applyGroup(group)">Apply configuration</button><button class="button button--secondary" :aria-label="`Test group ${group.name} from gateway`" :title="probeUnavailable(group)" :disabled="!!probing || !!probeUnavailable(group)" @click="runProbe(group)">{{ probing === probeKey(group) ? 'Testing…' : 'Test group' }}</button><button class="button button--secondary" :aria-label="`Edit ${group.name}`" :disabled="busy || !canAdminister" @click="openEditor(group)">Edit</button></div>
+          <div class="actions"><StatusPill :label="pendingGroup === group.id ? '正在应用' : readbackErrors[group.id] ? '回读不可用' : groupConfigurationPending(group) ? '配置待确认' : '已配置'" :tone="pendingGroup === group.id || readbackErrors[group.id] || groupConfigurationPending(group) ? 'warn' : 'neutral'" /><button v-if="groupConfigurationPending(group)" class="button" :aria-label="`应用组配置：${group.name}`" :title="groupApplyUnavailable(group)" :disabled="busy || !!groupApplyUnavailable(group)" @click="applyGroup(group)">应用配置</button><button class="button button--secondary" :aria-label="`测试代理组 ${group.name}（从网关测试）`" :title="probeUnavailable(group)" :disabled="!!probing || !!probeUnavailable(group)" @click="runProbe(group)">{{ probing === probeKey(group) ? '正在测试…' : '测试代理组' }}</button><button class="button button--secondary" :aria-label="`编辑 ${group.name}`" :disabled="busy || !canAdminister" @click="openEditor(group)">编辑</button></div>
         </div>
-        <p v-if="group.appliedRevision !== undefined" class="help">Group configuration: desired revision {{ group.revision }} · applied {{ group.appliedRevision || 'Not applied' }} · observed {{ group.observedRevision || 'Not observed' }}<span v-if="group.appliedGeneration"> · gateway generation {{ group.appliedGeneration }}</span></p>
-        <p v-if="group.sourceFilters" class="help">Candidates follow saved source filters. The {{ group.nodeIds.length }} nodes below are the controller’s current resolved membership.</p>
-        <p v-if="readbackErrors[group.id]" class="alert alert--bad" role="alert">{{ readbackErrors[group.id] }} Previously loaded values may be stale.</p>
-        <p v-if="probeResults[probeKey(group)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group)]!) }}<span v-if="probeResults[probeKey(group)]?.probe.error"> · {{ probeResults[probeKey(group)]?.probe.error }}</span></p>
-        <p v-if="probeErrors[probeKey(group)]" class="help warning" role="alert">{{ probeErrors[probeKey(group)] }}</p>
+        <p v-if="group.appliedRevision !== undefined" class="help">组配置：期望版本 {{ group.revision }} · 已应用 {{ group.appliedRevision || '尚未应用' }} · 已观测 {{ group.observedRevision || '尚未观测' }}<span v-if="group.appliedGeneration"> · 网关代次 {{ group.appliedGeneration }}</span></p>
+        <p v-if="group.sourceFilters" class="help">候选节点遵循已保存的来源筛选条件。以下 {{ group.nodeIds.length }} 个节点是控制器当前解析的成员。</p>
+        <p v-if="readbackErrors[group.id]" class="alert alert--bad" role="alert"><DiagnosticMessage :message="readbackErrors[group.id]" /> 之前读取的数值可能已过期。</p>
+        <p v-if="probeResults[probeKey(group)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group)]!) }}<span v-if="probeResults[probeKey(group)]?.probe.error"> · <DiagnosticMessage :message="probeResults[probeKey(group)]?.probe.error" /></span></p>
+        <p v-if="probeErrors[probeKey(group)]" class="help warning" role="alert"><DiagnosticMessage :message="probeErrors[probeKey(group)]" /></p>
 
-        <p v-if="sharedSelection(group)" class="help">Shared TCP + UDP selection. Choosing a node changes both transports together.</p>
-        <label v-else class="transport-control">Selection transport<select :value="activeTransport(group)" :aria-label="`Selection transport for ${group.name}`" :disabled="busy" @change="selectedTransports[group.id] = ($event.target as HTMLSelectElement).value"><option v-for="transport in transports(group)" :key="transport" :value="transport">{{ transport.toUpperCase() }}</option></select></label>
+        <p v-if="sharedSelection(group)" class="help">TCP 与 UDP 共用选择。选择节点会同时更改两种传输协议的出口。</p>
+        <label v-else class="transport-control">选择传输协议<select :value="activeTransport(group)" :aria-label="`节点选择传输协议：${group.name}`" :disabled="busy" @change="selectedTransports[group.id] = ($event.target as HTMLSelectElement).value"><option v-for="transport in transports(group)" :key="transport" :value="transport">{{ transport.toUpperCase() }}</option></select></label>
         <StateStrip :states="selectionStates(group)" :pending="pendingGroup === group.id" />
         <p v-if="selectionUnavailable(group)" class="help warning">{{ selectionUnavailable(group) }}</p>
-        <p v-else-if="!state.capabilities.value['selection.persist_restart']" class="help warning">This adapter does not report durable selection across gateway restarts.</p>
+        <p v-else-if="!state.capabilities.value['selection.persist_restart']" class="help warning">此适配器未报告网关重启后保留节点选择的能力。</p>
         <div class="node-grid">
-          <div v-for="node in nodesForGroup(group)" :key="node.id" class="node-entry"><button class="node-card" :class="{ 'node-card--selected': observedForSelection(group, node.id) }" :aria-label="`Select ${node.name} for ${group.name} (${selectionLabel(group)})`" :aria-pressed="observedForSelection(group, node.id)" :disabled="busy || !!selectionUnavailable(group) || !node.supported" @click="select(group, node)">
-            <span class="node-card__name"><UiIcon name="globe" :size="19" />{{ node.name }}<UiIcon v-if="observedForSelection(group, node.id)" class="node-check" name="check" :size="17" /></span><span class="node-card__meta">{{ node.protocol }} · {{ node.health }}</span><span v-if="!node.supported" class="node-card__warning">Unsupported</span><span v-if="observedForSelection(group, node.id)" class="node-card__meta">Observed for {{ selectionLabel(group) }}</span>
-          </button><button class="button button--secondary" :aria-label="`Test node ${node.name} from gateway for ${group.name}`" :title="probeUnavailable(group, node)" :disabled="!!probing || !!probeUnavailable(group, node)" @click="runProbe(group, node)">{{ probing === probeKey(group, node) ? 'Testing…' : 'Test node' }}</button><p v-if="probeResults[probeKey(group, node)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group, node)]!) }}<span v-if="probeResults[probeKey(group, node)]?.probe.error"> · {{ probeResults[probeKey(group, node)]?.probe.error }}</span></p><p v-if="probeErrors[probeKey(group, node)]" class="help warning" role="alert">{{ probeErrors[probeKey(group, node)] }}</p></div>
+          <div v-for="node in nodesForGroup(group)" :key="node.id" class="node-entry"><button class="node-card" :class="{ 'node-card--selected': observedForSelection(group, node.id) }" :aria-label="`选择 ${node.name}，用于 ${group.name} (${selectionLabel(group)})`" :aria-pressed="observedForSelection(group, node.id)" :disabled="busy || !!selectionUnavailable(group) || !node.supported" @click="select(group, node)">
+            <span class="node-card__name"><UiIcon name="globe" :size="19" />{{ node.name }}<UiIcon v-if="observedForSelection(group, node.id)" class="node-check" name="check" :size="17" /></span><span class="node-card__meta">{{ node.protocol }} · {{ uiLabel(node.health) }}</span><span v-if="!node.supported" class="node-card__warning">不支持</span><span v-if="observedForSelection(group, node.id)" class="node-card__meta">已观测用于 {{ selectionLabel(group) }}</span>
+          </button><button class="button button--secondary" :aria-label="`测试节点 ${node.name}（从网关测试），用于 ${group.name}`" :title="probeUnavailable(group, node)" :disabled="!!probing || !!probeUnavailable(group, node)" @click="runProbe(group, node)">{{ probing === probeKey(group, node) ? '正在测试…' : '测试节点' }}</button><p v-if="probeResults[probeKey(group, node)]" class="help" role="status">{{ probeLabel(probeResults[probeKey(group, node)]!) }}<span v-if="probeResults[probeKey(group, node)]?.probe.error"> · <DiagnosticMessage :message="probeResults[probeKey(group, node)]?.probe.error" /></span></p><p v-if="probeErrors[probeKey(group, node)]" class="help warning" role="alert"><DiagnosticMessage :message="probeErrors[probeKey(group, node)]" /></p></div>
         </div>
-        <p v-if="group.nodeIds.length && !nodesForGroup(group).length && !missingCandidates(group).length" class="help">No candidate nodes match the search.</p>
-        <p v-if="missingCandidates(group).length" class="help warning">Candidates unavailable in current inventory: {{ missingCandidates(group).join(', ') }}</p>
+        <p v-if="group.nodeIds.length && !nodesForGroup(group).length && !missingCandidates(group).length" class="help">没有匹配搜索条件的候选节点。</p>
+        <p v-if="missingCandidates(group).length" class="help warning">当前清单中不可用的候选节点：{{ missingCandidates(group).join(', ') }}</p>
         <details class="readback-details" :open="selectionNeedsAttention(group)">
           <summary><span>部署与传输详情</span><span>{{ selectionNeedsAttention(group) ? '需要检查回读' : '查看 TCP / UDP 配置回读' }}</span></summary>
           <p class="help">以下是配置版本与传输选择的回读，不代表客户端流量已通过验证。</p>
-        <div class="table-scroll"><table :aria-label="`Selection readback for ${group.name}`"><thead><tr><th>Transport</th><th>Desired</th><th>Applied</th><th>Observed</th><th>Revision</th></tr></thead><tbody><tr v-for="transport in transports(group)" :key="transport"><th scope="row">{{ transport.toUpperCase() }}</th><td>{{ nodeName(selectionFor(group, transport)?.desired_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.applied_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.observed_node_id) ?? '—' }}</td><td>{{ selectionFor(group, transport)?.revision ?? 'No selection' }}</td></tr></tbody></table></div>
+        <div class="table-scroll"><table :aria-label="`节点选择回读：${group.name}`"><thead><tr><th>传输协议</th><th>期望状态</th><th>已应用</th><th>已观测</th><th>版本</th></tr></thead><tbody><tr v-for="transport in transports(group)" :key="transport"><th scope="row">{{ transport.toUpperCase() }}</th><td>{{ nodeName(selectionFor(group, transport)?.desired_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.applied_node_id) ?? '—' }}</td><td>{{ nodeName(selectionFor(group, transport)?.observed_node_id) ?? '—' }}</td><td>{{ selectionFor(group, transport)?.revision ?? '尚未选择' }}</td></tr></tbody></table></div>
         </details>
-        <section class="usage-panel" :aria-label="`Used by ${group.name}`">
-          <h4>Used by</h4>
-          <p class="help">References in saved controller configuration. Disabled references remain listed; deployed traffic may differ.</p>
-          <p v-if="usageError" class="help warning" role="status">Usage readback incomplete: {{ usageError }} {{ usageLoaded ? 'Showing the previous complete reference snapshot.' : '' }}</p>
-          <p v-else-if="loading && !usageLoaded" class="help">Reading policy and device-group references…</p>
-          <p v-else-if="usageLoaded && !references[group.id]?.length" class="help">No saved policies, rule sets, or device groups reference this outbound group.</p>
+        <section class="usage-panel" :aria-label="`引用位置：${group.name}`">
+          <h4>引用位置</h4>
+          <p class="help">这些是已保存控制器配置中的引用，已禁用的引用仍会列出；实际部署流量可能不同。</p>
+          <p v-if="usageError" class="help warning" role="status">引用回读不完整：<DiagnosticMessage :message="usageError" /> {{ usageLoaded ? '显示上次完整的引用快照。' : '' }}</p>
+          <p v-else-if="loading && !usageLoaded" class="help">正在读取策略和设备组引用…</p>
+          <p v-else-if="usageLoaded && !references[group.id]?.length" class="help">已保存的策略、规则集和设备组均未引用此代理组。</p>
           <ul v-if="references[group.id]?.length" class="usage-list">
             <li v-for="reference in references[group.id]" :key="`${reference.kind}:${reference.id}:${reference.detail}`">
-              <a :href="reference.href">{{ reference.kind === 'device_group' ? 'Device group' : reference.kind === 'rule_set' ? 'Rule set' : 'Policy' }}: {{ reference.name }}</a>
-              <span>{{ reference.detail }}<strong v-if="reference.disabled"> · Disabled reference</strong></span>
+              <a :href="reference.href">{{ reference.kind === 'device_group' ? '设备组' : reference.kind === 'rule_set' ? '规则集' : '策略' }}: {{ reference.name }}</a>
+              <span>{{ reference.detail }}<strong v-if="reference.disabled"> · 已禁用的引用</strong></span>
             </li>
           </ul>
         </section>

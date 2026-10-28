@@ -42,7 +42,7 @@ afterEach(() => {
   container?.remove()
 })
 
-function scheduleForm() { return container.querySelector<HTMLFormElement>('form[aria-label="Refresh schedule for Remote subscription"]')! }
+function scheduleForm() { return container.querySelector<HTMLFormElement>('form[aria-label="订阅刷新计划：Remote subscription"]')! }
 async function inputMinutes(value: string) {
   const input = scheduleForm().querySelector<HTMLInputElement>('input[type="number"]')!
   input.value = value
@@ -57,9 +57,9 @@ async function submitSchedule() {
 describe('subscription refresh schedules', () => {
   it('uses server eligibility for a redacted URL and saves a staged-only schedule with the read revision', async () => {
     const api = await mount({ ...defaultSchedule, revision: 7 })
-    expect(container.textContent).toContain('Subscription URL')
-    expect(container.textContent).toContain('Refresh provider')
-    expect(container.textContent).toContain('publication requires a separate action')
+    expect(container.textContent).toContain('订阅 URL')
+    expect(container.textContent).toContain('刷新订阅')
+    expect(container.textContent).toContain('发布需单独执行')
     const checkbox = scheduleForm().querySelector<HTMLInputElement>('input[type="checkbox"]')!
     expect(checkbox.checked).toBe(false)
     checkbox.checked = true
@@ -68,19 +68,19 @@ describe('subscription refresh schedules', () => {
     await submitSchedule()
     await vi.waitFor(() => expect(api.saveProviderSchedule).toHaveBeenCalledWith(provider.id, { enabled: true, interval_seconds: 900, auto_apply: false }, 7))
     await vi.waitFor(() => expect(container.textContent).toContain('2026-10-08T08:15:00Z'))
-    expect(container.textContent).toContain('Refresh schedule saved')
+    expect(container.textContent).toContain('已保存刷新计划')
   })
 
   it('shows scheduler readback and blocks out-of-range intervals without a mutation', async () => {
     const api = await mount({ ...defaultSchedule, enabled: true, running: true, last_attempt_at: '2026-10-08T08:00:00Z', last_success_at: '2026-10-08T07:00:00Z', last_error: 'Fetch timed out', last_operation_id: 'refresh-9' })
-    expect(container.textContent).toContain('Refresh running')
+    expect(container.textContent).toContain('正在刷新')
     expect(container.textContent).toContain('2026-10-08T08:00:00Z')
     expect(container.textContent).toContain('2026-10-08T07:00:00Z')
     expect(container.textContent).toContain('Fetch timed out')
     expect(container.textContent).toContain('refresh-9')
     await inputMinutes('4')
     await submitSchedule()
-    expect(container.textContent).toContain('Choose an interval from 5 minutes to 7 days')
+    expect(container.textContent).toContain('请选择 5 分钟至 7 天')
     await inputMinutes('10081')
     await submitSchedule()
     expect(api.saveProviderSchedule).not.toHaveBeenCalled()
@@ -88,17 +88,18 @@ describe('subscription refresh schedules', () => {
 
   it('keeps inventory usable when schedule readback fails and withholds unavailable source actions', async () => {
     await mount(new Error('Schedule temporarily unavailable'))
-    expect(container.textContent).toContain('Refresh schedule: Schedule temporarily unavailable')
-    expect(container.textContent).toContain('Source details unavailable')
-    expect(container.textContent).toContain('Import new revision')
-    expect(container.textContent).not.toContain('Refresh provider')
+    expect(container.textContent).toContain('刷新计划：')
+    expect(container.querySelector('[data-raw-diagnostic]')?.textContent).toBe('Schedule temporarily unavailable')
+    expect(container.textContent).toContain('来源详情不可用')
+    expect(container.textContent).toContain('导入新版本')
+    expect(container.textContent).not.toContain('刷新订阅')
     expect(scheduleForm()).toBeNull()
   })
 
   it('hides URL refresh and scheduling for imported content', async () => {
     await mount({ ...defaultSchedule, eligible: false })
-    expect(container.textContent).toContain('Imported content')
-    expect(container.textContent).not.toContain('Refresh provider')
+    expect(container.textContent).toContain('导入内容')
+    expect(container.textContent).not.toContain('刷新订阅')
     expect(scheduleForm()).toBeNull()
   })
 
@@ -107,8 +108,8 @@ describe('subscription refresh schedules', () => {
     api.saveProviderSchedule.mockRejectedValue(new ControllerApiError('Schedule changed', 409, 'revision_conflict'))
     await inputMinutes('30')
     await submitSchedule()
-    await vi.waitFor(() => expect(container.textContent).toContain('Schedule changed Refresh state before retrying.'))
-    expect(container.textContent).not.toContain('Refresh schedule saved')
-    expect(container.querySelector('.schedule-status')?.textContent).toContain('Disabled')
+    await vi.waitFor(() => expect(container.textContent).toContain('Schedule changed 重试前请刷新状态。'))
+    expect(container.textContent).not.toContain('已保存刷新计划')
+    expect(container.querySelector('.schedule-status')?.textContent).toContain('已禁用')
   })
 })

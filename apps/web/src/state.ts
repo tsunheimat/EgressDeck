@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ControllerApi, ControllerApiError } from './api/client'
 import type { Capability, GatewaySummary, OverviewResponse, OperationSummary, SessionSummary } from './types'
 
@@ -9,12 +9,14 @@ export function useControllerState(api = new ControllerApi()) {
   const gateways = ref<GatewaySummary[]>([])
   const selectedGatewayId = ref<string>()
   const lastOperation = ref<OperationSummary>()
+  const lastInventoryPlanChecksum = ref<string>()
   const capabilities = ref<Partial<Record<Capability, boolean>>>({})
   const session = ref<SessionSummary>()
   const authRequired = ref(false)
   const sessionUnavailable = ref(false)
   const canOperate = computed(() => !!session.value?.roles.some(role => ['operator', 'administrator', 'admin'].includes(role)))
   const isAdministrator = computed(() => !!session.value?.roles.some(role => ['administrator', 'admin'].includes(role)))
+  watch(() => session.value?.subject, () => { lastInventoryPlanChecksum.value = undefined }, { flush: 'sync' })
 
   const selectedGateway = computed(() => gateways.value.find((gateway) => gateway.id === selectedGatewayId.value) ?? gateways.value[0])
   const hasDrift = computed(() => overview.value?.bindings.some((binding) => binding.drift) || overview.value?.deviceGroups.some((group) => group.drift) || false)
@@ -34,10 +36,10 @@ export function useControllerState(api = new ControllerApi()) {
       }
       const failures = [overviewResult, gatewayResult].filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       if (failures.length === 2) throw failures[0]?.reason
-      if (failures.length === 1) error.value = failures[0]?.reason instanceof ControllerApiError ? failures[0].reason.message : 'Some controller state is unavailable'
+      if (failures.length === 1) error.value = failures[0]?.reason instanceof ControllerApiError ? failures[0].reason.message : '部分控制器状态不可用'
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === 'AbortError') return
-      error.value = cause instanceof ControllerApiError ? cause.message : 'Unable to load controller state'
+      error.value = cause instanceof ControllerApiError ? cause.message : '无法读取控制器状态'
     } finally {
       loading.value = false
     }
@@ -47,5 +49,5 @@ export function useControllerState(api = new ControllerApi()) {
     lastOperation.value = operation
   }
 
-  return { api, loading, error, overview, gateways, selectedGatewayId, selectedGateway, lastOperation, hasDrift, capabilities, session, authRequired, sessionUnavailable, canOperate, isAdministrator, load, recordOperation }
+  return { api, loading, error, overview, gateways, selectedGatewayId, selectedGateway, lastOperation, lastInventoryPlanChecksum, hasDrift, capabilities, session, authRequired, sessionUnavailable, canOperate, isAdministrator, load, recordOperation }
 }

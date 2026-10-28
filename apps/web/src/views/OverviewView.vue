@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 import StatusPill from '../components/StatusPill.vue'
+import DiagnosticMessage from '../components/DiagnosticMessage.vue'
+import { actionName } from '../localization'
 import UiIcon from '../components/UiIcon.vue'
 import { useControllerState } from '../state'
 import { attentionItems, coveragePercent, outboundPending, setupSteps } from '../overviewModel'
 import { navigationHref, type PageName } from '../navigationTarget'
-import { formatTimestamp, healthLabels, healthTone, operationAction, operationLabels, operationTone } from '../uiPresentation'
+import { formatTimestamp, healthLabels, healthTone, operationLabels, operationTone } from '../uiPresentation'
 import type { DeviceSummary, OutboundGroupSummary } from '../types'
 
 const props = defineProps<{ state: ReturnType<typeof useControllerState> }>()
@@ -89,7 +91,7 @@ watch(() => props.state.session.value?.subject, () => { cancelInventory(); devic
       <div><h1>总览</h1><p>安全地管理家庭实验室的代理路由与防火墙接入，让每一次配置都清晰可查。</p></div>
       <button class="ed-button ed-button--quiet" :disabled="busy" @click="refresh"><UiIcon name="refresh" :size="17" />{{ busy ? '正在读取' : '刷新总览' }}</button>
     </header>
-    <div v-if="state.error.value" class="dashboard-alert" role="alert"><UiIcon name="warning" /><span>无法确认最新控制器状态：{{ state.error.value }}。刷新成功前，不显示已完成或健康结论。</span></div>
+    <div v-if="state.error.value" class="dashboard-alert" role="alert"><UiIcon name="warning" /><span>无法确认最新控制器状态：<DiagnosticMessage :message="state.error.value" />。刷新成功前，不显示已完成或健康结论。</span></div>
     <div v-if="inventoryErrors.length" class="dashboard-alert" role="status"><UiIcon name="warning" /><span>{{ inventoryErrors.join('；') }}。不可用的清单显示为「—」，不按零计算。</span></div>
 
     <section class="setup-card ed-panel" aria-labelledby="setup-title">
@@ -131,7 +133,7 @@ watch(() => props.state.session.value?.subject, () => { cancelInventory(); devic
       <section class="ed-panel" aria-labelledby="recent-title">
         <div class="ed-panel__heading"><h2 id="recent-title"><UiIcon name="clock" />最近操作</h2><a :href="href('activity')">查看全部<UiIcon name="arrow" :size="15" /></a></div>
         <ol v-if="recent.length" class="activity-list">
-          <li v-for="operation in recent" :key="operation.id"><span class="timeline-dot" :class="`timeline-dot--${operationTone(operation.status)}`"><UiIcon :name="operation.status === 'applied' ? 'check' : operation.status === 'failed' ? 'close' : 'clock'" :size="12" /></span><span class="activity-copy"><strong>{{ operationAction(operation.action) }}</strong><small :title="operation.target">{{ targetName(operation.target) }}</small></span><time :datetime="operation.createdAt">{{ formatTimestamp(operation.createdAt) }}</time><StatusPill :label="operationLabels[operation.status] ?? operation.status" :tone="operationTone(operation.status)" /></li>
+          <li v-for="operation in recent" :key="operation.id"><span class="timeline-dot" :class="`timeline-dot--${operationTone(operation.status)}`"><UiIcon :name="operation.status === 'applied' ? 'check' : operation.status === 'failed' ? 'close' : 'clock'" :size="12" /></span><span class="activity-copy"><strong>{{ actionName(operation.action) }}</strong><small :title="operation.target">{{ targetName(operation.target) }}</small></span><time :datetime="operation.createdAt">{{ formatTimestamp(operation.createdAt) }}</time><StatusPill :label="operationLabels[operation.status] ?? operation.status" :tone="operationTone(operation.status)" /></li>
         </ol>
         <div v-else class="ed-empty">{{ overview ? '尚无操作记录。完成设置后，可在这里追踪每次变更。' : '等待控制器返回操作记录。' }}</div>
       </section>

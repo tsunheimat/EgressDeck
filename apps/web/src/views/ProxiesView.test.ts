@@ -31,13 +31,13 @@ async function mount(selectionScope = 'independent_transport', initialSelections
 
 it('requires actual assigned gateway probe capability and labels gateway measurements', async () => {
   const { api } = await mount()
-  const group = container!.querySelector<HTMLButtonElement>('[aria-label="Test group Scoped group from gateway"]')!
-  const node = container!.querySelector<HTMLButtonElement>('[aria-label="Test node Node one from gateway for Scoped group"]')!
+  const group = container!.querySelector<HTMLButtonElement>('[aria-label="测试代理组 Scoped group（从网关测试）"]')!
+  const node = container!.querySelector<HTMLButtonElement>('[aria-label="测试节点 Node one（从网关测试），用于 Scoped group"]')!
   expect(group.disabled).toBe(true)
   expect(node.disabled).toBe(false)
   node.click()
   await vi.waitFor(() => expect(api.gatewayProbeNode).toHaveBeenCalledWith('gw1', 'n1'))
-  await vi.waitFor(() => expect(container!.textContent).toContain('Gateway one: 12 ms gateway measurement'))
+  await vi.waitFor(() => expect(container!.textContent).toContain('Gateway one: 12 毫秒（网关测量）'))
   expect(api.gatewayProbeGroup).not.toHaveBeenCalled()
 })
 
@@ -46,11 +46,11 @@ it('selects shared TCP and UDP with both observed revisions and avoids claiming 
     { scope: { gateway_id: 'gw1', transport: 'tcp' }, revision: 3, desired_node_id: 'n1', applied_node_id: 'n1', observed_node_id: 'n1' },
     { scope: { gateway_id: 'gw1', transport: 'udp' }, revision: 1, desired_node_id: 'old-node', applied_node_id: 'old-node', observed_node_id: 'old-node' },
   ])
-  expect([...container!.querySelectorAll('.node-card')].map(node => node.getAttribute('aria-label'))).toEqual(['Select Node one for Scoped group (TCP + UDP)'])
+  expect([...container!.querySelectorAll('.node-card')].map(node => node.getAttribute('aria-label'))).toEqual(['选择 Node one，用于 Scoped group (TCP + UDP)'])
   const node = container!.querySelector<HTMLButtonElement>('.node-card')!
   expect(node.getAttribute('aria-pressed')).toBe('false')
-  expect(container!.querySelector('[aria-label="Selection transport for Scoped group"]')).toBeNull()
-  expect(container!.textContent).toContain('TCP / UDP differ')
+  expect(container!.querySelector('[aria-label="节点选择传输协议：Scoped group"]')).toBeNull()
+  expect(container!.textContent).toContain('TCP / UDP 不一致')
   node.click()
   await vi.waitFor(() => expect(api.setSelection).toHaveBeenCalledWith('g1', {
     nodeId: 'n1', gatewayId: 'gw1', transportScopes: ['tcp', 'udp'], expectedRevision: '3', expectedRevisions: { tcp: 3, udp: 1 },
@@ -63,10 +63,10 @@ it('preserves independent UDP selection and its own revision', async () => {
     { scope: { gateway_id: 'gw1', transport: 'tcp' }, revision: 3 },
     { scope: { gateway_id: 'gw1', transport: 'udp' }, revision: 1 },
   ])
-  const transport = container!.querySelector<HTMLSelectElement>('[aria-label="Selection transport for Scoped group"]')!
+  const transport = container!.querySelector<HTMLSelectElement>('[aria-label="节点选择传输协议：Scoped group"]')!
   transport.value = 'udp'; transport.dispatchEvent(new Event('change'))
-  await vi.waitFor(() => expect(container!.querySelector('[aria-label="Select Node one for Scoped group (UDP)"]')).not.toBeNull())
-  container!.querySelector<HTMLButtonElement>('[aria-label="Select Node one for Scoped group (UDP)"]')!.click()
+  await vi.waitFor(() => expect(container!.querySelector('[aria-label="选择 Node one，用于 Scoped group (UDP)"]')).not.toBeNull())
+  container!.querySelector<HTMLButtonElement>('[aria-label="选择 Node one，用于 Scoped group (UDP)"]')!.click()
   await vi.waitFor(() => expect(api.setSelection).toHaveBeenCalledWith('g1', {
     nodeId: 'n1', gatewayId: 'gw1', transportScopes: ['udp'], expectedRevision: '1',
   }, expect.any(String)))
@@ -75,31 +75,31 @@ it('preserves independent UDP selection and its own revision', async () => {
 it('requires applied group readback before selecting and verifies publication after an edit', async () => {
   const { api } = await mount('shared_tcp_udp', [], { revision: 2, appliedRevision: 1, observedRevision: 1 }, 'admin')
   expect(container!.querySelector<HTMLButtonElement>('.node-card')!.disabled).toBe(true)
-  expect(container!.textContent).toContain('Group configuration is not applied')
+  expect(container!.textContent).toContain('组配置尚未应用')
   const current = (await api.outboundGroups())[0]!
   api.outboundGroups.mockResolvedValue([{ ...current, appliedRevision: 2, observedRevision: 2 }])
-  const apply = container!.querySelector<HTMLButtonElement>('[aria-label="Apply configuration for Scoped group"]')!
+  const apply = container!.querySelector<HTMLButtonElement>('[aria-label="应用组配置：Scoped group"]')!
   expect(apply.disabled).toBe(false)
   apply.click()
   await vi.waitFor(() => expect(api.applyOutboundGroup).toHaveBeenCalledWith('g1', 2, expect.any(String)))
-  await vi.waitFor(() => expect(container!.textContent).toContain('Group configuration revision 2 applied and observed'))
+  await vi.waitFor(() => expect(container!.textContent).toContain('组配置版本 2 已在网关上应用并观测确认'))
   expect(container!.querySelector<HTMLButtonElement>('.node-card')!.disabled).toBe(false)
   expect(api.setSelection).not.toHaveBeenCalled()
 })
 
 it('does not claim group publication when operation succeeds but readback remains old', async () => {
   const { api } = await mount('shared_tcp_udp', [], { revision: 2, appliedRevision: 1, observedRevision: 1 }, 'admin')
-  container!.querySelector<HTMLButtonElement>('[aria-label="Apply configuration for Scoped group"]')!.click()
+  container!.querySelector<HTMLButtonElement>('[aria-label="应用组配置：Scoped group"]')!.click()
   await vi.waitFor(() => expect(api.applyOutboundGroup).toHaveBeenCalledTimes(1))
-  await vi.waitFor(() => expect(container!.textContent).toContain('readback has not confirmed the requested revision'))
+  await vi.waitFor(() => expect(container!.textContent).toContain('回读尚未确认请求版本'))
   expect(container!.querySelector<HTMLButtonElement>('.node-card')!.disabled).toBe(true)
 })
 
 it('keeps applying saved group configuration restricted to administrators', async () => {
   const { api, state } = await mount('shared_tcp_udp', [], { revision: 2, appliedRevision: 1, observedRevision: 1 })
-  const apply = container!.querySelector<HTMLButtonElement>('[aria-label="Apply configuration for Scoped group"]')!
+  const apply = container!.querySelector<HTMLButtonElement>('[aria-label="应用组配置：Scoped group"]')!
   expect(apply.disabled).toBe(true)
-  expect(apply.title).toBe('An administrator session is required to apply group configuration.')
+  expect(apply.title).toBe('应用组配置需要管理员会话。')
   apply.click()
   expect(api.applyOutboundGroup).not.toHaveBeenCalled()
   state.session.value = { subject: 'admin', roles: ['admin'] }
@@ -108,14 +108,14 @@ it('keeps applying saved group configuration restricted to administrators', asyn
 
 it('discards mismatched probe targets and hides a previous successful measurement during failure', async () => {
   const { api } = await mount()
-  const node = container!.querySelector<HTMLButtonElement>('[aria-label="Test node Node one from gateway for Scoped group"]')!
+  const node = container!.querySelector<HTMLButtonElement>('[aria-label="测试节点 Node one（从网关测试），用于 Scoped group"]')!
   node.click()
-  await vi.waitFor(() => expect(container!.textContent).toContain('12 ms gateway measurement'))
+  await vi.waitFor(() => expect(container!.textContent).toContain('12 毫秒（网关测量）'))
   api.gatewayProbeNode.mockResolvedValueOnce({ gateway_id: 'other', gateway_name: 'Wrong gateway', target_kind: 'node', target_id: 'n1', observed_at: '2026-10-08T08:01:00Z', probe: { target: 'n1', ok: true, latency_ms: 1, observed_at: '2026-10-08T08:01:00Z' } })
   node.click()
-  await vi.waitFor(() => expect(container!.textContent).toContain('Gateway probe returned a different target'))
-  expect(container!.textContent).not.toContain('12 ms gateway measurement')
-  expect(container!.textContent).not.toContain('1 ms gateway measurement')
+  await vi.waitFor(() => expect(container!.textContent).toContain('网关探测返回了不同的目标'))
+  expect(container!.textContent).not.toContain('12 毫秒（网关测量）')
+  expect(container!.textContent).not.toContain('1 毫秒（网关测量）')
 })
 
 
@@ -135,5 +135,5 @@ it('expands readback when shared transports disagree instead of hiding the misma
   ])
   await vi.waitFor(() => expect(container!.querySelector<HTMLDetailsElement>('.readback-details')!.open).toBe(true))
   expect(container!.querySelector('.readback-details summary')?.textContent).toContain('需要检查回读')
-  expect(container!.textContent).toContain('TCP / UDP differ')
+  expect(container!.textContent).toContain('TCP / UDP 不一致')
 })

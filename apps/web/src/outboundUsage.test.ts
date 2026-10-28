@@ -16,7 +16,7 @@ describe('outbound references', () => {
     const refs = outboundUsage('exit1', [{ id: 'p1', mandatory: [{ id: 'r1', enabled: false, action: { kind: 'outbound_group', outbound_group_id: 'exit1' } }], exceptions: [{ id: 'r2', action: { kind: 'direct', outbound_group_id: 'exit1' } }], rules: [{ id: 'r3', name: 'exit1', action: { kind: 'block' } }] }], [], [{ id: 'g1', name: 'Disabled group', policyId: 'p1', enabled: false, gatewayId: 'gw1' }])
     expect(refs).toHaveLength(2)
     expect(refs.every(ref => ref.disabled)).toBe(true)
-    expect(refs.find(ref => ref.kind === 'policy')?.detail).toBe('Mandatory rule: r1')
+    expect(refs.find(ref => ref.kind === 'policy')?.detail).toBe('强制规则: r1')
   })
 
   it('makes encoded links round-trip without letting identifiers choose a page', () => {

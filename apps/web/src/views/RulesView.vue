@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { uiLabel } from '../localization'
+import DiagnosticMessage from '../components/DiagnosticMessage.vue'
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import StatusPill from '../components/StatusPill.vue'
 import InventoryPlanPanel from '../components/InventoryPlanPanel.vue'
@@ -61,10 +63,10 @@ const explanation = ref<Explanation>()
 const context = ref({ gatewayId: '', sourceIP: '192.0.2.10', transports: ['tcp'] as Transport[], supportsIPv6: false, distinguishesNetworks: false, domainSets: '' })
 const packet = ref<Packet>({ source_ip: '192.0.2.10', destination_ip: '203.0.113.80', destination_port: 443, transport: 'tcp', family: 'ipv4', domain: 'example.com' })
 const actions: ActionKind[] = ['direct', 'proxy', 'block', 'outbound_group']
-const policyActions: Array<{ key: ActionField; label: string }> = [{ key: 'default_action', label: 'Default action' }, { key: 'unknown_domain_action', label: 'Unknown domain action' }, { key: 'proxy_failure_action', label: 'Proxy failure action' }]
+const policyActions: Array<{ key: ActionField; label: string }> = [{ key: 'default_action', label: '默认动作' }, { key: 'unknown_domain_action', label: '未知域名动作' }, { key: 'proxy_failure_action', label: '代理失败动作' }]
 const listMatches: Array<{ key: 'domain_exact' | 'domain_suffix' | 'domain_sets' | 'destination_cidrs'; label: string; placeholder: string }> = [
-  { key: 'domain_exact', label: 'Exact domains', placeholder: 'example.com' }, { key: 'domain_suffix', label: 'Domain suffixes', placeholder: 'example.com, media.example' },
-  { key: 'domain_sets', label: 'Domain set IDs', placeholder: 'streaming-domains' }, { key: 'destination_cidrs', label: 'Destination CIDRs', placeholder: '192.0.2.0/24' },
+  { key: 'domain_exact', label: '精确域名', placeholder: 'example.com' }, { key: 'domain_suffix', label: '域名后缀', placeholder: 'example.com, media.example' },
+  { key: 'domain_sets', label: '域名集 ID', placeholder: 'streaming-domains' }, { key: 'destination_cidrs', label: '目标 CIDR 网段', placeholder: '192.0.2.0/24' },
 ]
 const entries = computed<Entry[]>(() => !draft.value ? [] : phase.value === 'entries' ? draft.value.entries ?? [] : (draft.value[phase.value] ?? []).map((rule) => ({ rule })))
 const activeEntry = computed(() => entries.value[selectedIndex.value])
@@ -73,8 +75,8 @@ const busy = computed(() => loading.value || saving.value || deleting.value || !
 const storedSelection = computed(() => editingMode.value === 'policy' ? policies.value.find((policy) => policy.id === selectedId.value) : ruleSets.value.find((set) => set.id === selectedId.value))
 const referencingPolicies = computed(() => editingMode.value === 'rule_set' ? policies.value.filter((policy) => policy.entries?.some((entry) => entry.rule_set_id?.trim() === selectedId.value) || policy.rule_set_ids?.some((id) => id.trim() === selectedId.value)) : [])
 const deleteBlockedReason = computed(() => {
-  if (referencingPolicies.value.length) return `Cannot delete this rule set while referenced by ${referencingPolicies.value.length === 1 ? 'policy' : 'policies'}: ${referencingPolicies.value.map((policy) => `${policy.name || policy.id} (${policy.id})`).join(', ')}.`
-  if (!Number.isInteger(draft.value?.revision) || (draft.value?.revision ?? 0) < 1) return 'Reload this document to obtain its current revision before deletion.'
+  if (referencingPolicies.value.length) return `此规则集仍被引用，无法删除。引用来源：策略: ${referencingPolicies.value.map((policy) => `${policy.name || policy.id} (${policy.id})`).join(', ')}.`
+  if (!Number.isInteger(draft.value?.revision) || (draft.value?.revision ?? 0) < 1) return '删除前请重新读取此文档以获取当前版本。'
   return ''
 })
 const canPreview = computed(() => props.state.canOperate.value && props.state.capabilities.value['policy.validate'] === true)
@@ -117,11 +119,11 @@ function normalizePolicy(policy: Policy): Policy {
   delete next.mandatory; delete next.strict_mode
   return next
 }
-function actionLabel(action?: Action): string { return action?.kind === 'outbound_group' ? `outbound group: ${action.outbound_group_id || 'unset'}` : action?.kind || 'policy default' }
+function actionLabel(action?: Action): string { return action?.kind === 'outbound_group' ? `代理组：${action.outbound_group_id || '未设置'}` : action?.kind ? uiLabel(action.kind) : '策略默认值' }
 function actionOptions(field: ActionField): ActionKind[] { return field === 'proxy_failure_action' ? ['block'] : actions }
 function errorMessage(cause: unknown): string {
-  if (cause instanceof ControllerApiError && (cause.status === 409 || cause.status === 412)) return `${cause.message}. Reload this document to review the latest revision before saving again.`
-  return cause instanceof Error ? cause.message : 'The controller request failed.'
+  if (cause instanceof ControllerApiError && (cause.status === 409 || cause.status === 412)) return `${cause.message}。再次保存前，请重新读取文档并检查最新版本。`
+  return cause instanceof Error ? cause.message : '控制器请求失败。'
 }
 function invalidatePreview() { preview.value = undefined; explanation.value = undefined; explainSequence++; compileSequence++ }
 watch([draftSignature, rulesetSignature], invalidatePreview, { flush: 'sync' })
@@ -188,7 +190,7 @@ async function reloadSelected() {
       const items = await props.state.api.ruleSetDocuments<RuleSet>()
       if (sequence !== loadSequence || !viewActive) return
       const item = items.find((set) => set.id === id)
-      if (!item) throw new Error('The rule set no longer exists in the controller.')
+      if (!item) throw new Error('此规则集已不在控制器中。')
       ruleSets.value = items; editRuleSet(item)
     } else {
       const item = await props.state.api.policy<Policy>(id)
@@ -206,12 +208,12 @@ function selectLinkedRule(ruleId?: string) {
     const index = rules.findIndex((rule) => rule?.id === ruleId)
     if (index >= 0) { phase.value = item; selectedIndex.value = index; return }
   }
-  error.value = `Rule ${ruleId} no longer exists in this document. The latest document is shown.`
+  error.value = `规则 ${ruleId} 已不在此文档中，现显示最新文档。`
 }
 async function openNavigationTarget(target: NavigationTarget) {
   if (target.page !== 'rules' || !target.id || (target.resource !== 'policy' && target.resource !== 'rule_set')) return
   if (saving.value || deleting.value || deleteTarget.value?.accepted) {
-    error.value = 'Finish the current save or deletion readback before opening another document.'
+    error.value = '请先完成当前保存或删除回读，再打开其他文档。'
     return
   }
   if (!documentsLoaded) { await load(); return }
@@ -227,7 +229,7 @@ async function openNavigationTarget(target: NavigationTarget) {
       const items = await props.state.api.ruleSetDocuments<RuleSet>()
       if (sequence !== loadSequence || !viewActive) return
       const item = items.find((set) => set.id === target.id)
-      if (!item) throw new Error('The linked rule set no longer exists in the controller.')
+      if (!item) throw new Error('链接的规则集已不在控制器中。')
       ruleSets.value = items; editRuleSet(item)
     }
     selectLinkedRule(target.ruleId)
@@ -239,17 +241,17 @@ function confirmDelete() {
   deleteAcknowledged.value = false; error.value = ''; notice.value = ''
 }
 function deletionError(cause: unknown): string {
-  if (!(cause instanceof ControllerApiError)) return cause instanceof Error ? cause.message : 'The controller request failed.'
+  if (!(cause instanceof ControllerApiError)) return cause instanceof Error ? cause.message : '控制器请求失败。'
   const message = `${cause.code ? `[${cause.code}] ` : ''}${cause.message}`
-  if (cause.code === 'resource_referenced') return `${message}. Remove or reassign the reference, then refresh before deleting.`
-  if (cause.status === 409 || cause.status === 412) return `${message}. Reload this document and confirm its latest revision before deleting.`
+  if (cause.code === 'resource_referenced') return `${message}。删除前请移除或重新分配引用，然后刷新。`
+  if (cause.status === 409 || cause.status === 412) return `${message}。删除前请重新读取文档并确认最新版本。`
   return message
 }
 async function deleteSelected() {
   const target = deleteTarget.value
   if (!target || !deleteAcknowledged.value || loading.value || saving.value || deleting.value) return
-  if (!target.accepted && !props.state.isAdministrator.value) { error.value = 'An administrator session is required to delete policies and rule sets.'; return }
-  if (!Number.isInteger(target.revision) || target.revision < 1) { error.value = 'Reload this document before deleting.'; return }
+  if (!target.accepted && !props.state.isAdministrator.value) { error.value = '删除策略和规则集需要管理员会话。'; return }
+  if (!Number.isInteger(target.revision) || target.revision < 1) { error.value = '删除前请重新读取此文档。'; return }
   deleting.value = true; error.value = ''; notice.value = ''
   invalidatePreview()
   try {
@@ -259,15 +261,15 @@ async function deleteSelected() {
       target.accepted = true
     }
     const [policyItems, setItems] = await Promise.all([props.state.api.policyDocuments<Policy>(), props.state.api.ruleSetDocuments<RuleSet>()])
-    if ((target.mode === 'policy' ? policyItems : setItems).some((item) => item.id === target.id)) throw new Error('The deleted document is still present in controller readback.')
+    if ((target.mode === 'policy' ? policyItems : setItems).some((item) => item.id === target.id)) throw new Error('控制器回读中仍存在已删除的文档。')
     policies.value = policyItems; ruleSets.value = setItems
     deleteTarget.value = undefined; deleteAcknowledged.value = false
     selectedId.value = ''; draft.value = undefined
     if (policyItems[0]) editPolicy(policyItems[0])
     else if (setItems[0]) editRuleSet(setItems[0])
-    notice.value = `${target.mode === 'policy' ? 'Policy' : 'Rule set'} “${target.name}” deleted and absence confirmed by controller readback.`
+    notice.value = `${target.mode === 'policy' ? '策略' : '规则集'} “${target.name}”已删除，控制器回读已确认其不存在。`
   } catch (cause) {
-    error.value = `${target.accepted ? 'Deletion was accepted, but readback has not confirmed removal. Select Verify deletion to retry readback. ' : ''}${deletionError(cause)}`
+    error.value = `${target.accepted ? '删除请求已受理，但回读尚未确认移除。请选择“验证删除”重试回读。' : ''}${deletionError(cause)}`
     if (!target.accepted) { deleteTarget.value = undefined; deleteAcknowledged.value = false }
   } finally { deleting.value = false }
 }
@@ -305,30 +307,30 @@ function updatePorts(event: Event) {
   for (const token of csv(value)) {
     const match = /^(\d+)(?:-(\d+))?$/.exec(token)
     const from = Number(match?.[1]); const to = Number(match?.[2] ?? match?.[1])
-    if (!match || from < 1 || to < from || to > 65535) { portsError.value = `Invalid port range "${token}". Use ports 1–65535, for example 443 or 1000-1100.`; error.value = portsError.value; invalidatePreview(); return }
+    if (!match || from < 1 || to < from || to > 65535) { portsError.value = `无效的端口范围“${token}”。请使用 1–65535 的端口，例如 443 或 1000-1100。`; error.value = portsError.value; invalidatePreview(); return }
     result.push({ from, to })
   }
   activeRule.value.match.destination_ports = result; portsError.value = ''; error.value = ''
 }
 function validateDraft(requireRevision = false): Policy {
-  if (!draft.value) throw new Error('Create or select a policy or rule set first.')
+  if (!draft.value) throw new Error('请先创建或选择策略或规则集。')
   if (portsError.value) throw new Error(portsError.value)
   const item = clone(draft.value)
-  if (!item.name?.trim()) throw new Error(`${editingMode.value === 'rule_set' ? 'A rule set' : 'A policy'} name is required.`)
-  if (item.entries?.length && (item.rules?.length || item.rule_set_ids?.length)) throw new Error('This stored policy combines entries with rules or rule_set_ids. The controller rejects this ambiguous order; create a new policy with one ordered representation.')
-  if (requireRevision && selectedId.value && (!Number.isInteger(item.revision) || (item.revision ?? 0) < 1)) throw new Error('The controller did not supply a revision. Reload this policy before saving.')
+  if (!item.name?.trim()) throw new Error(`${editingMode.value === 'rule_set' ? '规则集' : '策略'}名称不能为空。`)
+  if (item.entries?.length && (item.rules?.length || item.rule_set_ids?.length)) throw new Error('此持久化策略同时使用 entries 与 rules 或 rule_set_ids，规则顺序存在歧义，控制器将拒绝。请使用单一有序表示创建新策略。')
+  if (requireRevision && selectedId.value && (!Number.isInteger(item.revision) || (item.revision ?? 0) < 1)) throw new Error('控制器未提供版本。保存前请重新读取此策略。')
   const allRules = [...(item.mandatory_rules ?? []), ...(item.exceptions ?? []), ...(item.entries ?? []).flatMap((entry) => entry.rule ? [entry.rule] : [])]
-  if (allRules.some((rule) => !rule.id.trim())) throw new Error('Every rule requires an ID.')
-  if ((item.entries ?? []).some((entry) => !entry.rule && !entry.rule_set_id)) throw new Error('Select a rule set for every rule-set entry.')
+  if (allRules.some((rule) => !rule.id.trim())) throw new Error('每条规则都必须有 ID。')
+  if ((item.entries ?? []).some((entry) => !entry.rule && !entry.rule_set_id)) throw new Error('请为每个规则集条目选择一个规则集。')
   for (const action of [item.default_action, item.unknown_domain_action, item.proxy_failure_action, ...allRules.map((rule) => rule.action)]) {
-    if (action?.kind === 'outbound_group' && !action.outbound_group_id?.trim()) throw new Error('Every outbound-group action requires an outbound group ID.')
+    if (action?.kind === 'outbound_group' && !action.outbound_group_id?.trim()) throw new Error('每个代理组动作都必须指定代理组 ID。')
   }
   return item
 }
 async function save() {
   if (editingMode.value === 'rule_set') { await saveRuleSet(); return }
   error.value = ''; notice.value = ''
-  if (!props.state.isAdministrator.value) { error.value = 'An administrator session is required to save policies.'; return }
+  if (!props.state.isAdministrator.value) { error.value = '保存策略需要管理员会话。'; return }
   saving.value = true
   let accepted = false
   try {
@@ -340,17 +342,17 @@ async function save() {
     const readback = await props.state.api.policy<Policy>(result.id)
     policies.value = [...policies.value.filter((policy) => policy.id !== readback.id), readback]
     draft.value = normalizePolicy(readback)
-    notice.value = `Policy revision ${readback.revision ?? 'unknown'} saved and read back. Gateway deployment requires a separate apply operation.`
-  } catch (cause) { error.value = `${accepted ? 'The save was accepted, but readback failed. Reload before editing again. ' : ''}${errorMessage(cause)}` } finally { saving.value = false }
+    notice.value = `策略版本 ${readback.revision ?? 'unknown'} 已保存并回读。部署到网关需单独应用。`
+  } catch (cause) { error.value = `${accepted ? '保存请求已受理，但回读失败。再次编辑前请重新读取。' : ''}${errorMessage(cause)}` } finally { saving.value = false }
 }
 async function saveRuleSet() {
   error.value = ''; notice.value = ''
-  if (!props.state.isAdministrator.value) { error.value = 'An administrator session is required to save rule sets.'; return }
+  if (!props.state.isAdministrator.value) { error.value = '保存规则集需要管理员会话。'; return }
   saving.value = true
   let accepted = false
   try {
     const item = validateDraft(true)
-    if (item.entries?.some((entry) => !entry.rule)) throw new Error('Reusable rule sets contain typed rules only; nested rule-set references are unsupported.')
+    if (item.entries?.some((entry) => !entry.rule)) throw new Error('可复用规则集只能包含类型化规则，不支持嵌套规则集引用。')
     const payload: RuleSet = { id: item.id, name: item.name?.trim(), revision: item.revision, rules: (item.entries ?? []).flatMap((entry, index) => entry.rule ? [{ ...entry.rule, order: index + 1 }] : []) }
     const result = selectedId.value ? await props.state.api.updateRuleSet<RuleSet>(selectedId.value, payload, item.revision!) : await props.state.api.createRuleSet<RuleSet>(payload)
     accepted = true
@@ -358,26 +360,26 @@ async function saveRuleSet() {
     draft.value = { id: result.id, name: result.name, revision: result.revision, entries: (result.rules ?? []).map((rule) => ({ rule })), default_action: { kind: 'direct' } }
     const items = await props.state.api.ruleSetDocuments<RuleSet>()
     const readback = items.find((set) => set.id === result.id)
-    if (!readback) throw new Error('The saved rule set was absent from controller readback.')
+    if (!readback) throw new Error('控制器回读中不存在已保存的规则集。')
     ruleSets.value = items
     editRuleSet(readback)
-    notice.value = `Rule set revision ${readback.revision ?? 'unknown'} saved and read back. Referencing policies use these rules when next compiled.`
-  } catch (cause) { error.value = `${accepted ? 'The save was accepted, but readback failed. Reload before editing again. ' : ''}${errorMessage(cause)}` } finally { saving.value = false }
+    notice.value = `规则集版本 ${readback.revision ?? 'unknown'} 已保存并回读。引用此规则集的策略将在下次编译时使用这些规则。`
+  } catch (cause) { error.value = `${accepted ? '保存请求已受理，但回读失败。再次编辑前请重新读取。' : ''}${errorMessage(cause)}` } finally { saving.value = false }
 }
 async function compile() {
   if (editingMode.value !== 'policy') return
-  if (!canPreview.value) { error.value = 'An operator session and the controller policy validation capability are required for preview.'; return }
+  if (!canPreview.value) { error.value = '预览需要操作员会话，以及控制器的策略校验能力。'; return }
   compiling.value = true; error.value = ''; notice.value = ''; invalidatePreview()
   const signature = draftSignature.value
   let sequence = compileSequence
   try {
     const policy = validateDraft()
-    if (!context.value.gatewayId.trim()) throw new Error('Enter the gateway ID used by this simulation.')
-    if (!context.value.sourceIP.trim()) throw new Error('Enter a source IP for the simulated device.')
-    if (!context.value.transports.length) throw new Error('Select at least one supported gateway transport.')
+    if (!context.value.gatewayId.trim()) throw new Error('请输入本次模拟使用的网关 ID。')
+    if (!context.value.sourceIP.trim()) throw new Error('请输入模拟设备的来源 IP。')
+    if (!context.value.transports.length) throw new Error('请至少选择一种网关支持的传输协议。')
     const domainSets = context.value.domainSets.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
       const separator = line.indexOf('=')
-      if (separator < 1 || !line.slice(separator + 1).trim()) throw new Error('Use one domain set per line: set-id=example.com, another.example')
+      if (separator < 1 || !line.slice(separator + 1).trim()) throw new Error('每行一个域名集，例如：set-id=example.com, another.example')
       return { id: line.slice(0, separator).trim(), domains: csv(line.slice(separator + 1)) }
     })
     const [currentOutbounds, currentRuleSets] = await Promise.all([props.state.api.outboundGroupDocuments<Outbound>(), props.state.api.ruleSetDocuments<RuleSet>()])
@@ -400,7 +402,7 @@ async function compile() {
     })
     if (signature !== draftSignature.value || sequence !== compileSequence || portsError.value) return
     preview.value = result
-    notice.value = 'Compiled the supplied simulation context. This result is a prediction of policy behavior.'
+    notice.value = '已编译指定的模拟上下文。这只是策略行为预测。'
   } catch (cause) { if (signature === draftSignature.value && sequence === compileSequence) error.value = errorMessage(cause) } finally { compiling.value = false }
 }
 async function explain() {
@@ -408,7 +410,7 @@ async function explain() {
   const sequence = ++explainSequence
   explaining.value = true; error.value = ''; explanation.value = undefined
   try {
-    if (!Number.isInteger(packet.value.destination_port) || packet.value.destination_port < 1 || packet.value.destination_port > 65535) throw new Error('Destination port must be an integer between 1 and 65535.')
+    if (!Number.isInteger(packet.value.destination_port) || packet.value.destination_port < 1 || packet.value.destination_port > 65535) throw new Error('目标端口必须是 1 至 65535 之间的整数。')
     const result = await props.state.api.explainPolicy<Explanation>(preview.value.manifest, clone(packet.value))
     if (sequence === explainSequence) explanation.value = result
   } catch (cause) { if (sequence === explainSequence) error.value = errorMessage(cause) } finally { explaining.value = false }
@@ -432,29 +434,29 @@ onUnmounted(() => { unsubscribeNavigation(); loadSequence++ })
 
 <template>
   <div class="page-grid">
-    <section class="page-heading"><div><p class="eyebrow">路由策略</p><h1>规则策略</h1><p class="lede">按顺序组织匹配条件与路由动作，在应用前预览策略与预计路径。</p></div><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">Refresh policies</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="newPolicy">New policy</button><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="newRuleSet">New rule set</button></div></section>
-    <p v-if="error" class="alert alert--bad" role="alert">{{ error }}</p><p v-if="notice" class="alert alert--good" role="status">{{ notice }}</p>
+    <section class="page-heading"><div><p class="eyebrow">路由策略</p><h1>规则策略</h1><p class="lede">按顺序组织匹配条件与路由动作，在应用前预览策略与预计路径。</p></div><div class="actions"><button class="button button--secondary" :disabled="busy" @click="load">刷新策略</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="newPolicy">新建策略</button><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="newRuleSet">新建规则集</button></div></section>
+    <p v-if="error" class="alert alert--bad" role="alert"><DiagnosticMessage :message="error" /></p><p v-if="notice" class="alert alert--good" role="status">{{ notice }}</p>
     <InventoryPlanPanel :state="state" />
     <div class="workspace">
-      <section class="panel"><div class="panel__heading"><h2>Policies</h2><span class="muted">{{ policies.length }}</span></div><p v-if="!policies.length" class="muted">{{ loading ? 'Loading policies…' : 'No policies configured.' }}</p><button v-for="policy in policies" :key="policy.id" class="policy-choice" :class="{ selected: editingMode === 'policy' && policy.id === selectedId }" :disabled="busy" @click="editPolicy(policy)"><strong>{{ policy.name || policy.id }}</strong><small>Revision {{ policy.revision ?? 'unknown' }} · {{ actionLabel(policy.default_action) }}</small></button><div class="panel__heading"><h2>Reusable rule sets</h2><span class="muted">{{ ruleSets.length }}</span></div><p v-if="!ruleSets.length" class="muted">No rule sets configured.</p><button v-for="set in ruleSets" :key="set.id" class="policy-choice" :class="{ selected: editingMode === 'rule_set' && set.id === selectedId }" :disabled="busy" @click="editRuleSet(set)"><strong>{{ set.name || set.id }}</strong><small>{{ set.rules?.length ?? 0 }} ordered rules · revision {{ set.revision ?? 'unknown' }}</small></button></section>
+      <section class="panel"><div class="panel__heading"><h2>策略清单</h2><span class="muted">{{ policies.length }}</span></div><p v-if="!policies.length" class="muted">{{ loading ? '正在读取策略…' : '尚未配置策略。' }}</p><button v-for="policy in policies" :key="policy.id" class="policy-choice" :class="{ selected: editingMode === 'policy' && policy.id === selectedId }" :disabled="busy" @click="editPolicy(policy)"><strong>{{ policy.name || policy.id }}</strong><small>版本 {{ policy.revision ?? '未知' }} · {{ actionLabel(policy.default_action) }}</small></button><div class="panel__heading"><h2>可复用规则集</h2><span class="muted">{{ ruleSets.length }}</span></div><p v-if="!ruleSets.length" class="muted">尚未配置规则集。</p><button v-for="set in ruleSets" :key="set.id" class="policy-choice" :class="{ selected: editingMode === 'rule_set' && set.id === selectedId }" :disabled="busy" @click="editRuleSet(set)"><strong>{{ set.name || set.id }}</strong><small>{{ set.rules?.length ?? 0 }} 条有序规则 · 版本 {{ set.revision ?? '未知' }}</small></button></section>
       <div v-if="draft" class="editor-column">
-        <section class="panel"><div class="panel__heading"><h2>{{ selectedId ? 'Edit' : 'Create' }} {{ editingMode === 'rule_set' ? 'rule set' : 'policy' }}</h2><div class="actions"><button v-if="selectedId" class="button button--secondary" :disabled="busy" @click="reloadSelected">Reload {{ editingMode === 'rule_set' ? 'rule set' : 'policy' }}</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="save">{{ saving ? 'Saving…' : editingMode === 'rule_set' ? 'Save rule set' : 'Save policy' }}</button><button v-if="selectedId && state.isAdministrator.value" class="button button--danger" :disabled="busy || !!deleteBlockedReason" :title="deleteBlockedReason || undefined" @click="confirmDelete">Delete {{ editingMode === 'rule_set' ? 'rule set' : 'policy' }}</button></div></div><fieldset :disabled="busy || !state.isAdministrator.value" class="form-grid"><label>{{ editingMode === 'rule_set' ? 'Rule set name' : 'Policy name' }}<input v-model="draft.name" autocomplete="off" required /></label><label v-if="editingMode === 'policy'" class="check-field"><input v-model="draft.strict" type="checkbox" />Strict mode</label><template v-for="field in editingMode === 'policy' ? policyActions : []" :key="field.key"><label>{{ field.label }}<select :value="draft[field.key]?.kind ?? ''" @change="setAction(field.key, ($event.target as HTMLSelectElement).value)"><option v-if="field.key === 'unknown_domain_action'" value="">Use policy default</option><option v-if="field.key === 'proxy_failure_action'" value="" disabled>Use block default</option><option v-if="field.key === 'proxy_failure_action' && draft[field.key]?.kind && draft[field.key]?.kind !== 'block'" :value="draft[field.key]?.kind" disabled>{{ draft[field.key]?.kind }} (invalid failure action)</option><option v-for="action in actionOptions(field.key)" :key="action" :value="action">{{ action }}</option></select></label><label v-if="draft[field.key]?.kind === 'outbound_group'">{{ field.label }} group ID<input v-model="draft[field.key]!.outbound_group_id" /></label></template></fieldset><p class="muted">{{ selectedId ? `Editing revision ${draft.revision ?? 'unknown'}. Saves reject concurrent changes.` : 'The controller assigns an ID and revision when this document is created.' }}</p><p v-if="editingMode === 'rule_set'" class="muted">Reusable rule sets contain ordered match/action rules. If no rule matches, evaluation continues with the next policy entry. Compile and explain by referencing this set from a policy.</p><p v-if="draft.raw_config_override" class="alert alert--warn">This policy contains a raw configuration override. The typed editor preserves it; compilation applies the controller’s safety checks.</p></section>
+        <section class="panel"><div class="panel__heading"><h2>{{ selectedId ? '编辑' : '创建' }} {{ editingMode === 'rule_set' ? '规则集' : '策略' }}</h2><div class="actions"><button v-if="selectedId" class="button button--secondary" :disabled="busy" @click="reloadSelected">重新读取{{ editingMode === 'rule_set' ? '规则集' : '策略' }}</button><button class="button" :disabled="busy || !state.isAdministrator.value" @click="save">{{ saving ? '正在保存…' : editingMode === 'rule_set' ? '保存规则集' : '保存策略' }}</button><button v-if="selectedId && state.isAdministrator.value" class="button button--danger" :disabled="busy || !!deleteBlockedReason" :title="deleteBlockedReason || undefined" @click="confirmDelete">删除{{ editingMode === 'rule_set' ? '规则集' : '策略' }}</button></div></div><fieldset :disabled="busy || !state.isAdministrator.value" class="form-grid"><label>{{ editingMode === 'rule_set' ? '规则集名称' : '策略名称' }}<input v-model="draft.name" autocomplete="off" required /></label><label v-if="editingMode === 'policy'" class="check-field"><input v-model="draft.strict" type="checkbox" />严格模式</label><template v-for="field in editingMode === 'policy' ? policyActions : []" :key="field.key"><label>{{ field.label }}<select :value="draft[field.key]?.kind ?? ''" @change="setAction(field.key, ($event.target as HTMLSelectElement).value)"><option v-if="field.key === 'unknown_domain_action'" value="">使用策略默认值</option><option v-if="field.key === 'proxy_failure_action'" value="" disabled>默认阻断</option><option v-if="field.key === 'proxy_failure_action' && draft[field.key]?.kind && draft[field.key]?.kind !== 'block'" :value="draft[field.key]?.kind" disabled>{{ uiLabel(draft[field.key]?.kind) }}（无效的失败动作）</option><option v-for="action in actionOptions(field.key)" :key="action" :value="action">{{ uiLabel(action) }}</option></select></label><label v-if="draft[field.key]?.kind === 'outbound_group'">{{ field.label }}的组 ID<input v-model="draft[field.key]!.outbound_group_id" /></label></template></fieldset><p class="muted">{{ selectedId ? `正在编辑版本 ${draft.revision ?? '未知'}。保存时会拒绝并发变更。` : '控制器将在创建文档时分配 ID 和版本。' }}</p><p v-if="editingMode === 'rule_set'" class="muted">可复用规则集包含有序的匹配条件和动作。没有规则命中时，继续匹配下一策略条目。在策略中引用此规则集后即可编译和解释路径。</p><p v-if="draft.raw_config_override" class="alert alert--warn">此策略包含原始配置覆盖项。类型化编辑器会保留这些内容；编译时仍执行控制器的安全检查。</p></section>
         <p v-if="selectedId && state.isAdministrator.value && deleteBlockedReason" class="muted">{{ deleteBlockedReason }}</p>
         <form v-if="deleteTarget && (state.isAdministrator.value || deleteTarget.accepted || deleting)" class="panel" @submit.prevent="deleteSelected">
-          <h2>Delete {{ deleteTarget.mode === 'rule_set' ? 'rule set' : 'policy' }} “{{ deleteTarget.name }}”?</h2>
-          <p class="muted">This removes the saved document {{ deleteTarget.id }} at revision {{ deleteTarget.revision }}. The controller rejects deletion if this document is referenced or changed.</p>
-          <label class="check-field"><input v-model="deleteAcknowledged" :disabled="deleting || deleteTarget.accepted" type="checkbox" required />I confirm deletion of {{ deleteTarget.name }} ({{ deleteTarget.id }}).</label>
-          <div class="actions"><button class="button button--danger" type="submit" :disabled="deleting || !deleteAcknowledged">{{ deleting ? 'Verifying deletion…' : deleteTarget.accepted ? 'Verify deletion' : `Confirm delete ${deleteTarget.mode === 'rule_set' ? 'rule set' : 'policy'}` }}</button><button class="button button--secondary" type="button" :disabled="deleting || deleteTarget.accepted" @click="deleteTarget = undefined; deleteAcknowledged = false">Cancel deletion</button></div>
+          <h2>删除{{ deleteTarget.mode === 'rule_set' ? '规则集' : '策略' }}“{{ deleteTarget.name }}”？</h2>
+          <p class="muted">此操作会删除文档 {{ deleteTarget.id }} 的版本 {{ deleteTarget.revision }}。文档被引用或已发生变化时，控制器将拒绝删除。</p>
+          <label class="check-field"><input v-model="deleteAcknowledged" :disabled="deleting || deleteTarget.accepted" type="checkbox" required />我确认删除 {{ deleteTarget.name }}（{{ deleteTarget.id }}）。</label>
+          <div class="actions"><button class="button button--danger" type="submit" :disabled="deleting || !deleteAcknowledged">{{ deleting ? '正在验证删除…' : deleteTarget.accepted ? '验证删除' : `确认删除${deleteTarget.mode === 'rule_set' ? '规则集' : '策略'}` }}</button><button class="button button--secondary" type="button" :disabled="deleting || deleteTarget.accepted" @click="deleteTarget = undefined; deleteAcknowledged = false">取消删除</button></div>
         </form>
-        <section class="panel"><div class="panel__heading"><h2>Ordered rules</h2><label v-if="editingMode === 'policy'">Evaluation phase<select v-model="phase" :disabled="busy"><option value="mandatory_rules">1. Mandatory rules</option><option value="exceptions">2. Policy exceptions</option><option value="entries">3. Policy rules and rule sets</option></select></label></div><p v-if="editingMode === 'policy'" class="muted">Mandatory rules run first, followed by policy and device exceptions, ordered policy entries, and the default action. Values within a match field are ORed; populated fields are ANDed. An empty match applies to all packets.</p><div class="actions"><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="addRule">Add rule</button><button v-if="editingMode === 'policy' && phase === 'entries'" class="button button--secondary" :disabled="busy || !ruleSets.length || !state.isAdministrator.value" @click="addRuleSet">Add rule set</button></div><p v-if="!entries.length" class="muted">No entries in this phase.</p><div v-for="(entry, index) in entries" :key="index" class="entry-row" :class="{ selected: selectedIndex === index }"><button class="entry-select" :disabled="busy" @click="selectedIndex = index"><span>{{ index + 1 }}.</span><span><strong>{{ entry.rule?.name || entry.rule?.id || `Rule set: ${entry.rule_set_id}` }}</strong><small v-if="entry.rule">{{ actionLabel(entry.rule.action) }} · {{ entry.rule.enabled ? 'enabled' : 'disabled' }}</small></span></button><button class="icon-button" :disabled="busy || index === 0 || !state.isAdministrator.value" :aria-label="`Move entry ${index + 1} up`" @click="moveEntry(index, -1)">↑</button><button class="icon-button" :disabled="busy || index === entries.length - 1 || !state.isAdministrator.value" :aria-label="`Move entry ${index + 1} down`" @click="moveEntry(index, 1)">↓</button></div>
-          <fieldset v-if="activeRule" :disabled="busy || !state.isAdministrator.value" class="form-grid rule-fields"><label>Rule name<input v-model="activeRule.name" /></label><label>Rule ID<input v-model="activeRule.id" required /></label><label class="check-field"><input v-model="activeRule.enabled" type="checkbox" />Rule enabled</label><label>Rule action<select :value="activeRule.action.kind" @change="setRuleAction(($event.target as HTMLSelectElement).value as ActionKind)"><option v-for="action in actions" :key="action" :value="action">{{ action }}</option></select></label><label v-if="activeRule.action.kind === 'outbound_group'">Rule outbound group ID<input v-model="activeRule.action.outbound_group_id" /></label><label v-for="field in listMatches" :key="field.key">{{ field.label }}<input :value="activeRule.match[field.key]?.join(', ')" :placeholder="field.placeholder" @change="activeRule.match[field.key] = csv(($event.target as HTMLInputElement).value)" /></label><label>Destination ports<input :value="activeRule.match.destination_ports?.map((port) => !port.to || port.from === port.to ? String(port.from) : `${port.from}-${port.to}`).join(', ')" placeholder="443, 1000-1100" @change="updatePorts" /></label><label>Rule transports<select v-model="activeRule.match.transport" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select><small>No selection matches any transport.</small></label><label>Rule address families<select v-model="activeRule.match.address_families" multiple><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select><small>No selection matches either family.</small></label></fieldset>
-          <label v-else-if="activeEntry">Referenced rule set<select v-model="activeEntry.rule_set_id" :disabled="busy || !state.isAdministrator.value"><option v-for="set in ruleSets" :key="set.id" :value="set.id">{{ set.name || set.id }} ({{ set.rules?.length ?? 0 }} rules)</option></select></label><button v-if="activeEntry" class="button button--danger" :disabled="busy || !state.isAdministrator.value" @click="removeEntry">Remove selected entry</button>
+        <section class="panel"><div class="panel__heading"><h2>有序规则</h2><label v-if="editingMode === 'policy'">匹配阶段<select v-model="phase" :disabled="busy"><option value="mandatory_rules">1. 强制规则</option><option value="exceptions">2. 策略例外</option><option value="entries">3. 策略规则与规则集</option></select></label></div><p v-if="editingMode === 'policy'" class="muted">先执行强制规则，再依次执行策略例外、设备例外、有序策略条目和默认动作。同一匹配字段中的值满足任一即可，不同已填写字段必须同时匹配。空匹配条件适用于所有数据包。</p><div class="actions"><button class="button button--secondary" :disabled="busy || !state.isAdministrator.value" @click="addRule">添加规则</button><button v-if="editingMode === 'policy' && phase === 'entries'" class="button button--secondary" :disabled="busy || !ruleSets.length || !state.isAdministrator.value" @click="addRuleSet">添加规则集</button></div><p v-if="!entries.length" class="muted">此阶段暂无条目。</p><div v-for="(entry, index) in entries" :key="index" class="entry-row" :class="{ selected: selectedIndex === index }"><button class="entry-select" :disabled="busy" @click="selectedIndex = index"><span>{{ index + 1 }}.</span><span><strong>{{ entry.rule?.name || entry.rule?.id || `规则集：${entry.rule_set_id}` }}</strong><small v-if="entry.rule">{{ actionLabel(entry.rule.action) }} · {{ entry.rule.enabled ? '已启用' : '已禁用' }}</small></span></button><button class="icon-button" :disabled="busy || index === 0 || !state.isAdministrator.value" :aria-label="`移动条目 ${index + 1}上移`" @click="moveEntry(index, -1)">↑</button><button class="icon-button" :disabled="busy || index === entries.length - 1 || !state.isAdministrator.value" :aria-label="`移动条目 ${index + 1}下移`" @click="moveEntry(index, 1)">↓</button></div>
+          <fieldset v-if="activeRule" :disabled="busy || !state.isAdministrator.value" class="form-grid rule-fields"><label>规则名称<input v-model="activeRule.name" /></label><label>规则 ID<input v-model="activeRule.id" required /></label><label class="check-field"><input v-model="activeRule.enabled" type="checkbox" />启用规则</label><label>规则动作<select :value="activeRule.action.kind" @change="setRuleAction(($event.target as HTMLSelectElement).value as ActionKind)"><option v-for="action in actions" :key="action" :value="action">{{ uiLabel(action) }}</option></select></label><label v-if="activeRule.action.kind === 'outbound_group'">规则代理组 ID<input v-model="activeRule.action.outbound_group_id" /></label><label v-for="field in listMatches" :key="field.key">{{ field.label }}<input :value="activeRule.match[field.key]?.join(', ')" :placeholder="field.placeholder" @change="activeRule.match[field.key] = csv(($event.target as HTMLInputElement).value)" /></label><label>目标端口<input :value="activeRule.match.destination_ports?.map((port) => !port.to || port.from === port.to ? String(port.from) : `${port.from}-${port.to}`).join(', ')" placeholder="443, 1000-1100" @change="updatePorts" /></label><label>规则传输协议<select v-model="activeRule.match.transport" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select><small>未选择时匹配任意传输协议。</small></label><label>规则地址族<select v-model="activeRule.match.address_families" multiple><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select><small>未选择时匹配任意地址族。</small></label></fieldset>
+          <label v-else-if="activeEntry">引用的规则集<select v-model="activeEntry.rule_set_id" :disabled="busy || !state.isAdministrator.value"><option v-for="set in ruleSets" :key="set.id" :value="set.id">{{ set.name || set.id }}（{{ set.rules?.length ?? 0 }} 条规则）</option></select></label><button v-if="activeEntry" class="button button--danger" :disabled="busy || !state.isAdministrator.value" @click="removeEntry">移除所选条目</button>
         </section>
       </div>
-      <section v-else class="panel"><p class="muted">Select a policy or create one to begin.</p></section>
+      <section v-else class="panel"><p class="muted">选择或创建一个策略以开始编辑。</p></section>
     </div>
-    <section v-if="draft && editingMode === 'policy'" class="panel"><div class="panel__heading"><div><h2>Compile preview</h2><p class="muted">Simulate this draft with one device and the gateway capabilities you specify. Choose capabilities supported by your gateway.</p></div><button class="button" :disabled="busy || compiling || !canPreview" @click="compile">{{ compiling ? 'Compiling…' : 'Compile preview' }}</button></div><fieldset class="form-grid" :disabled="compiling || busy"><label>Simulation gateway ID<input v-model="context.gatewayId" required /></label><label>Simulation source IP<input v-model="context.sourceIP" required /></label><label>Supported gateway transports<select v-model="context.transports" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select></label><div class="checks"><label class="check-field"><input v-model="context.supportsIPv6" type="checkbox" />Gateway supports IPv6</label><label class="check-field"><input v-model="context.distinguishesNetworks" type="checkbox" />Gateway distinguishes source networks</label></div><label class="wide">Domain sets for simulation<textarea v-model="context.domainSets" rows="2" placeholder="streaming=example.com, media.example" /><small>One set-id=domain, domain per line. Referenced rule sets and outbound candidates are read from the controller.</small></label></fieldset><div v-if="preview" class="result"><StatusPill label="Compiler accepted" tone="good" /><p class="hash">Manifest {{ preview.manifest.content_hash }}</p><p class="muted">{{ preview.manifest.groups?.length ?? 0 }} compiled group(s). {{ preview.impact.changed_groups?.length ?? 0 }} groups changed against an empty baseline; this preview does not compare with a live deployment.</p><ul v-if="preview.diagnostics?.length"><li v-for="(diagnostic, index) in preview.diagnostics" :key="index">{{ diagnostic.severity }} · {{ diagnostic.code }}<span v-if="diagnostic.path"> · {{ diagnostic.path }}</span>: {{ diagnostic.message }}</li></ul><details><summary>Read-only generated manifest</summary><pre>{{ JSON.stringify(preview.manifest, null, 2) }}</pre></details></div></section>
-    <section v-if="draft && editingMode === 'policy'" class="panel"><div class="panel__heading"><div><h2>Explain a packet</h2><p class="muted">The prediction uses the last compiled snapshot, including its rule sets and outbound candidates. Recompile after external changes; editing this draft or context clears the snapshot.</p></div><button class="button" :disabled="!preview || explaining || busy || !canPreview" @click="explain">{{ explaining ? 'Explaining…' : 'Explain packet' }}</button></div><fieldset class="form-grid" :disabled="explaining"><label>Packet source IP<input v-model="packet.source_ip" /></label><label>Packet destination IP<input v-model="packet.destination_ip" /></label><label>Packet destination port<input v-model.number="packet.destination_port" type="number" min="1" max="65535" /></label><label>Packet transport<select v-model="packet.transport"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select></label><label>Packet family<select v-model="packet.family"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label><label>Packet domain<input v-model="packet.domain" placeholder="Optional; blank tests unknown-domain handling" /></label></fieldset><div v-if="explanation" class="result"><StatusPill :label="explanation.predicted ? `Predicted: ${actionLabel(explanation.action)}` : 'No prediction'" tone="warn" /><p>{{ explanation.reason }}</p><p v-if="explanation.matched_rule_id">Matched rule: {{ explanation.matched_rule_name || explanation.matched_rule_id }}</p><p v-if="explanation.device_group_id">Device group: {{ explanation.device_group_id }}</p><p v-if="explanation.candidates?.length">Candidates: {{ explanation.candidates.join(', ') }}</p><small class="muted">This is a compiler prediction; traffic observation is separate.</small></div></section>
+    <section v-if="draft && editingMode === 'policy'" class="panel"><div class="panel__heading"><div><h2>编译预览</h2><p class="muted">使用一台设备及指定的网关能力模拟此草稿。请选择网关实际支持的能力。</p></div><button class="button" :disabled="busy || compiling || !canPreview" @click="compile">{{ compiling ? '正在编译…' : '编译预览' }}</button></div><fieldset class="form-grid" :disabled="compiling || busy"><label>模拟网关 ID<input v-model="context.gatewayId" required /></label><label>模拟来源 IP<input v-model="context.sourceIP" required /></label><label>网关支持的传输协议<select v-model="context.transports" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select></label><div class="checks"><label class="check-field"><input v-model="context.supportsIPv6" type="checkbox" />网关支持 IPv6</label><label class="check-field"><input v-model="context.distinguishesNetworks" type="checkbox" />网关可区分来源网络</label></div><label class="wide">模拟使用的域名集<textarea v-model="context.domainSets" rows="2" placeholder="域名集格式：streaming=example.com, media.example" /><small>每行使用“集合标识=域名, 域名”格式。引用的规则集和候选代理节点由控制器读取。</small></label></fieldset><div v-if="preview" class="result"><StatusPill label="编译器已接受" tone="good" /><p class="hash">清单 {{ preview.manifest.content_hash }}</p><p class="muted">{{ preview.manifest.groups?.length ?? 0 }} 个已编译组。相对空基线有 {{ preview.impact.changed_groups?.length ?? 0 }} 个组发生变化；此预览不与实际部署比较。</p><ul v-if="preview.diagnostics?.length"><li v-for="(diagnostic, index) in preview.diagnostics" :key="index">{{ uiLabel(diagnostic.severity) }} · {{ diagnostic.code }}<span v-if="diagnostic.path"> · {{ diagnostic.path }}</span>: <DiagnosticMessage :message="diagnostic.message" :code="diagnostic.code" /></li></ul><details><summary>只读生成清单</summary><pre>{{ JSON.stringify(preview.manifest, null, 2) }}</pre></details></div></section>
+    <section v-if="draft && editingMode === 'policy'" class="panel"><div class="panel__heading"><div><h2>解释数据包路径</h2><p class="muted">预测使用最近一次编译快照，包括其中的规则集和候选代理节点。外部配置更改后请重新编译；编辑当前草稿或上下文会清除快照。</p></div><button class="button" :disabled="!preview || explaining || busy || !canPreview" @click="explain">{{ explaining ? '正在解释…' : '解释数据包路径' }}</button></div><fieldset class="form-grid" :disabled="explaining"><label>数据包来源 IP<input v-model="packet.source_ip" /></label><label>数据包目标 IP<input v-model="packet.destination_ip" /></label><label>数据包目标端口<input v-model.number="packet.destination_port" type="number" min="1" max="65535" /></label><label>数据包传输协议<select v-model="packet.transport"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select></label><label>数据包地址族<select v-model="packet.family"><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></label><label>数据包域名<input v-model="packet.domain" placeholder="可选；留空可测试未知域名的处理方式" /></label></fieldset><div v-if="explanation" class="result"><StatusPill :label="explanation.predicted ? `预测结果：${actionLabel(explanation.action)}` : '暂无预测'" tone="warn" /><p><DiagnosticMessage :message="explanation.reason" /></p><p v-if="explanation.matched_rule_id">命中规则：{{ explanation.matched_rule_name || explanation.matched_rule_id }}</p><p v-if="explanation.device_group_id">设备组：{{ explanation.device_group_id }}</p><p v-if="explanation.candidates?.length">候选节点：{{ explanation.candidates.join(', ') }}</p><small class="muted">这只是编译器预测；实际流量需单独观测。</small></div></section>
   </div>
 </template>
 

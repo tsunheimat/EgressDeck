@@ -22,6 +22,6 @@ describe('visibleNavigation', () => {
 
   it('explains that a gateway must be registered when there is no selection', () => {
     const items = visibleNavigation([], undefined)
-    expect(items.find((item) => item.id === 'proxies')?.disabledReason).toBe('Register a gateway to inspect capabilities')
+    expect(items.find((item) => item.id === 'proxies')?.disabledReason).toBe('请先登记网关以检查能力')
   })
 })

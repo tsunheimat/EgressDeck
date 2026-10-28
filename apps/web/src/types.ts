@@ -205,6 +205,7 @@ export interface OperationSummary {
   createdAt: string
   updatedAt: string
   error?: string
+  enrollment?: { device_id: string; binding_id: string; plan_checksum: string; previous_operation_id?: string }
   views?: Partial<Record<StateKind, { generation: number; revision?: string; status?: string; at: string; data?: unknown }>>
 }
 
@@ -338,11 +339,31 @@ export interface InventoryPlan {
   }
   valid: boolean
   deployable: boolean
+  configuration_deployable?: boolean
+  enrollment_ready?: boolean
+  configuration_blockers?: InventoryPlanDiagnostic[] | null
+  enrollment_blockers?: InventoryPlanDiagnostic[] | null
+  complete_artifact?: {
+    format?: string
+    dae_base?: string
+    gateway_id: string
+    base_sha256?: string
+    routing_artifact_hash?: string
+    native_sha256: string
+    content_hash: string
+    base_revision: number
+    expected_generation: number
+    requires_guard: boolean
+    providers?: Array<{ provider_id: string; revision: number; content_hash: string; node_ids: string[] }> | null
+    groups?: Array<{ outbound_group_id: string; engine_name: string; provider_id: string; revision: number; applied_revision: number; observed_revision: number; candidate_ids: string[]; selected_node_id: string; tcp_revision: number; udp_revision: number }> | null
+  }
   diagnostics?: InventoryPlanDiagnostic[]
   blockers: InventoryPlanDiagnostic[] | null
   target: {
     gateway_id: string
     observation_status: string
+    generation?: number
+    next_policy_generation?: number
     capabilities: {
       implementation: string
       version: string

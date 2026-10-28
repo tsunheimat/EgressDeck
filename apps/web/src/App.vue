@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ControllerApi } from './api/client'
+import { installChineseValidation } from './formValidation'
 import { managementNavigation } from './navigation'
 import { navigationHref, readNavigationTarget, subscribeNavigationTarget, type PageName } from './navigationTarget'
 import { useControllerState } from './state'
@@ -15,6 +16,7 @@ import ProxiesView from './views/ProxiesView.vue'
 import RulesView from './views/RulesView.vue'
 import SubscriptionsView from './views/SubscriptionsView.vue'
 
+const uiBuild = __EGRESSDECK_UI_BUILD__
 const api = new ControllerApi()
 const state = useControllerState(api)
 const currentPage = ref(readNavigationTarget().page)
@@ -66,6 +68,7 @@ function sidebarKeys(event: KeyboardEvent) {
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
 }
 
+let stopValidation: (() => void) | undefined
 let abortController: AbortController | undefined
 let stopNavigation: (() => void) | undefined
 let media: MediaQueryList | undefined
@@ -78,6 +81,7 @@ watch([sidebarOpen, compact], async ([open, small]) => {
   if (open && small) { await nextTick(); sidebar.value?.querySelector<HTMLButtonElement>('.sidebar-close')?.focus() }
 })
 onMounted(() => {
+  if (mainContent.value) stopValidation = installChineseValidation(mainContent.value)
   previousOverflow = document.body.style.overflow
   media = window.matchMedia?.('(max-width: 960px)')
   syncViewport()
@@ -88,6 +92,7 @@ onMounted(() => {
   stopNavigation = subscribeNavigationTarget(target => { currentPage.value = target.page; closeSidebar() })
 })
 onUnmounted(() => {
+  stopValidation?.()
   abortController?.abort()
   stopNavigation?.()
   media?.removeEventListener('change', syncViewport)
@@ -128,7 +133,7 @@ onUnmounted(() => {
       </section>
       <footer class="sidebar__footer">
         <span class="footer-icon"><UiIcon name="shield" /></span>
-        <span><strong>EgressDeck</strong><small>{{ controllerLabel }}</small></span>
+        <span><strong>EgressDeck</strong><small>{{ controllerLabel }}</small><small class="ui-build" :title="uiBuild.sourceSha256" data-ui-build>界面版本 {{ uiBuild.sourceSha256.slice(0, 10) }}</small></span>
         <button class="ed-icon-button" :disabled="loading || authRequired" aria-label="刷新控制器状态" @click="state.load()"><UiIcon name="refresh" :size="17" /></button>
       </footer>
     </aside>

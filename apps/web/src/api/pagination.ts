@@ -4,9 +4,9 @@ export async function boundedListJSON(response: Response, signal?: AbortSignal):
   const length = response.headers.get('Content-Length')
   if (length && Number(length) > maxBytes) {
     await response.body?.cancel()
-    throw new Error('The collection page exceeds the 4 MiB browser response limit.')
+    throw new Error('集合页面超过浏览器 4 MiB 响应上限。')
   }
-  if (!response.body) throw new Error('The controller returned an empty collection response.')
+  if (!response.body) throw new Error('控制器返回了空的集合响应。')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let bytes = 0
@@ -22,7 +22,7 @@ export async function boundedListJSON(response: Response, signal?: AbortSignal):
       bytes += chunk.value.byteLength
       if (bytes > maxBytes) {
         await reader.cancel()
-        throw new Error('The collection page exceeds the 4 MiB browser response limit.')
+        throw new Error('集合页面超过浏览器 4 MiB 响应上限。')
       }
       text += decoder.decode(chunk.value, { stream: true })
     }

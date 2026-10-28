@@ -1,7 +1,10 @@
 <script setup lang="ts">
+import { uiLabel } from '../localization'
+import DiagnosticMessage from '../components/DiagnosticMessage.vue'
 import { computed, nextTick, onActivated, onUnmounted, reactive, ref } from 'vue'
 import { ControllerApiError, randomIdempotencyKey } from '../api/client'
 import StatusPill from '../components/StatusPill.vue'
+import EnrollmentPanel from '../components/EnrollmentPanel.vue'
 import { useControllerState } from '../state'
 import type { DeviceExceptionRule, DeviceGroupSummary, DeviceSummary, GatewaySummary, OutboundGroupSummary, PolicySummary } from '../types'
 import { readNavigationTarget, subscribeNavigationTarget } from '../navigationTarget'
@@ -23,7 +26,9 @@ const editingDevice = ref<DeviceSummary>()
 const editingGroup = ref<DeviceGroupSummary>()
 const deletingDevice = ref<DeviceSummary>()
 const deleteAcknowledged = ref(false)
-const deviceForm = reactive({ name: '', groupId: '', addresses: '' })
+const deviceForm = reactive({ name: '', groupId: '', addresses: '', provenance: 'manual' })
+const addressProvenance = ref<Record<string, string>>({})
+const existingAddresses = computed(() => editingDevice.value?.addresses.filter(address => deviceForm.addresses.split(/[\s,]+/).includes(address.address)) ?? [])
 interface ExceptionDraft { rule: DeviceExceptionRule; ports: string }
 const exceptionDrafts = ref<ExceptionDraft[]>([])
 const selectedExceptionIndex = ref(0)
@@ -31,10 +36,10 @@ const activeException = computed(() => exceptionDrafts.value[selectedExceptionIn
 let initialExceptions = ''
 const exceptionActions: DeviceExceptionRule['action']['kind'][] = ['direct', 'proxy', 'block', 'outbound_group']
 const exceptionListMatches = [
-  { key: 'domain_exact', label: 'Exception exact domains', placeholder: 'example.com' },
-  { key: 'domain_suffix', label: 'Exception domain suffixes', placeholder: 'example.com, media.example' },
-  { key: 'domain_sets', label: 'Exception domain set IDs', placeholder: 'streaming-domains' },
-  { key: 'destination_cidrs', label: 'Exception destination CIDRs', placeholder: '192.0.2.0/24' },
+  { key: 'domain_exact', label: '例外精确域名', placeholder: 'example.com' },
+  { key: 'domain_suffix', label: '例外域名后缀', placeholder: 'example.com, media.example' },
+  { key: 'domain_sets', label: '例外域名集 ID', placeholder: 'streaming-domains' },
+  { key: 'destination_cidrs', label: '例外目标 CIDR 网段', placeholder: '192.0.2.0/24' },
 ] as const
 const groupForm = reactive({ name: '', gatewayId: '', policyId: '', enabled: true })
 const linkedGroupId = ref<string>()
@@ -49,9 +54,9 @@ const stopNavigation = subscribeNavigationTarget(target => { if (target.page ===
 onUnmounted(stopNavigation)
 
 function failureMessage(cause: unknown): string {
-  const message = cause instanceof Error ? cause.message : 'The controller request failed'
+  const message = cause instanceof Error ? cause.message : '控制器请求失败'
   return cause instanceof ControllerApiError && (cause.status === 412 || cause.code === 'revision_conflict')
-    ? `${message}. Cancel editing and refresh to load the current revision before retrying.` : message
+    ? `${message}。请取消编辑并刷新当前版本后再重试。` : message
 }
 
 async function load() {
@@ -78,6 +83,8 @@ function editDevice(device?: DeviceSummary) {
   deviceForm.name = device?.name ?? ''
   deviceForm.groupId = device?.groupId ?? ''
   deviceForm.addresses = device?.addresses.map((address) => address.address).join('\n') ?? ''
+  deviceForm.provenance = 'manual'
+  addressProvenance.value = Object.fromEntries((device?.addresses ?? []).map(address => [address.address, address.provenance ?? 'manual']))
   exceptionDrafts.value = (device?.exceptions ?? []).map((original, index) => {
     const rule = JSON.parse(JSON.stringify(original)) as DeviceExceptionRule
     const match = rule.match
@@ -120,10 +127,10 @@ function deviceExceptions(): DeviceExceptionRule[] {
     const destination_ports = csv(ports).map(token => {
       const match = /^(\d+)(?:-(\d+))?$/.exec(token)
       const from = Number(match?.[1]); const to = Number(match?.[2] ?? match?.[1])
-      if (!match || from < 1 || to < from || to > 65535) throw new Error(`Exception ${index + 1}: invalid port range "${token}". Use ports 1–65535, for example 443 or 1000-1100.`)
+      if (!match || from < 1 || to < from || to > 65535) throw new Error(`例外规则 ${index + 1}：无效的端口范围“${token}”。请使用 1–65535 的端口，例如 443 或 1000-1100。`)
       return { from, to }
     })
-    if (rule.action.kind === 'outbound_group' && !outbounds.value.some(group => group.id === rule.action.outbound_group_id)) throw new Error(`Exception ${index + 1}: select an available outbound group.`)
+    if (rule.action.kind === 'outbound_group' && !outbounds.value.some(group => group.id === rule.action.outbound_group_id)) throw new Error(`例外规则 ${index + 1}：请选择可用的代理组。`)
     return { ...rule, order: index + 1, match: { ...rule.match, destination_ports }, action: { ...rule.action } }
   })
 }
@@ -136,10 +143,10 @@ async function saveDevice() {
   try {
     const addresses = deviceForm.addresses.split(/[\s,]+/).filter(Boolean).map((address) => {
       const previous = editingDevice.value?.addresses.find((item) => item.address === address)
-      return { address, family: previous?.family ?? (address.includes(':') ? 'ipv6' as const : 'ipv4' as const), provenance: previous?.provenance ?? 'manual' }
+      return { address, family: previous?.family ?? (address.includes(':') ? 'ipv6' as const : 'ipv4' as const), provenance: addressProvenance.value[address] ?? deviceForm.provenance }
     })
     const payload = { name: deviceForm.name.trim(), primary_group_id: deviceForm.groupId, addresses, exceptions: deviceExceptions() }
-    if (editingDevice.value && !editingDevice.value.revision) throw new Error('Refresh this device to obtain its revision before editing')
+    if (editingDevice.value && !editingDevice.value.revision) throw new Error('编辑前请刷新此设备以获取其版本')
     const saved = editingDevice.value
       ? await props.state.api.updateDevice(editingDevice.value.id, payload, editingDevice.value.revision)
       : await props.state.api.createDevice(payload)
@@ -147,10 +154,10 @@ async function saveDevice() {
     editingDevice.value = undefined
     const readback = await load()
     if (!readback.devicesLoaded || !devices.value.some((device) => device.id === saved.id && device.revision === saved.revision)) {
-      error.value = 'The controller accepted the save, but its device revision could not be read back. Refresh before making further changes.'
+      error.value = '控制器已受理保存，但无法回读设备版本。继续修改前请刷新。'
       return
     }
-    notice.value = 'Device record saved. Address verification and traffic deployment are separate operations.'
+    notice.value = '设备记录已保存。地址验证与流量部署是独立操作。'
   } catch (cause) { error.value = failureMessage(cause) } finally { saving.value = false }
 }
 
@@ -167,17 +174,17 @@ async function deleteDevice() {
   saving.value = true
   error.value = undefined
   try {
-    if (device.enrollment !== 'unenrolled') throw new Error('Only unenrolled device records can be deleted here')
-    if (!device.revision) throw new Error('Refresh this device to obtain its revision before deleting')
+    if (device.enrollment !== 'unenrolled') throw new Error('此处只能删除尚未纳管的设备记录')
+    if (!device.revision) throw new Error('删除前请刷新此设备以获取其版本')
     await props.state.api.deleteDevice(device.id, device.revision)
     deletingDevice.value = undefined
     if (editingDevice.value?.id === device.id) deviceEditorOpen.value = false
     const readback = await load()
     if (!readback.devicesLoaded || devices.value.some((item) => item.id === device.id)) {
-      error.value = 'The controller accepted deletion, but removal could not be read back. Refresh before retrying.'
+      error.value = '控制器已受理删除，但无法回读确认移除。重试前请刷新。'
       return
     }
-    notice.value = 'Device record deleted and its recorded addresses released.'
+    notice.value = '设备记录已删除，其登记的地址归属已释放。'
   } catch (cause) { error.value = failureMessage(cause) } finally { saving.value = false }
 }
 
@@ -199,7 +206,7 @@ async function saveGroup() {
   notice.value = undefined
   try {
     const payload = { name: groupForm.name.trim(), gateway_id: groupForm.gatewayId, policy_id: groupForm.policyId, enabled: groupForm.enabled }
-    if (editingGroup.value && !editingGroup.value.revision) throw new Error('Refresh this group to obtain its revision before editing')
+    if (editingGroup.value && !editingGroup.value.revision) throw new Error('编辑前请刷新此组以获取其版本')
     const saved = editingGroup.value
       ? await props.state.api.updateDeviceGroup(editingGroup.value.id, payload, editingGroup.value.revision)
       : await props.state.api.createDeviceGroup(payload)
@@ -207,10 +214,10 @@ async function saveGroup() {
     editingGroup.value = undefined
     const readback = await load()
     if (!readback.groupsLoaded || !groups.value.some((group) => group.id === saved.id && group.revision === saved.revision)) {
-      error.value = 'The controller accepted the save, but its group revision could not be read back. Refresh before making further changes.'
+      error.value = '控制器已受理保存，但无法回读设备组版本。继续修改前请刷新。'
       return
     }
-    notice.value = 'Desired group configuration saved. Preview and deploy the policy to change traffic.'
+    notice.value = '期望组配置已保存。需预览并部署策略才能改变流量。'
   } catch (cause) { error.value = failureMessage(cause) } finally { saving.value = false }
 }
 
@@ -219,59 +226,61 @@ onActivated(async () => { await load(); await focusLinkedGroup() })
 </script>
 
 <template>
-  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">设备管理</p><h1>设备与分组</h1><p class="lede">管理家庭网络中的设备，按场景分组并配置策略。保存清单不代表地址已验证或代理已生效。</p></div><button class="button button--secondary" :disabled="loading || saving" @click="load">{{ loading ? 'Refreshing…' : 'Refresh' }}</button></section>
-    <section v-if="error" class="alert alert--bad" role="alert">{{ error }}</section>
+  <div class="page-grid"><section class="page-heading"><div><p class="eyebrow">设备管理</p><h1>设备与分组</h1><p class="lede">管理家庭网络中的设备，按场景分组并配置策略。保存清单不代表地址已验证或代理已生效。</p></div><button class="button button--secondary" :disabled="loading || saving" @click="load">{{ loading ? '正在刷新…' : '刷新' }}</button></section>
+    <section v-if="error" class="alert alert--bad" role="alert"><DiagnosticMessage :message="error" /></section>
     <section v-if="notice" class="alert alert--good" role="status">{{ notice }}</section>
-    <section class="panel"><div class="panel__heading"><h2>Traffic enrollment</h2><button class="button" disabled>Enroll selected devices</button></div><p class="muted">Enrollment is unavailable until a gateway and OPNsense deployment adapter can apply policy, verify steering, and read back the result. Saving device records only changes controller intent.</p></section>
+    <EnrollmentPanel :state="state" :devices="devices" :groups="groups" @completed="load" />
     <section class="panel">
-      <div class="panel__heading"><h2>Device groups</h2><div class="actions"><span class="muted">{{ groups.length }} groups</span><button v-if="canOperate" class="button" :disabled="loading || saving" @click="editGroup()">Add group</button></div></div>
+      <div class="panel__heading"><h2>设备组</h2><div class="actions"><span class="muted">{{ groups.length }} 个设备组</span><button v-if="canOperate" class="button" :disabled="loading || saving" @click="editGroup()">添加设备组</button></div></div>
       <form v-if="groupEditorOpen && canOperate" class="editor" @submit.prevent="saveGroup">
-        <h3>{{ editingGroup ? `Edit ${editingGroup.name}` : 'Create device group' }}</h3><p class="muted">{{ editingGroup ? `Editing revision ${editingGroup.revision ?? 'unavailable'}.` : 'Register a gateway on Infrastructure and create a policy on Rules before assigning a group. Your group form remains available while you choose its references.' }}</p><p v-if="!gateways.length || !policies.length" class="muted">{{ !gateways.length ? 'No gateways are registered. Open Infrastructure in the navigation and select Register gateway.' : '' }} {{ !policies.length ? 'No policies exist. Open Rules and select New policy.' : '' }}</p>
+        <h3>{{ editingGroup ? `编辑 ${editingGroup.name}` : '创建设备组' }}</h3><p class="muted">{{ editingGroup ? `正在编辑版本 ${editingGroup.revision ?? '不可用'}.` : '分配设备组前，请先在“基础设施”中登记网关，并在“规则策略”中创建策略。选择引用时，设备组表单会保留。' }}</p><p v-if="!gateways.length || !policies.length" class="muted">{{ !gateways.length ? '尚未登记网关。请打开“基础设施”并选择“登记网关”。' : '' }} {{ !policies.length ? '尚无策略。请打开“规则策略”并选择“新建策略”。' : '' }}</p>
         <fieldset :disabled="saving"><div class="form-grid">
-          <label>Group name<input v-model="groupForm.name" required maxlength="200" autocomplete="off" /></label>
-          <label>Group gateway<select v-model="groupForm.gatewayId" required><option disabled value="">Select gateway</option><option v-if="groupForm.gatewayId && !gateways.some((gateway) => gateway.id === groupForm.gatewayId)" :value="groupForm.gatewayId">{{ groupForm.gatewayId }} (unavailable)</option><option v-for="gateway in gateways" :key="gateway.id" :value="gateway.id">{{ gateway.name }}</option></select></label>
-          <label>Group policy<select v-model="groupForm.policyId" required><option disabled value="">Select policy</option><option v-if="groupForm.policyId && !policies.some((policy) => policy.id === groupForm.policyId)" :value="groupForm.policyId">{{ groupForm.policyId }} (unavailable)</option><option v-for="policy in policies" :key="policy.id" :value="policy.id">{{ policy.name }}</option></select></label>
-          <label class="checkbox"><input v-model="groupForm.enabled" type="checkbox" />Enabled in desired configuration</label>
-        </div><div class="actions"><button class="button" type="submit" :disabled="!groupForm.gatewayId || !groupForm.policyId">{{ saving ? 'Saving…' : 'Save group' }}</button><button class="button button--secondary" type="button" @click="groupEditorOpen = false">Cancel</button></div></fieldset>
+          <label>设备组名称<input v-model="groupForm.name" required maxlength="200" autocomplete="off" /></label>
+          <label>所属网关<select v-model="groupForm.gatewayId" required><option disabled value="">选择网关</option><option v-if="groupForm.gatewayId && !gateways.some((gateway) => gateway.id === groupForm.gatewayId)" :value="groupForm.gatewayId">{{ groupForm.gatewayId }}（不可用）</option><option v-for="gateway in gateways" :key="gateway.id" :value="gateway.id">{{ gateway.name }}</option></select></label>
+          <label>设备组策略<select v-model="groupForm.policyId" required><option disabled value="">选择策略</option><option v-if="groupForm.policyId && !policies.some((policy) => policy.id === groupForm.policyId)" :value="groupForm.policyId">{{ groupForm.policyId }}（不可用）</option><option v-for="policy in policies" :key="policy.id" :value="policy.id">{{ policy.name }}</option></select></label>
+          <label class="checkbox"><input v-model="groupForm.enabled" type="checkbox" />在期望配置中启用</label>
+        </div><div class="actions"><button class="button" type="submit" :disabled="!groupForm.gatewayId || !groupForm.policyId">{{ saving ? '正在保存…' : '保存设备组' }}</button><button class="button button--secondary" type="button" @click="groupEditorOpen = false">取消</button></div></fieldset>
       </form>
-      <div v-if="!groups.length && !loading" class="empty-state">No device groups are configured.</div>
-      <article v-for="group in groups" :id="`device-group-${group.id}`" :key="group.id" class="row-card" :class="{ 'row-card--linked': linkedGroupId === group.id }"><div><strong>{{ group.name }}</strong><p>{{ memberCount(group.id) }} members · {{ gateways.find((gateway) => gateway.id === group.gatewayId)?.name ?? group.gatewayId }}</p><p>Policy: {{ policies.find((policy) => policy.id === group.policyId)?.name ?? group.policyId }} · revision {{ group.revision ?? 'unknown' }}</p></div><div class="row-card__right"><StatusPill :label="group.drift ? 'Drift' : group.state" :tone="group.drift ? 'warn' : group.state === 'verified' ? 'good' : 'neutral'" /><span class="muted">{{ group.enabled ? 'Enabled' : 'Disabled' }}</span><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !group.revision" :aria-label="`Edit group ${group.name}`" @click="editGroup(group)">Edit</button></div></article>
+      <div v-if="!groups.length && !loading" class="empty-state">尚未配置设备组。</div>
+      <article v-for="group in groups" :id="`device-group-${group.id}`" :key="group.id" class="row-card" :class="{ 'row-card--linked': linkedGroupId === group.id }"><div><strong>{{ group.name }}</strong><p>{{ memberCount(group.id) }} 个成员 · {{ gateways.find((gateway) => gateway.id === group.gatewayId)?.name ?? group.gatewayId }}</p><p>策略：{{ policies.find((policy) => policy.id === group.policyId)?.name ?? group.policyId }} · 版本 {{ group.revision ?? '未知' }}</p></div><div class="row-card__right"><StatusPill :label="group.drift ? '配置差异' : uiLabel(group.state)" :tone="group.drift ? 'warn' : group.state === 'verified' ? 'good' : 'neutral'" /><span class="muted">{{ group.enabled ? '已启用' : '已禁用' }}</span><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !group.revision" :aria-label="`编辑设备组 ${group.name}`" @click="editGroup(group)">编辑</button></div></article>
     </section>
     <section class="panel">
-      <div class="panel__heading"><h2>Devices</h2><div class="actions"><span class="muted">{{ devices.length }} records</span><button v-if="canOperate" class="button" :disabled="loading || saving" @click="editDevice()">Add device</button></div></div>
+      <div class="panel__heading"><h2>设备清单</h2><div class="actions"><span class="muted">{{ devices.length }} 条记录</span><button v-if="canOperate" class="button" :disabled="loading || saving" @click="editDevice()">添加设备</button></div></div>
       <form v-if="deviceEditorOpen && canOperate" class="editor" @submit.prevent="saveDevice">
-        <h3>{{ editingDevice ? `Edit ${editingDevice.name}` : 'Register device' }}</h3><p class="muted">{{ editingDevice ? `Editing revision ${editingDevice.revision ?? 'unavailable'}.` : 'New devices start unenrolled.' }} Addresses are checked for ownership conflicts by the controller.</p>
+        <h3>{{ editingDevice ? `编辑 ${editingDevice.name}` : '登记设备' }}</h3><p class="muted">{{ editingDevice ? `正在编辑版本 ${editingDevice.revision ?? '不可用'}.` : '新设备默认未纳管。' }} 控制器会检查地址归属冲突。</p>
         <fieldset :disabled="saving"><div class="form-grid">
-          <label>Device name<input v-model="deviceForm.name" required maxlength="200" autocomplete="off" /></label>
-          <label>Primary routing group<select v-model="deviceForm.groupId"><option value="">Unassigned</option><option v-if="deviceForm.groupId && !groups.some((group) => group.id === deviceForm.groupId)" :value="deviceForm.groupId">{{ deviceForm.groupId }} (unavailable)</option><option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label>
-          <label class="full-width">IP addresses<textarea aria-label="IP addresses" v-model="deviceForm.addresses" rows="3" spellcheck="false" aria-describedby="device-address-help" placeholder="192.0.2.10&#10;2001:db8::10" /><span id="device-address-help" class="muted">Enter reserved or static addresses, one per line. New addresses remain unverified.</span></label>
+          <label>设备名称<input v-model="deviceForm.name" required maxlength="200" autocomplete="off" /></label>
+          <label>主要路由组<select v-model="deviceForm.groupId"><option value="">未分配</option><option v-if="deviceForm.groupId && !groups.some((group) => group.id === deviceForm.groupId)" :value="deviceForm.groupId">{{ deviceForm.groupId }}（不可用）</option><option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label>
+          <label class="full-width">IP 地址<textarea aria-label="IP 地址" v-model="deviceForm.addresses" rows="3" spellcheck="false" aria-describedby="device-address-help" placeholder="192.0.2.10&#10;2001:db8::10" /><span id="device-address-help" class="muted">每行输入一个保留或静态地址。新增地址仍为未验证状态。</span></label>
+          <label>新地址分配方式<select v-model="deviceForm.provenance"><option value="manual">手动登记</option><option value="static">静态地址</option><option value="reserved">DHCP 保留地址</option></select><span class="muted">记录新地址的分配方式。此声明不代表地址归属或客户端流量已验证。</span></label>
+          <label v-for="address in existingAddresses" :key="address.address">地址 {{ address.address }} 的分配方式<select v-model="addressProvenance[address.address]"><option v-if="addressProvenance[address.address] && !['manual', 'static', 'reserved'].includes(addressProvenance[address.address]!)" :value="addressProvenance[address.address]">{{ uiLabel(addressProvenance[address.address]) }}（已记录）</option><option value="manual">手动登记</option><option value="static">静态地址</option><option value="reserved">DHCP 保留地址</option></select><span class="muted">仅在实际分配方式改变时修改此记录。</span></label>
         </div>
-        <section class="exceptions-editor" aria-label="Per-device exceptions">
-          <div class="panel__heading"><h3>Per-device exceptions</h3><button class="button button--secondary" type="button" @click="addException">Add exception</button></div>
-          <p class="muted">These rules apply only to this device, after mandatory rules and policy exceptions, before ordinary policy rules. The first enabled match wins. Values within a field are alternatives; populated fields must all match. An empty match applies to all this device’s traffic.</p>
-          <p v-if="!exceptionDrafts.length" class="muted">No per-device exceptions.</p>
+        <section class="exceptions-editor" aria-label="设备例外规则">
+          <div class="panel__heading"><h3>设备例外规则</h3><button class="button button--secondary" type="button" @click="addException">添加例外规则</button></div>
+          <p class="muted">这些规则仅用于此设备，在强制规则和策略例外之后、普通策略规则之前执行。首条启用且匹配的规则生效。同一字段中的值满足任一即可，不同已填写字段必须同时匹配。空匹配条件适用于此设备的所有流量。</p>
+          <p v-if="!exceptionDrafts.length" class="muted">此设备暂无例外规则。</p>
           <div v-for="(entry, index) in exceptionDrafts" :key="index" class="exception-row" :class="{ 'exception-row--selected': selectedExceptionIndex === index }">
-            <button class="exception-select" type="button" :aria-pressed="selectedExceptionIndex === index" :aria-label="`Select exception ${index + 1}`" @click="selectedExceptionIndex = index"><strong>{{ index + 1 }}. {{ entry.rule.name || 'Unnamed exception' }}</strong><span class="muted">{{ entry.rule.action.kind === 'outbound_group' ? `Outbound group: ${outbounds.find(group => group.id === entry.rule.action.outbound_group_id)?.name || entry.rule.action.outbound_group_id || 'not selected'}` : entry.rule.action.kind }} · {{ entry.rule.enabled ? 'enabled' : 'disabled' }}</span></button>
-            <button class="button button--secondary" type="button" :disabled="index === 0" :aria-label="`Move exception ${index + 1} up`" @click="moveException(index, -1)">↑</button>
-            <button class="button button--secondary" type="button" :disabled="index === exceptionDrafts.length - 1" :aria-label="`Move exception ${index + 1} down`" @click="moveException(index, 1)">↓</button>
+            <button class="exception-select" type="button" :aria-pressed="selectedExceptionIndex === index" :aria-label="`选择例外规则 ${index + 1}`" @click="selectedExceptionIndex = index"><strong>{{ index + 1 }}. {{ entry.rule.name || '未命名例外规则' }}</strong><span class="muted">{{ entry.rule.action.kind === 'outbound_group' ? `代理组：${outbounds.find(group => group.id === entry.rule.action.outbound_group_id)?.name || entry.rule.action.outbound_group_id || '未选择'}` : uiLabel(entry.rule.action.kind) }} · {{ entry.rule.enabled ? '已启用' : '已禁用' }}</span></button>
+            <button class="button button--secondary" type="button" :disabled="index === 0" :aria-label="`移动例外规则 ${index + 1}上移`" @click="moveException(index, -1)">↑</button>
+            <button class="button button--secondary" type="button" :disabled="index === exceptionDrafts.length - 1" :aria-label="`移动例外规则 ${index + 1}下移`" @click="moveException(index, 1)">↓</button>
           </div>
           <div v-if="activeException" class="form-grid">
-            <label>Exception name<input v-model="activeException.rule.name" maxlength="200" autocomplete="off" /></label>
-            <label class="checkbox"><input v-model="activeException.rule.enabled" type="checkbox" />Exception enabled</label>
-            <label>Exception action<select :value="activeException.rule.action.kind" @change="setExceptionAction(($event.target as HTMLSelectElement).value as DeviceExceptionRule['action']['kind'])"><option v-for="action in exceptionActions" :key="action" :value="action">{{ action }}</option></select></label>
-            <label v-if="activeException.rule.action.kind === 'outbound_group'">Exception outbound group<select v-model="activeException.rule.action.outbound_group_id" required><option disabled value="">Select outbound group</option><option v-if="activeException.rule.action.outbound_group_id && !outbounds.some(group => group.id === activeException!.rule.action.outbound_group_id)" :value="activeException.rule.action.outbound_group_id" disabled>{{ activeException.rule.action.outbound_group_id }} (unavailable)</option><option v-for="group in outbounds" :key="group.id" :value="group.id">{{ group.name }}</option></select></label>
+            <label>例外名称<input v-model="activeException.rule.name" maxlength="200" autocomplete="off" /></label>
+            <label class="checkbox"><input v-model="activeException.rule.enabled" type="checkbox" />启用例外规则</label>
+            <label>例外动作<select :value="activeException.rule.action.kind" @change="setExceptionAction(($event.target as HTMLSelectElement).value as DeviceExceptionRule['action']['kind'])"><option v-for="action in exceptionActions" :key="action" :value="action">{{ uiLabel(action) }}</option></select></label>
+            <label v-if="activeException.rule.action.kind === 'outbound_group'">例外代理组<select v-model="activeException.rule.action.outbound_group_id" required><option disabled value="">选择代理组</option><option v-if="activeException.rule.action.outbound_group_id && !outbounds.some(group => group.id === activeException!.rule.action.outbound_group_id)" :value="activeException.rule.action.outbound_group_id" disabled>{{ activeException.rule.action.outbound_group_id }}（不可用）</option><option v-for="group in outbounds" :key="group.id" :value="group.id">{{ group.name }}</option></select></label>
             <label v-for="field in exceptionListMatches" :key="field.key">{{ field.label }}<input :value="activeException.rule.match[field.key]?.join(', ')" :placeholder="field.placeholder" @change="activeException.rule.match[field.key] = csv(($event.target as HTMLInputElement).value)" /></label>
-            <label>Exception destination ports<input v-model="activeException.ports" placeholder="443, 1000-1100" /><span class="muted">Comma-separated ports or inclusive ranges, 1–65535.</span></label>
-            <label>Exception transports<select v-model="activeException.rule.match.transport" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select><span class="muted">No selection matches any transport.</span></label>
-            <label>Exception address families<select v-model="activeException.rule.match.address_families" multiple><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select><span class="muted">No selection matches either family.</span></label>
-            <div class="full-width"><button class="button button--danger" type="button" @click="removeException">Remove selected exception</button></div>
+            <label>例外目标端口<input v-model="activeException.ports" placeholder="443, 1000-1100" /><span class="muted">使用逗号分隔端口或闭区间，范围为 1–65535。</span></label>
+            <label>例外传输协议<select v-model="activeException.rule.match.transport" multiple><option value="tcp">TCP</option><option value="udp">UDP</option><option value="quic">QUIC</option></select><span class="muted">未选择时匹配任意传输协议。</span></label>
+            <label>例外地址族<select v-model="activeException.rule.match.address_families" multiple><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select><span class="muted">未选择时匹配任意地址族。</span></label>
+            <div class="full-width"><button class="button button--danger" type="button" @click="removeException">移除所选例外</button></div>
           </div>
         </section>
-        <div class="actions"><button class="button" type="submit">{{ saving ? 'Saving…' : 'Save device' }}</button><button class="button button--secondary" type="button" @click="deviceEditorOpen = false">Cancel</button></div></fieldset>
+        <div class="actions"><button class="button" type="submit">{{ saving ? '正在保存…' : '保存设备' }}</button><button class="button button--secondary" type="button" @click="deviceEditorOpen = false">取消</button></div></fieldset>
       </form>
-      <form v-if="deletingDevice && canOperate" class="editor" @submit.prevent="deleteDevice"><h3>Delete {{ deletingDevice.name }}?</h3><p class="muted">This removes the unenrolled device record and releases its recorded address ownership.</p><label class="checkbox"><input v-model="deleteAcknowledged" :disabled="saving" type="checkbox" required />I confirm this device is unenrolled and its record can be removed.</label><div class="actions"><button class="button button--danger" type="submit" :disabled="saving || !deleteAcknowledged">{{ saving ? 'Deleting…' : 'Delete device record' }}</button><button class="button button--secondary" type="button" :disabled="saving" @click="deletingDevice = undefined">Cancel</button></div></form>
-      <div v-if="!devices.length && !loading" class="empty-state">No devices have been registered.</div>
-      <article v-for="device in devices" :key="device.id" class="row-card"><div><strong>{{ device.name }}</strong><p>{{ device.addresses.map((address) => address.address).join(', ') || 'No addresses recorded' }}</p><p>Group: {{ groups.find((group) => group.id === device.groupId)?.name ?? (device.groupId || 'Unassigned') }} · revision {{ device.revision ?? 'unknown' }}</p></div><div class="row-card__right"><StatusPill :label="device.enrollment" :tone="device.enrollment === 'enrolled' ? 'good' : device.enrollment === 'blocked' ? 'bad' : 'warn'" /><span class="coverage">{{ device.coverage }}</span><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !device.revision" :aria-label="`Edit device ${device.name}`" @click="editDevice(device)">Edit</button><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !device.revision || device.enrollment !== 'unenrolled'" :title="device.enrollment !== 'unenrolled' ? 'Resolve enrollment before removing this device record' : 'Delete unenrolled device record'" :aria-label="`Delete device ${device.name}`" @click="confirmDelete(device)">Delete</button></div></article>
+      <form v-if="deletingDevice && canOperate" class="editor" @submit.prevent="deleteDevice"><h3>删除 {{ deletingDevice.name }}？</h3><p class="muted">此操作会删除未纳管设备的记录，并释放其已登记的地址归属。</p><label class="checkbox"><input v-model="deleteAcknowledged" :disabled="saving" type="checkbox" required />我确认此设备未被纳管，可以删除其记录。</label><div class="actions"><button class="button button--danger" type="submit" :disabled="saving || !deleteAcknowledged">{{ saving ? '正在删除…' : '删除设备记录' }}</button><button class="button button--secondary" type="button" :disabled="saving" @click="deletingDevice = undefined">取消</button></div></form>
+      <div v-if="!devices.length && !loading" class="empty-state">尚未登记设备。</div>
+      <article v-for="device in devices" :key="device.id" class="row-card"><div><strong>{{ device.name }}</strong><p>{{ device.addresses.map((address) => address.address).join(', ') || '尚未记录地址' }}</p><p>设备组：{{ groups.find((group) => group.id === device.groupId)?.name ?? (device.groupId || '未分配') }} · 版本 {{ device.revision ?? '未知' }}</p></div><div class="row-card__right"><StatusPill :label="uiLabel(device.enrollment)" :tone="device.enrollment === 'enrolled' ? 'good' : device.enrollment === 'blocked' ? 'bad' : 'warn'" /><span class="coverage">{{ uiLabel(device.coverage) }}</span><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !device.revision" :aria-label="`编辑设备 ${device.name}`" @click="editDevice(device)">编辑</button><button v-if="canOperate" class="button button--secondary" :disabled="saving || loading || !device.revision || device.enrollment !== 'unenrolled'" :title="device.enrollment !== 'unenrolled' ? '移除此设备记录前请先处理纳管状态' : '删除未纳管设备记录'" :aria-label="`删除设备 ${device.name}`" @click="confirmDelete(device)">删除</button></div></article>
     </section>
   </div>
 </template>
